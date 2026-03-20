@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(npm install:*)",
+      "Bash(timeout 10 python -c \"from app.main import app; print\\(''Backend imports OK''\\)\")",
+      "Bash(python -c \"import sys; print\\(sys.executable\\)\")",
+      "Bash(C:/Python313/python.exe -m pip install -e .)",
+      "Bash(curl -s http://localhost:8000/api/health)"
+    ]
+  }
+}
