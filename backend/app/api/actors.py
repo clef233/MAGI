@@ -2,17 +2,14 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from typing import List
-import json
 
 from app.services.database import get_db
-from app.models.database import Actor as DBActor, ProviderType
+from app.models.database import Actor as DBActor
 from app.models.schemas import (
     ActorCreate,
     ActorUpdate,
     ActorResponse,
     ActorDetail,
-    APIConfigCreate,
-    PromptConfigBase,
 )
 
 router = APIRouter(prefix="/api/actors", tags=["actors"])
@@ -20,8 +17,10 @@ router = APIRouter(prefix="/api/actors", tags=["actors"])
 
 @router.get("", response_model=List[ActorResponse])
 async def list_actors(db: AsyncSession = Depends(get_db)):
-    """Get all actors"""
-    result = await db.execute(select(DBActor).order_by(DBActor.created_at.desc()))
+    """Get all active actors"""
+    result = await db.execute(
+        select(DBActor).where(DBActor.is_active == True).order_by(DBActor.created_at.desc())
+    )
     actors = result.scalars().all()
     return [
         ActorResponse(
@@ -134,14 +133,23 @@ async def update_actor(
 
     if "api_config" in update_data and update_data["api_config"]:
         api_config = update_data["api_config"]
-        actor.provider = api_config.get("provider", actor.provider)
-        actor.api_format = api_config.get("api_format", actor.api_format)
-        actor.base_url = api_config.get("base_url", actor.base_url)
-        actor.api_key = api_config.get("api_key", actor.api_key)
-        actor.model = api_config.get("model", actor.model)
-        actor.max_tokens = api_config.get("max_tokens", actor.max_tokens)
-        actor.temperature = api_config.get("temperature", actor.temperature)
-        actor.extra_params = api_config.get("extra_params", actor.extra_params)
+        if api_config.get("provider") is not None:
+            actor.provider = api_config["provider"]
+        if api_config.get("api_format") is not None:
+            actor.api_format = api_config["api_format"]
+        if api_config.get("base_url") is not None:
+            actor.base_url = api_config["base_url"]
+        # ✅ 只有显式提供 api_key 时才更新，None 表示保留现有
+        if api_config.get("api_key") is not None:
+            actor.api_key = api_config["api_key"]
+        if api_config.get("model") is not None:
+            actor.model = api_config["model"]
+        if api_config.get("max_tokens") is not None:
+            actor.max_tokens = api_config["max_tokens"]
+        if api_config.get("temperature") is not None:
+            actor.temperature = api_config["temperature"]
+        if api_config.get("extra_params") is not None:
+            actor.extra_params = api_config["extra_params"]
 
     if "prompt_config" in update_data and update_data["prompt_config"]:
         prompt_config = update_data["prompt_config"]
@@ -169,13 +177,37 @@ async def update_actor(
 
 @router.delete("/{actor_id}")
 async def delete_actor(actor_id: str, db: AsyncSession = Depends(get_db)):
-    """Delete actor"""
+    """Delete actor (soft delete)"""
     result = await db.execute(select(DBActor).where(DBActor.id == actor_id))
     actor = result.scalar_one_or_none()
     if not actor:
         raise HTTPException(status_code=404, detail="Actor not found")
 
-    await db.delete(actor)
+    # Check if actor is used in any session
+    from app.models.database import DebateSessionActor, DebateSession
+
+    # Check as participant
+    result = await db.execute(
+        select(DebateSessionActor).where(DebateSessionActor.actor_id == actor_id).limit(1)
+    )
+    if result.scalar_one_or_none():
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot delete actor: already used in debate sessions. Use soft delete instead."
+        )
+
+    # Check as judge
+    result = await db.execute(
+        select(DebateSession).where(DebateSession.judge_actor_id == actor_id).limit(1)
+    )
+    if result.scalar_one_or_none():
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot delete actor: already used as judge in debate sessions."
+        )
+
+    # Soft delete
+    actor.is_active = False
     await db.commit()
     return {"message": "Actor deleted successfully"}
 

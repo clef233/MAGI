@@ -9,7 +9,9 @@ interface ConsensusViewProps {
 }
 
 export default function ConsensusView({ consensus }: ConsensusViewProps) {
-  const confidencePercent = Math.round(consensus.confidence * 100)
+  const confidencePercent = consensus.confidence !== null && consensus.confidence !== undefined
+    ? Math.round(consensus.confidence * 100)
+    : null
 
   return (
     <motion.div
@@ -21,15 +23,21 @@ export default function ConsensusView({ consensus }: ConsensusViewProps) {
       <div className="px-6 py-4 bg-accent-purple/10 border-b border-border flex items-center justify-between">
         <h3 className="text-lg font-medium text-accent-purple">共识裁决</h3>
         <div className="flex items-center gap-2">
-          <div className="w-24 h-2 bg-bg-tertiary rounded-full overflow-hidden">
-            <motion.div
-              initial={{ width: 0 }}
-              animate={{ width: `${confidencePercent}%` }}
-              transition={{ duration: 1, ease: 'easeOut' }}
-              className="h-full bg-accent-green"
-            />
-          </div>
-          <span className="text-sm text-text-secondary">{confidencePercent}%</span>
+          {confidencePercent !== null ? (
+            <>
+              <div className="w-24 h-2 bg-bg-tertiary rounded-full overflow-hidden">
+                <motion.div
+                  initial={{ width: 0 }}
+                  animate={{ width: `${confidencePercent}%` }}
+                  transition={{ duration: 1, ease: 'easeOut' }}
+                  className="h-full bg-accent-green"
+                />
+              </div>
+              <span className="text-sm text-text-secondary">{confidencePercent}%</span>
+            </>
+          ) : (
+            <span className="text-sm text-text-tertiary">置信度暂不可用</span>
+          )}
         </div>
       </div>
 

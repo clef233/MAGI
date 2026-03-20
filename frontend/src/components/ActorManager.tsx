@@ -5,6 +5,19 @@ import { motion } from 'framer-motion'
 import { ArrowLeft, Plus, Trash2, Edit2, Check, X, TestTube } from 'lucide-react'
 import { useActorStore } from '@/stores'
 import { Actor, ProviderType } from '@/types'
+import { apiClient } from '@/lib/apiClient'
+
+interface PromptPreset {
+  id: string
+  key: string
+  name: string
+  description: string
+  system_prompt: string
+  review_prompt: string
+  revision_prompt: string
+  personality: string
+  custom_instructions: string
+}
 
 interface ActorManagerProps {
   onBack: () => void
@@ -104,7 +117,7 @@ export default function ActorManager({ onBack }: ActorManagerProps) {
                           <h3 className="text-xl font-medium">{actor.name}</h3>
                           {actor.is_meta_judge && (
                             <span className="px-2 py-0.5 bg-accent-purple/20 text-accent-purple text-xs rounded">
-                              Judge
+                              总结模型
                             </span>
                           )}
                         </div>
@@ -181,6 +194,10 @@ interface ActorFormModalProps {
 }
 
 function ActorFormModal({ actorId, onClose, onSave }: ActorFormModalProps) {
+  const { fetchActorDetail } = useActorStore()
+  const [presets, setPresets] = useState<PromptPreset[]>([])
+  const [selectedPreset, setSelectedPreset] = useState<string>('')
+
   const [name, setName] = useState('')
   const [displayColor, setDisplayColor] = useState('#FF6B35')
   const [icon, setIcon] = useState('🤖')
@@ -190,7 +207,61 @@ function ActorFormModal({ actorId, onClose, onSave }: ActorFormModalProps) {
   const [apiKey, setApiKey] = useState('')
   const [baseUrl, setBaseUrl] = useState('')
   const [systemPrompt, setSystemPrompt] = useState('')
+  const [reviewPrompt, setReviewPrompt] = useState('')
+  const [revisionPrompt, setRevisionPrompt] = useState('')
+  const [customInstructions, setCustomInstructions] = useState('')
   const [saving, setSaving] = useState(false)
+  const [loading, setLoading] = useState(false)
+
+  // Load presets on mount
+  useEffect(() => {
+    loadPresets()
+  }, [])
+
+  // Load existing actor data
+  useEffect(() => {
+    if (actorId) {
+      setLoading(true)
+      fetchActorDetail(actorId)
+        .then((detail) => {
+          setName(detail.name)
+          setDisplayColor(detail.display_color)
+          setIcon(detail.icon)
+          setIsJudge(detail.is_meta_judge)
+          setProvider(detail.provider as ProviderType)
+          setModel(detail.model)
+          setBaseUrl(detail.base_url || '')
+          setSystemPrompt(detail.system_prompt || '')
+          setReviewPrompt(detail.review_prompt || '')
+          setRevisionPrompt(detail.revision_prompt || '')
+          setCustomInstructions(detail.custom_instructions || '')
+          setApiKey('')
+        })
+        .catch(console.error)
+        .finally(() => setLoading(false))
+    }
+  }, [actorId, fetchActorDetail])
+
+  const loadPresets = async () => {
+    try {
+      const data = await apiClient.request<PromptPreset[]>('/api/settings/prompt-presets')
+      setPresets(data)
+    } catch (err) {
+      console.error('Failed to load presets:', err)
+    }
+  }
+
+  // Apply preset to form
+  const applyPreset = (presetKey: string) => {
+    const preset = presets.find(p => p.key === presetKey)
+    if (preset) {
+      setSystemPrompt(preset.system_prompt)
+      setReviewPrompt(preset.review_prompt)
+      setRevisionPrompt(preset.revision_prompt)
+      setCustomInstructions(preset.custom_instructions)
+      setSelectedPreset(presetKey)
+    }
+  }
 
   const handleSubmit = async () => {
     setSaving(true)
@@ -202,17 +273,17 @@ function ActorFormModal({ actorId, onClose, onSave }: ActorFormModalProps) {
         is_meta_judge: isJudge,
         provider,
         model,
-        api_key: apiKey,
+        api_key: apiKey || undefined,
         api_format: provider === 'anthropic' ? 'anthropic' : 'openai_compatible',
         base_url: baseUrl || undefined,
         max_tokens: 4096,
         temperature: 0.7,
         extra_params: {},
         system_prompt: systemPrompt,
-        review_prompt: '',
-        revision_prompt: '',
+        review_prompt: reviewPrompt,
+        revision_prompt: revisionPrompt,
         personality: 'neutral',
-        custom_instructions: '',
+        custom_instructions: customInstructions,
       } as unknown as Actor)
     } finally {
       setSaving(false)
@@ -220,155 +291,231 @@ function ActorFormModal({ actorId, onClose, onSave }: ActorFormModalProps) {
   }
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 overflow-auto py-8">
       <motion.div
         initial={{ opacity: 0, scale: 0.95 }}
         animate={{ opacity: 1, scale: 1 }}
-        className="bg-bg-secondary border border-border rounded-3xl p-6 w-full max-w-lg max-h-[80vh] overflow-auto"
+        className="bg-bg-secondary border border-border rounded-3xl p-6 w-full max-w-2xl max-h-[90vh] overflow-auto mx-4"
       >
         <div className="flex items-center justify-between mb-6">
           <h2 className="text-xl font-semibold">
-            {actorId ? 'Edit Actor' : 'Create Actor'}
+            {actorId ? '编辑 Actor' : '创建 Actor'}
           </h2>
           <button onClick={onClose} className="text-text-tertiary hover:text-text-primary">
             <X className="w-5 h-5" />
           </button>
         </div>
 
-        <div className="space-y-4">
-          {/* Name */}
-          <div>
-            <label className="text-text-secondary text-sm block mb-1">Name</label>
-            <input
-              type="text"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              className="w-full px-4 py-2 bg-bg-tertiary border border-border rounded-xl focus:outline-none focus:border-accent-blue"
-              placeholder="CASPER"
-            />
-          </div>
-
-          {/* Color & Icon */}
-          <div className="flex gap-4">
-            <div className="flex-1">
-              <label className="text-text-secondary text-sm block mb-1">Color</label>
-              <input
-                type="color"
-                value={displayColor}
-                onChange={(e) => setDisplayColor(e.target.value)}
-                className="w-full h-10 rounded-xl cursor-pointer"
-              />
+        {loading ? (
+          <div className="text-center py-8 text-text-secondary">Loading...</div>
+        ) : (
+          <div className="space-y-4">
+            {/* Basic Info */}
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="text-text-secondary text-sm block mb-1">名称</label>
+                <input
+                  type="text"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  className="w-full px-4 py-2 bg-bg-tertiary border border-border rounded-xl focus:outline-none focus:border-accent-blue"
+                  placeholder="CASPER"
+                />
+              </div>
+              <div className="flex gap-2">
+                <div className="flex-1">
+                  <label className="text-text-secondary text-sm block mb-1">颜色</label>
+                  <input
+                    type="color"
+                    value={displayColor}
+                    onChange={(e) => setDisplayColor(e.target.value)}
+                    className="w-full h-10 rounded-xl cursor-pointer"
+                  />
+                </div>
+                <div className="flex-1">
+                  <label className="text-text-secondary text-sm block mb-1">图标</label>
+                  <input
+                    type="text"
+                    value={icon}
+                    onChange={(e) => setIcon(e.target.value)}
+                    className="w-full px-4 py-2 bg-bg-tertiary border border-border rounded-xl text-2xl"
+                  />
+                </div>
+              </div>
             </div>
-            <div className="flex-1">
-              <label className="text-text-secondary text-sm block mb-1">Icon</label>
+
+            {/* Is Judge */}
+            <div className="flex items-center gap-2">
               <input
-                type="text"
-                value={icon}
-                onChange={(e) => setIcon(e.target.value)}
-                className="w-full px-4 py-2 bg-bg-tertiary border border-border rounded-xl text-2xl"
+                type="checkbox"
+                id="isJudge"
+                checked={isJudge}
+                onChange={(e) => setIsJudge(e.target.checked)}
+                className="w-4 h-4"
               />
+              <label htmlFor="isJudge" className="text-text-secondary">
+                可作为总结模型（综合各方观点）
+              </label>
+            </div>
+
+            {/* API Configuration */}
+            <div className="border-t border-border pt-4 mt-4">
+              <h3 className="text-text-primary font-medium mb-3">API 配置</h3>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="text-text-secondary text-sm block mb-1">Provider</label>
+                  <select
+                    value={provider}
+                    onChange={(e) => {
+                      const p = e.target.value as ProviderType
+                      setProvider(p)
+                      if (p === 'openai') setModel('gpt-4o')
+                      else if (p === 'anthropic') setModel('claude-sonnet-4-20250514')
+                      else setModel('')
+                    }}
+                    className="w-full px-4 py-2 bg-bg-tertiary border border-border rounded-xl focus:outline-none focus:border-accent-blue"
+                  >
+                    <option value="openai">OpenAI</option>
+                    <option value="anthropic">Anthropic</option>
+                    <option value="custom">Custom</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="text-text-secondary text-sm block mb-1">Model</label>
+                  <input
+                    type="text"
+                    value={model}
+                    onChange={(e) => setModel(e.target.value)}
+                    className="w-full px-4 py-2 bg-bg-tertiary border border-border rounded-xl focus:outline-none focus:border-accent-blue"
+                  />
+                </div>
+              </div>
+
+              <div className="mt-4">
+                <label className="text-text-secondary text-sm block mb-1">
+                  API Key {actorId && <span className="text-text-tertiary">(留空保留现有)</span>}
+                </label>
+                <input
+                  type="password"
+                  value={apiKey}
+                  onChange={(e) => setApiKey(e.target.value)}
+                  className="w-full px-4 py-2 bg-bg-tertiary border border-border rounded-xl focus:outline-none focus:border-accent-blue"
+                  placeholder={actorId ? '留空保留现有 key' : 'sk-...'}
+                />
+              </div>
+
+              {provider === 'custom' && (
+                <div className="mt-4">
+                  <label className="text-text-secondary text-sm block mb-1">Base URL</label>
+                  <input
+                    type="text"
+                    value={baseUrl}
+                    onChange={(e) => setBaseUrl(e.target.value)}
+                    className="w-full px-4 py-2 bg-bg-tertiary border border-border rounded-xl focus:outline-none focus:border-accent-blue"
+                    placeholder="https://api.example.com/v1"
+                  />
+                </div>
+              )}
+            </div>
+
+            {/* Prompt Configuration */}
+            <div className="border-t border-border pt-4 mt-4">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-text-primary font-medium">提示词配置</h3>
+                {presets.length > 0 && (
+                  <div className="flex items-center gap-2">
+                    <select
+                      value={selectedPreset}
+                      onChange={(e) => applyPreset(e.target.value)}
+                      className="px-3 py-1.5 bg-bg-tertiary border border-border rounded-lg text-sm focus:outline-none focus:border-accent-blue"
+                    >
+                      <option value="">选择预设...</option>
+                      {presets.map((p) => (
+                        <option key={p.key} value={p.key}>
+                          {p.name}
+                        </option>
+                      ))}
+                    </select>
+                    <span className="text-text-tertiary text-xs">应用预设</span>
+                  </div>
+                )}
+              </div>
+
+              {/* System Prompt */}
+              <div className="mb-4">
+                <label className="text-text-secondary text-sm block mb-1">
+                  系统提示词
+                  <span className="text-text-tertiary text-xs ml-2">（定义 Actor 的基本角色和行为）</span>
+                </label>
+                <textarea
+                  value={systemPrompt}
+                  onChange={(e) => setSystemPrompt(e.target.value)}
+                  className="w-full px-4 py-3 bg-bg-tertiary border border-border rounded-xl focus:outline-none focus:border-accent-blue min-h-[80px] resize-none text-sm"
+                  placeholder="你是一个专业的分析者..."
+                />
+              </div>
+
+              {/* Review Prompt */}
+              <div className="mb-4">
+                <label className="text-text-secondary text-sm block mb-1">
+                  互评提示词
+                  <span className="text-text-tertiary text-xs ml-2">（指导如何评审他人回答）</span>
+                </label>
+                <textarea
+                  value={reviewPrompt}
+                  onChange={(e) => setReviewPrompt(e.target.value)}
+                  className="w-full px-4 py-3 bg-bg-tertiary border border-border rounded-xl focus:outline-none focus:border-accent-blue min-h-[60px] resize-none text-sm"
+                  placeholder="请从专业角度评审..."
+                />
+              </div>
+
+              {/* Revision Prompt */}
+              <div className="mb-4">
+                <label className="text-text-secondary text-sm block mb-1">
+                  修订提示词
+                  <span className="text-text-tertiary text-xs ml-2">（指导如何根据反馈修订）</span>
+                </label>
+                <textarea
+                  value={revisionPrompt}
+                  onChange={(e) => setRevisionPrompt(e.target.value)}
+                  className="w-full px-4 py-3 bg-bg-tertiary border border-border rounded-xl focus:outline-none focus:border-accent-blue min-h-[60px] resize-none text-sm"
+                  placeholder="请根据评审意见修订..."
+                />
+              </div>
+
+              {/* Custom Instructions */}
+              <div>
+                <label className="text-text-secondary text-sm block mb-1">
+                  额外指令
+                  <span className="text-text-tertiary text-xs ml-2">（附加到所有提示词后面）</span>
+                </label>
+                <textarea
+                  value={customInstructions}
+                  onChange={(e) => setCustomInstructions(e.target.value)}
+                  className="w-full px-4 py-3 bg-bg-tertiary border border-border rounded-xl focus:outline-none focus:border-accent-blue min-h-[60px] resize-none text-sm"
+                  placeholder="始终提供具体的数据支撑..."
+                />
+              </div>
+            </div>
+
+            {/* Actions */}
+            <div className="flex justify-end gap-3 mt-6 pt-4 border-t border-border">
+              <button
+                onClick={onClose}
+                className="px-4 py-2 text-text-secondary hover:text-text-primary transition-colors"
+              >
+                取消
+              </button>
+              <button
+                onClick={handleSubmit}
+                disabled={saving || !name || (!actorId && !apiKey)}
+                className="px-6 py-2 bg-accent-blue text-white rounded-xl hover:bg-blue-600 disabled:opacity-50 transition-colors flex items-center gap-2"
+              >
+                {saving ? '保存中...' : '保存'}
+              </button>
             </div>
           </div>
-
-          {/* Is Judge */}
-          <div className="flex items-center gap-2">
-            <input
-              type="checkbox"
-              id="isJudge"
-              checked={isJudge}
-              onChange={(e) => setIsJudge(e.target.checked)}
-              className="w-4 h-4"
-            />
-            <label htmlFor="isJudge" className="text-text-secondary">
-              Meta Judge (can synthesize consensus)
-            </label>
-          </div>
-
-          {/* Provider */}
-          <div>
-            <label className="text-text-secondary text-sm block mb-1">Provider</label>
-            <select
-              value={provider}
-              onChange={(e) => {
-                const p = e.target.value as ProviderType
-                setProvider(p)
-                if (p === 'openai') setModel('gpt-4o')
-                else if (p === 'anthropic') setModel('claude-sonnet-4-20250514')
-              }}
-              className="w-full px-4 py-2 bg-bg-tertiary border border-border rounded-xl focus:outline-none focus:border-accent-blue"
-            >
-              <option value="openai">OpenAI</option>
-              <option value="anthropic">Anthropic</option>
-              <option value="google">Google</option>
-              <option value="custom">Custom</option>
-            </select>
-          </div>
-
-          {/* Model */}
-          <div>
-            <label className="text-text-secondary text-sm block mb-1">Model</label>
-            <input
-              type="text"
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              className="w-full px-4 py-2 bg-bg-tertiary border border-border rounded-xl focus:outline-none focus:border-accent-blue"
-            />
-          </div>
-
-          {/* API Key */}
-          <div>
-            <label className="text-text-secondary text-sm block mb-1">API Key</label>
-            <input
-              type="password"
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-              className="w-full px-4 py-2 bg-bg-tertiary border border-border rounded-xl focus:outline-none focus:border-accent-blue"
-              placeholder="sk-..."
-            />
-          </div>
-
-          {/* Base URL (for custom) */}
-          {provider === 'custom' && (
-            <div>
-              <label className="text-text-secondary text-sm block mb-1">Base URL</label>
-              <input
-                type="text"
-                value={baseUrl}
-                onChange={(e) => setBaseUrl(e.target.value)}
-                className="w-full px-4 py-2 bg-bg-tertiary border border-border rounded-xl focus:outline-none focus:border-accent-blue"
-                placeholder="https://api.example.com/v1"
-              />
-            </div>
-          )}
-
-          {/* System Prompt */}
-          <div>
-            <label className="text-text-secondary text-sm block mb-1">System Prompt</label>
-            <textarea
-              value={systemPrompt}
-              onChange={(e) => setSystemPrompt(e.target.value)}
-              className="w-full px-4 py-2 bg-bg-tertiary border border-border rounded-xl focus:outline-none focus:border-accent-blue min-h-[100px] resize-none"
-              placeholder="You are a helpful AI assistant..."
-            />
-          </div>
-        </div>
-
-        {/* Actions */}
-        <div className="flex justify-end gap-3 mt-6">
-          <button
-            onClick={onClose}
-            className="px-4 py-2 text-text-secondary hover:text-text-primary transition-colors"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={handleSubmit}
-            disabled={saving || !name || !apiKey}
-            className="px-6 py-2 bg-accent-blue text-white rounded-xl hover:bg-blue-600 disabled:opacity-50 transition-colors flex items-center gap-2"
-          >
-            {saving ? 'Saving...' : 'Save'}
-          </button>
-        </div>
+        )}
       </motion.div>
     </div>
   )

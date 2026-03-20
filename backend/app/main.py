@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from app.core.config import get_settings
 from app.services.database import init_db
 from app.api import actors_router, debate_router, sessions_router, presets_router
+from app.api.settings import router as settings_router
 
 settings = get_settings()
 
@@ -39,6 +40,7 @@ app.include_router(actors_router)
 app.include_router(debate_router)
 app.include_router(sessions_router)
 app.include_router(presets_router)
+app.include_router(settings_router)
 
 
 @app.get("/api/health")

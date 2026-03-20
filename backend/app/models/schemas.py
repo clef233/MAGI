@@ -7,7 +7,6 @@ from enum import Enum
 class ProviderType(str, Enum):
     OPENAI = "openai"
     ANTHROPIC = "anthropic"
-    GOOGLE = "google"
     CUSTOM = "custom"
 
 
@@ -35,6 +34,18 @@ class APIConfigCreate(APIConfigBase):
     api_key: str
 
 
+class APIConfigUpdate(BaseModel):
+    """API config update - all fields optional, api_key=None means keep existing"""
+    provider: Optional[ProviderType] = None
+    api_format: Optional[str] = None
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None  # None means keep existing key
+    model: Optional[str] = None
+    max_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    extra_params: Optional[dict] = None
+
+
 class PromptConfigBase(BaseModel):
     system_prompt: str = ""
     review_prompt: str = ""
@@ -59,7 +70,7 @@ class ActorUpdate(BaseModel):
     name: Optional[str] = None
     display_color: Optional[str] = None
     icon: Optional[str] = None
-    api_config: Optional[APIConfigCreate] = None
+    api_config: Optional[APIConfigUpdate] = None  # ✅ 使用 Update 版本
     prompt_config: Optional[PromptConfigBase] = None
     is_meta_judge: Optional[bool] = None
 
@@ -134,7 +145,7 @@ class ConsensusResult(BaseModel):
     summary: str
     agreements: list[str]
     disagreements: list[str]
-    confidence: float
+    confidence: Optional[float] = None
     recommendation: str
 
 
@@ -211,3 +222,78 @@ class CompleteEvent(BaseModel):
 
 class ErrorEvent(BaseModel):
     message: str
+
+
+# ========== Semantic Analysis Schemas ==========
+
+class ComparisonAxis(BaseModel):
+    axis_id: str
+    label: str
+
+
+class QuestionIntentResponse(BaseModel):
+    id: str
+    session_id: str
+    question_type: Optional[str] = None
+    user_goal: Optional[str] = None
+    time_horizons: list[str] = Field(default_factory=list)
+    comparison_axes: list[ComparisonAxis] = Field(default_factory=list)
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class SemanticTopicResponse(BaseModel):
+    id: str
+    session_id: str
+    round_number: int
+    phase: str
+    actor_id: str
+    topic_id: str
+    axis_id: Optional[str] = None
+    label: str
+    summary: Optional[str] = None
+    stance: Optional[str] = None
+    time_horizon: Optional[str] = None
+    risk_level: Optional[str] = None
+    novelty: Optional[str] = None
+    quotes: list[str] = Field(default_factory=list)
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ActorPosition(BaseModel):
+    actor_id: str
+    actor_name: Optional[str] = None
+    stance_label: Optional[str] = None
+    summary: Optional[str] = None
+    quotes: list[str] = Field(default_factory=list)
+
+
+class SemanticComparisonResponse(BaseModel):
+    id: str
+    session_id: str
+    round_number: int
+    phase: str
+    topic_id: str
+    label: str
+    salience: float = 0.5
+    disagreement_score: float = 0.5
+    status: str = "partial"  # converged, divergent, partial
+    difference_types: list[str] = Field(default_factory=list)
+    agreement_summary: Optional[str] = None
+    disagreement_summary: Optional[str] = None
+    actor_positions: list[ActorPosition] = Field(default_factory=list)
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class SemanticAnalysisResult(BaseModel):
+    """Complete semantic analysis result for a session"""
+    question_intent: Optional[QuestionIntentResponse] = None
+    comparisons: list[SemanticComparisonResponse] = Field(default_factory=list)

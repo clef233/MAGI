@@ -1,14 +1,17 @@
 import { create } from 'zustand'
-import { Actor, ActorDetail, DebateSession, SessionListItem } from '@/types'
+import { Actor, ActorDetail } from '@/types'
+import { apiClient } from '@/lib/apiClient'
 
 interface ActorState {
   actors: Actor[]
+  actorDetails: Record<string, ActorDetail>
   selectedActors: string[]
   judgeActorId: string | null
   loading: boolean
   error: string | null
 
   fetchActors: () => Promise<void>
+  fetchActorDetail: (id: string) => Promise<ActorDetail>
   createActor: (data: Partial<ActorDetail>) => Promise<Actor>
   updateActor: (id: string, data: Partial<ActorDetail>) => Promise<void>
   deleteActor: (id: string) => Promise<void>
@@ -21,6 +24,7 @@ interface ActorState {
 
 export const useActorStore = create<ActorState>((set, get) => ({
   actors: [],
+  actorDetails: {},
   selectedActors: [],
   judgeActorId: null,
   loading: false,
@@ -29,12 +33,9 @@ export const useActorStore = create<ActorState>((set, get) => ({
   fetchActors: async () => {
     set({ loading: true, error: null })
     try {
-      const res = await fetch('/api/actors')
-      if (!res.ok) throw new Error('Failed to fetch actors')
-      const actors = await res.json()
+      const actors = await apiClient.listActors()
       set({ actors, loading: false })
 
-      // Auto-select first two non-judge actors and first judge
       const judges = actors.filter((a: Actor) => a.is_meta_judge)
       const nonJudges = actors.filter((a: Actor) => !a.is_meta_judge)
 
@@ -49,78 +50,88 @@ export const useActorStore = create<ActorState>((set, get) => ({
     }
   },
 
+  fetchActorDetail: async (id: string) => {
+    const cached = get().actorDetails[id]
+    if (cached) return cached
+
+    const detail = await apiClient.getActor(id)
+    set((state) => ({ actorDetails: { ...state.actorDetails, [id]: detail } }))
+    return detail
+  },
+
   createActor: async (data) => {
-    const res = await fetch('/api/actors', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name: data.name,
-        display_color: data.display_color,
-        icon: data.icon,
-        is_meta_judge: data.is_meta_judge,
-        api_config: {
-          provider: data.provider,
-          api_format: data.api_format,
-          base_url: data.base_url,
-          model: data.model,
-          max_tokens: data.max_tokens,
-          temperature: data.temperature,
-          extra_params: data.extra_params || {},
-          api_key: (data as unknown as { api_key: string }).api_key,
-        },
-        prompt_config: {
-          system_prompt: data.system_prompt,
-          review_prompt: data.review_prompt,
-          revision_prompt: data.revision_prompt,
-          personality: data.personality,
-          custom_instructions: data.custom_instructions,
-        },
-      }),
-    })
-    if (!res.ok) throw new Error('Failed to create actor')
-    const actor = await res.json()
+    const payload = {
+      name: data.name,
+      display_color: data.display_color,
+      icon: data.icon,
+      is_meta_judge: data.is_meta_judge,
+      api_config: {
+        provider: data.provider,
+        api_format: data.api_format,
+        base_url: data.base_url,
+        model: data.model,
+        max_tokens: data.max_tokens,
+        temperature: data.temperature,
+        extra_params: data.extra_params || {},
+        api_key: (data as unknown as { api_key?: string }).api_key,
+      },
+      prompt_config: {
+        system_prompt: data.system_prompt,
+        review_prompt: data.review_prompt,
+        revision_prompt: data.revision_prompt,
+        personality: data.personality,
+        custom_instructions: data.custom_instructions,
+      },
+    }
+    const actor = await apiClient.createActor(payload)
     set((state) => ({ actors: [...state.actors, actor] }))
     return actor
   },
 
   updateActor: async (id, data) => {
-    const res = await fetch(`/api/actors/${id}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name: data.name,
-        display_color: data.display_color,
-        icon: data.icon,
-        is_meta_judge: data.is_meta_judge,
-        api_config: {
-          provider: data.provider,
-          api_format: data.api_format,
-          base_url: data.base_url,
-          model: data.model,
-          max_tokens: data.max_tokens,
-          temperature: data.temperature,
-          extra_params: data.extra_params || {},
-          api_key: (data as unknown as { api_key: string }).api_key,
-        },
-        prompt_config: {
-          system_prompt: data.system_prompt,
-          review_prompt: data.review_prompt,
-          revision_prompt: data.revision_prompt,
-          personality: data.personality,
-          custom_instructions: data.custom_instructions,
-        },
-      }),
+    const apiConfig: Record<string, unknown> = {
+      provider: data.provider,
+      api_format: data.api_format,
+      base_url: data.base_url,
+      model: data.model,
+      max_tokens: data.max_tokens,
+      temperature: data.temperature,
+      extra_params: data.extra_params || {},
+    }
+
+    const apiKey = (data as unknown as { api_key?: string }).api_key
+    if (apiKey) {
+      apiConfig.api_key = apiKey
+    }
+
+    const payload = {
+      name: data.name,
+      display_color: data.display_color,
+      icon: data.icon,
+      is_meta_judge: data.is_meta_judge,
+      api_config: apiConfig,
+      prompt_config: {
+        system_prompt: data.system_prompt,
+        review_prompt: data.review_prompt,
+        revision_prompt: data.revision_prompt,
+        personality: data.personality,
+        custom_instructions: data.custom_instructions,
+      },
+    }
+
+    const updated = await apiClient.updateActor(id, payload)
+    set((state) => {
+      // Remove the cached detail by creating a new object without the key
+      const { [id]: _, ...remainingDetails } = state.actorDetails
+      return {
+        actors: state.actors.map((a) => (a.id === id ? (updated as unknown as Actor) : a)),
+        actorDetails: remainingDetails,
+      }
     })
-    if (!res.ok) throw new Error('Failed to update actor')
-    const updated = await res.json()
-    set((state) => ({
-      actors: state.actors.map((a) => (a.id === id ? updated : a)),
-    }))
   },
 
   deleteActor: async (id) => {
-    const res = await fetch(`/api/actors/${id}`, { method: 'DELETE' })
-    if (!res.ok) throw new Error('Failed to delete actor')
+    await apiClient.deleteActor(id)
     set((state) => ({
       actors: state.actors.filter((a) => a.id !== id),
       selectedActors: state.selectedActors.filter((aid) => aid !== id),
@@ -128,9 +139,7 @@ export const useActorStore = create<ActorState>((set, get) => ({
   },
 
   testActor: async (id) => {
-    const res = await fetch(`/api/actors/${id}/test`, { method: 'POST' })
-    if (!res.ok) throw new Error('Failed to test actor')
-    return res.json()
+    return apiClient.testActor(id)
   },
 
   selectActor: (id) => {

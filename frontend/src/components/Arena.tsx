@@ -4,18 +4,24 @@ import { useState, useEffect, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Send, Settings, Users, History, Loader2, AlertCircle } from 'lucide-react'
 import { useActorStore, useDebateStore } from '@/stores'
-import { Actor } from '@/types'
+import { Actor, SessionListItem } from '@/types'
 import ActorCard from './ActorCard'
 import DebateView from './DebateView'
 import ActorManager from './ActorManager'
 import SessionHistory from './SessionHistory'
+import SettingsView from './SettingsView'
+import SessionDetailView from './SessionDetailView'
 import ConsensusView from './ConsensusView'
+import { apiClient } from '@/lib/apiClient'
 
-type View = 'arena' | 'debate' | 'actors' | 'history'
+type View = 'arena' | 'debate' | 'actors' | 'history' | 'settings' | 'sessionDetail'
 
 export default function Arena() {
   const [view, setView] = useState<View>('arena')
   const [question, setQuestion] = useState('')
+  const [maxRounds, setMaxRounds] = useState(3)
+  const [recentSessions, setRecentSessions] = useState<SessionListItem[]>([])
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null)
 
   const {
     actors,
@@ -31,10 +37,15 @@ export default function Arena() {
     status,
     currentRound,
     currentPhase,
-    streamingContent,
     currentSession,
+    currentSessionId,
+    phaseHistory,
+    selectedDiffPhaseId,
+    selectDiffPhase,
+    semanticComparisons,
+    selectedTopicId,
+    selectTopic,
     startDebate,
-    streamDebate,
     stopDebate,
     reset,
     error,
@@ -44,15 +55,25 @@ export default function Arena() {
 
   useEffect(() => {
     fetchActors()
+    loadRecentSessions()
   }, [fetchActors])
+
+  const loadRecentSessions = async () => {
+    try {
+      const sessions = await apiClient.listSessions()
+      setRecentSessions(sessions.slice(0, 5))
+    } catch (err) {
+      console.error('Failed to load recent sessions:', err)
+    }
+  }
 
   const handleStartDebate = async () => {
     if (!question.trim() || selectedActors.length < 2 || !judgeActorId) return
 
     try {
-      const sessionId = await startDebate(question, selectedActors, judgeActorId)
+      // startDebate already calls streamDebate internally
+      await startDebate(question, selectedActors, judgeActorId, { max_rounds: maxRounds })
       setView('debate')
-      streamDebate(sessionId)
     } catch (err) {
       console.error('Failed to start debate:', err)
     }
@@ -64,6 +85,12 @@ export default function Arena() {
     }
     reset()
     setView('arena')
+    loadRecentSessions()
+  }
+
+  const handleSelectSession = (sessionId: string) => {
+    setSelectedSessionId(sessionId)
+    setView('sessionDetail')
   }
 
   const selectedActorObjects = actors.filter((a) => selectedActors.includes(a.id))
@@ -76,15 +103,23 @@ export default function Arena() {
   }
 
   if (view === 'history') {
-    return <SessionHistory onBack={() => setView('arena')} onSelect={(id) => console.log(id)} />
+    return <SessionHistory onBack={() => setView('arena')} onSelect={handleSelectSession} />
+  }
+
+  if (view === 'settings') {
+    return <SettingsView onBack={() => setView('arena')} />
+  }
+
+  if (view === 'sessionDetail' && selectedSessionId) {
+    return <SessionDetailView sessionId={selectedSessionId} onBack={() => setView('arena')} />
   }
 
   if (view === 'debate') {
     return (
-      <div className="min-h-screen flex flex-col">
+      <div className="h-screen flex flex-col overflow-hidden">
         {/* Header */}
-        <header className="border-b border-border px-6 py-4">
-          <div className="flex items-center justify-between max-w-6xl mx-auto">
+        <header className="border-b border-border px-6 py-4 shrink-0">
+          <div className="flex items-center justify-between max-w-7xl mx-auto">
             <button
               onClick={handleBackToArena}
               className="text-text-secondary hover:text-text-primary transition-colors"
@@ -96,21 +131,21 @@ export default function Arena() {
           </div>
         </header>
 
-        {/* Debate content */}
-        <main className="flex-1 overflow-auto">
-          <div className="max-w-5xl mx-auto py-8 px-6">
-            {/* Question */}
-            <div className="mb-8">
-              <h2 className="text-xl text-text-secondary mb-2">Question</h2>
-              <p className="text-2xl font-medium">{question}</p>
+        {/* Debate content - main area with fixed height */}
+        <main className="flex-1 overflow-hidden">
+          <div className="h-full max-w-7xl mx-auto px-6 py-4 flex flex-col">
+            {/* Question - fixed at top */}
+            <div className="mb-4 shrink-0">
+              <h2 className="text-lg text-text-secondary mb-1">问题</h2>
+              <p className="text-xl font-medium">{question}</p>
             </div>
 
-            {/* Status */}
-            <div className="mb-6 flex items-center gap-4">
+            {/* Status - fixed */}
+            <div className="mb-4 flex items-center gap-4 shrink-0">
               {status === 'connecting' && (
                 <div className="flex items-center gap-2 text-text-secondary">
                   <Loader2 className="w-5 h-5 animate-spin" />
-                  Connecting...
+                  连接中...
                 </div>
               )}
               {status === 'streaming' && (
@@ -121,7 +156,7 @@ export default function Arena() {
                 </div>
               )}
               {status === 'completed' && (
-                <div className="text-accent-green">Debate Complete</div>
+                <div className="text-accent-green">互评完成</div>
               )}
               {error && (
                 <div className="flex items-center gap-2 text-accent-red">
@@ -131,21 +166,29 @@ export default function Arena() {
               )}
             </div>
 
-            {/* Debate view */}
+            {/* Debate view - scrollable area */}
             {status !== 'idle' && (
-              <DebateView
-                actors={selectedActorObjects}
-                judgeActor={judgeActor}
-                streamingContent={streamingContent}
-                currentRound={currentRound}
-                currentPhase={currentPhase}
-                status={status}
-              />
+              <div className="flex-1 min-h-0">
+                <DebateView
+                  actors={selectedActorObjects}
+                  judgeActor={judgeActor}
+                  phaseHistory={phaseHistory}
+                  selectedDiffPhaseId={selectedDiffPhaseId}
+                  onSelectDiffPhase={selectDiffPhase}
+                  status={status}
+                  question={question}
+                  semanticComparisons={semanticComparisons}
+                  selectedTopicId={selectedTopicId}
+                  onSelectTopic={selectTopic}
+                />
+              </div>
             )}
 
-            {/* Consensus */}
+            {/* Consensus - fixed at bottom */}
             {currentSession?.consensus && status === 'completed' && (
-              <ConsensusView consensus={currentSession.consensus} />
+              <div className="mt-4 shrink-0">
+                <ConsensusView consensus={currentSession.consensus} />
+              </div>
             )}
           </div>
         </main>
@@ -184,7 +227,11 @@ export default function Arena() {
               </button>
             </nav>
           </div>
-          <button className="text-text-secondary hover:text-text-primary transition-colors">
+          <button
+            onClick={() => setView('settings')}
+            className="text-text-secondary hover:text-text-primary transition-colors"
+            title="Settings"
+          >
             <Settings className="w-5 h-5" />
           </button>
         </div>
@@ -216,7 +263,7 @@ export default function Arena() {
               ref={inputRef}
               value={question}
               onChange={(e) => setQuestion(e.target.value)}
-              placeholder="输入你的问题，让多个 AI 辩论求解..."
+              placeholder="输入你的问题，让多个 AI 互评求解..."
               className="w-full h-32 bg-bg-secondary border border-border rounded-2xl px-6 py-4 text-lg placeholder:text-text-tertiary focus:outline-none focus:border-accent-blue transition-colors resize-none"
             />
           </motion.div>
@@ -228,7 +275,7 @@ export default function Arena() {
             transition={{ delay: 0.2 }}
             className="mb-8"
           >
-            <label className="text-text-secondary text-sm mb-3 block">参与辩论的 Actor:</label>
+            <label className="text-text-secondary text-sm mb-3 block">参与互评的 Actor:</label>
             <div className="flex flex-wrap gap-3">
               {nonJudgeActors.map((actor) => (
                 <ActorCard
@@ -261,7 +308,7 @@ export default function Arena() {
             transition={{ delay: 0.3 }}
             className="mb-8"
           >
-            <label className="text-text-secondary text-sm mb-3 block">裁决者:</label>
+            <label className="text-text-secondary text-sm mb-3 block">总结模型:</label>
             <div className="flex gap-3">
               {judgeActors.map((actor) => (
                 <ActorCard
@@ -282,8 +329,17 @@ export default function Arena() {
             transition={{ delay: 0.4 }}
             className="mb-8 flex items-center gap-6"
           >
-            <div className="text-text-secondary">
-              轮次: <span className="text-text-primary">3 轮</span>
+            <div className="flex items-center gap-3">
+              <label className="text-text-secondary">最大互评轮数:</label>
+              <select
+                value={maxRounds}
+                onChange={(e) => setMaxRounds(Number(e.target.value))}
+                className="px-3 py-2 bg-bg-secondary border border-border rounded-lg focus:outline-none focus:border-accent-blue"
+              >
+                {[1, 2, 3, 4, 5].map((n) => (
+                  <option key={n} value={n}>{n} 轮</option>
+                ))}
+              </select>
             </div>
           </motion.div>
 
@@ -299,7 +355,7 @@ export default function Arena() {
               className="w-full py-4 bg-accent-blue hover:bg-blue-600 disabled:bg-bg-tertiary disabled:text-text-tertiary text-white font-medium rounded-xl transition-colors flex items-center justify-center gap-2"
             >
               <Send className="w-5 h-5" />
-              开始辩论
+              开始互评
             </button>
           </motion.div>
 
@@ -310,17 +366,26 @@ export default function Arena() {
             transition={{ delay: 0.6 }}
             className="mt-12"
           >
-            <h3 className="text-text-secondary text-sm mb-3">最近辩论</h3>
+            <h3 className="text-text-secondary text-sm mb-3">最近互评</h3>
             <div className="space-y-2">
-              {[1, 2, 3].map((i) => (
-                <div
-                  key={i}
-                  className="bg-bg-secondary border border-border rounded-xl px-4 py-3 flex items-center justify-between"
-                >
-                  <span className="text-text-primary truncate">示例辩论问题 #{i}</span>
-                  <span className="text-accent-green text-sm">✓ 87% 共识</span>
-                </div>
-              ))}
+              {recentSessions.length === 0 ? (
+                <div className="text-text-tertiary text-sm">暂无历史记录</div>
+              ) : (
+                recentSessions.map((session) => (
+                  <button
+                    key={session.id}
+                    onClick={() => handleSelectSession(session.id)}
+                    className="w-full bg-bg-secondary border border-border rounded-xl px-4 py-3 flex items-center justify-between hover:border-accent-blue transition-colors text-left"
+                  >
+                    <span className="text-text-primary truncate">{session.question}</span>
+                    {session.consensus_confidence && (
+                      <span className="text-accent-green text-sm ml-2">
+                        {Math.round(session.consensus_confidence * 100)}% 共识
+                      </span>
+                    )}
+                  </button>
+                ))
+              )}
             </div>
           </motion.div>
         </div>

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Boolean, DateTime, ForeignKey, Text, Integer, Float, Enum as SQLEnum, JSON
+from sqlalchemy import Column, String, Boolean, DateTime, ForeignKey, Text, Integer, Float, Enum as SQLEnum, JSON, UniqueConstraint
 from sqlalchemy.orm import relationship, DeclarativeBase
 from sqlalchemy.sql import func
 import uuid
@@ -16,7 +16,6 @@ def generate_uuid() -> str:
 class ProviderType(str, enum.Enum):
     OPENAI = "openai"
     ANTHROPIC = "anthropic"
-    GOOGLE = "google"
     CUSTOM = "custom"
 
 
@@ -55,6 +54,7 @@ class Actor(Base):
 
     # Meta
     is_meta_judge = Column(Boolean, default=False)
+    is_active = Column(Boolean, default=True)  # ✅ 软删除标记
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
@@ -98,6 +98,9 @@ class DebateSession(Base):
 
 class DebateSessionActor(Base):
     __tablename__ = "debate_session_actors"
+    __table_args__ = (
+        UniqueConstraint('session_id', 'actor_id', name='uq_session_actor'),
+    )
 
     id = Column(String(36), primary_key=True, default=generate_uuid)
     session_id = Column(String(36), ForeignKey("debate_sessions.id"), nullable=False)
@@ -110,6 +113,9 @@ class DebateSessionActor(Base):
 
 class Round(Base):
     __tablename__ = "rounds"
+    __table_args__ = (
+        UniqueConstraint('session_id', 'round_number', name='uq_session_round'),
+    )
 
     id = Column(String(36), primary_key=True, default=generate_uuid)
     session_id = Column(String(36), ForeignKey("debate_sessions.id"), nullable=False)
@@ -128,7 +134,7 @@ class Message(Base):
     round_id = Column(String(36), ForeignKey("rounds.id"), nullable=False)
     actor_id = Column(String(36), ForeignKey("actors.id"), nullable=False)
 
-    role = Column(String(20), nullable=False)  # answer, review, revision, final
+    role = Column(String(20), nullable=False)  # answer, review, revision, summary
     content = Column(Text, nullable=False)
 
     # Token tracking
@@ -139,3 +145,103 @@ class Message(Base):
 
     # Relationships
     round = relationship("Round", back_populates="messages")
+
+
+class WorkflowPromptTemplate(Base):
+    """System workflow prompt templates stored in DB for editing in Settings."""
+    __tablename__ = "workflow_prompt_templates"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    key = Column(String(50), unique=True, nullable=False)  # initial_answer, peer_review, revision, summary, convergence_check
+    name = Column(String(100), nullable=False)
+    description = Column(Text, default="")
+    template_text = Column(Text, nullable=False)
+    required_variables = Column(JSON, default=list)  # ["question", "actor_name", ...]
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class PromptPreset(Base):
+    """Actor prompt presets stored in DB for editing in Settings."""
+    __tablename__ = "prompt_presets"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    key = Column(String(50), unique=True, nullable=False)  # conservative, innovative, academic, practical, synthesizer
+    name = Column(String(100), nullable=False)
+    description = Column(Text, default="")
+    system_prompt = Column(Text, default="")
+    review_prompt = Column(Text, default="")
+    revision_prompt = Column(Text, default="")
+    personality = Column(String(50), default="neutral")
+    custom_instructions = Column(Text, default="")
+    is_builtin = Column(Boolean, default=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class QuestionIntent(Base):
+    """问题意图分析结果 - 存储对用户问题的结构化分析"""
+    __tablename__ = "question_intents"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    session_id = Column(String(36), ForeignKey("debate_sessions.id"), unique=True)
+    question_type = Column(String(50))  # investment_decision, analysis, comparison...
+    user_goal = Column(Text)
+    time_horizons = Column(JSON, default=list)  # ["short_term", "medium_term", "long_term"]
+    comparison_axes = Column(JSON, default=list)  # [{axis_id, label}, ...]
+    created_at = Column(DateTime, server_default=func.now())
+
+    # Relationships
+    session = relationship("DebateSession", backref="question_intent", uselist=False)
+
+
+class SemanticTopic(Base):
+    """每个回答的语义主题提取结果"""
+    __tablename__ = "semantic_topics"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    session_id = Column(String(36), ForeignKey("debate_sessions.id"), nullable=False)
+    round_number = Column(Integer, nullable=False)
+    phase = Column(String(20), nullable=False)  # initial, revision
+    actor_id = Column(String(36), ForeignKey("actors.id"), nullable=False)
+
+    topic_id = Column(String(50), nullable=False)  # energy_substitution, safe_haven...
+    axis_id = Column(String(50))  # 对应 comparison_axes
+    label = Column(String(100), nullable=False)  # 主题名称
+    summary = Column(Text)  # 观点摘要
+    stance = Column(String(50))  # 立场标签
+    time_horizon = Column(String(20))  # short, medium, long
+    risk_level = Column(String(20))  # low, medium, high
+    novelty = Column(String(20))  # low, medium, high
+    quotes = Column(JSON, default=list)  # 原文引用
+
+    created_at = Column(DateTime, server_default=func.now())
+
+    # Relationships
+    session = relationship("DebateSession", backref="semantic_topics")
+    actor = relationship("Actor", backref="semantic_topics")
+
+
+class SemanticComparison(Base):
+    """跨模型语义比较结果 - 主题分歧图谱"""
+    __tablename__ = "semantic_comparisons"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    session_id = Column(String(36), ForeignKey("debate_sessions.id"), nullable=False)
+    round_number = Column(Integer, nullable=False)
+    phase = Column(String(20), nullable=False)
+
+    topic_id = Column(String(50), nullable=False)
+    label = Column(String(100), nullable=False)
+    salience = Column(Float, default=0.5)  # 重要度 0-1
+    disagreement_score = Column(Float, default=0.5)  # 分歧度 0-1
+    status = Column(String(20), default="partial")  # converged, divergent, partial
+    difference_types = Column(JSON, default=list)  # ["solution_class", "time_horizon"]
+    agreement_summary = Column(Text)
+    disagreement_summary = Column(Text)
+    actor_positions = Column(JSON, default=list)  # [{actor_id, actor_name, stance_label, summary, quotes}]
+
+    created_at = Column(DateTime, server_default=func.now())
+
+    # Relationships
+    session = relationship("DebateSession", backref="semantic_comparisons")
