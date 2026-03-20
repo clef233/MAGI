@@ -3,6 +3,7 @@
 import { motion } from 'framer-motion'
 import { Consensus } from '@/types'
 import { Check, X, Lightbulb } from 'lucide-react'
+import MarkdownBlock from './MarkdownBlock'
 
 interface ConsensusViewProps {
   consensus: Consensus
@@ -45,7 +46,7 @@ export default function ConsensusView({ consensus }: ConsensusViewProps) {
         {/* Summary */}
         <div>
           <h4 className="text-text-secondary text-sm mb-2">Summary</h4>
-          <p className="text-text-primary">{consensus.summary}</p>
+          <MarkdownBlock content={consensus.summary} />
         </div>
 
         {/* Agreements */}
@@ -59,7 +60,7 @@ export default function ConsensusView({ consensus }: ConsensusViewProps) {
               {consensus.agreements.map((agreement, i) => (
                 <li key={i} className="flex items-start gap-2">
                   <span className="text-accent-green mt-1">•</span>
-                  <span className="text-text-primary">{agreement}</span>
+                  <MarkdownBlock content={agreement} className="flex-1" />
                 </li>
               ))}
             </ul>
@@ -77,7 +78,7 @@ export default function ConsensusView({ consensus }: ConsensusViewProps) {
               {consensus.disagreements.map((disagreement, i) => (
                 <li key={i} className="flex items-start gap-2">
                   <span className="text-accent-orange mt-1">•</span>
-                  <span className="text-text-primary">{disagreement}</span>
+                  <MarkdownBlock content={disagreement} className="flex-1" />
                 </li>
               ))}
             </ul>
@@ -91,7 +92,7 @@ export default function ConsensusView({ consensus }: ConsensusViewProps) {
               <Lightbulb className="w-4 h-4 text-accent-blue" />
               Recommendation
             </h4>
-            <p className="text-text-primary">{consensus.recommendation}</p>
+            <MarkdownBlock content={consensus.recommendation} />
           </div>
         )}
       </div>

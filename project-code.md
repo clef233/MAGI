@@ -1,8 +1,8 @@
 # Project: MAGI
 
-Generated: 2026-03-20 22:43:15
+Generated: 2026-03-21 00:10:21
 Root: D:\Projects\MAGI
-Files: 58
+Files: 61
 
 ---
 
@@ -62,6 +62,8 @@ frontend/
       DebateView.tsx
       DiffSidebar.tsx
       index.ts
+      MarkdownBlock.tsx
+      ProgressBar.tsx
       ReviewChatView.tsx
       SemanticSidebar.tsx
       SessionDetailView.tsx
@@ -70,6 +72,7 @@ frontend/
       Splash.tsx
       apiClient.ts
       reviewDiff.ts
+      sessionHydrator.ts
       utils.ts
       actorStore.ts
       debateStore.ts
@@ -2103,51 +2106,61 @@ async def check_convergence(
 """
 
     try:
-        adapter = create_adapter(
-            provider=judge.provider.value,
-            api_key=judge.api_key,
-            base_url=judge.base_url,
-            model=judge.model,
-        )
-
-        full_response = ""
-        async for token in adapter.stream_completion(
-            messages=[{"role": "user", "content": prompt}],
-            system_prompt="你是一个专业的收敛判断器。请以JSON格式返回判断结果。",
-            max_tokens=judge.max_tokens,
-            temperature=0.3,
-        ):
-            full_response += token
-
-        # Parse JSON response
-        json_start = full_response.find("{")
-        json_end = full_response.rfind("}") + 1
-
-        if json_start >= 0 and json_end > json_start:
-            json_str = full_response[json_start:json_end]
-            data = json.loads(json_str)
-
-            converged = data.get("converged", False)
-            score = float(data.get("score", 0.5))
-
-            # Apply threshold
-            if score >= threshold:
-                converged = True
-
-            return ConvergenceResult(
-                converged=converged,
-                score=score,
-                reason=data.get("reason", ""),
-                agreements=data.get("agreements", []),
-                disagreements=data.get("disagreements", []),
+            adapter = create_adapter(
+                provider=judge.provider.value,
+                api_key=judge.api_key,
+                base_url=judge.base_url,
+                model=judge.model,
             )
-        else:
-            logger.warning(f"Could not parse convergence response: {full_response}")
-            return ConvergenceResult(
-                converged=False,
-                score=0.5,
-                reason="Could not parse convergence response",
-            )
+
+            full_response = ""
+            async for token in adapter.stream_completion(
+                messages=[{"role": "user", "content": prompt}],
+                system_prompt="你是一个专业的收敛判断器。请以JSON格式返回判断结果。",
+                max_tokens=judge.max_tokens,
+                temperature=0.3,
+            ):
+                full_response += token
+
+            # Parse JSON response
+            json_start = full_response.find("{")
+            json_end = full_response.rfind("}") + 1
+
+            if json_start >= 0 and json_end > json_start:
+                json_str = full_response[json_start:json_end]
+                data = json.loads(json_str)
+
+                converged = data.get("converged", False)
+                score = data.get("score")
+
+                # Validate score - if not provided or invalid, mark as unavailable
+                if score is None:
+                    score = None
+                    converged = False
+                else:
+                    try:
+                        score = float(score)
+                        # Apply threshold
+                        if score >= threshold:
+                            converged = True
+                    except (ValueError, TypeError):
+                        score = None
+                        converged = False
+
+                return ConvergenceResult(
+                    converged=converged,
+                    score=score if score is not None else 0.0,
+                    reason=data.get("reason", "") + (" (置信度不可用)" if score is None else ""),
+                    agreements=data.get("agreements", []),
+                    disagreements=data.get("disagreements", []),
+                )
+            else:
+                logger.warning(f"Could not parse convergence response: {full_response}")
+                return ConvergenceResult(
+                    converged=False,
+                    score=0.0,
+                    reason="无法解析收敛判断结果",
+                )
 
     except Exception as e:
         logger.error(f"Convergence check failed: {e}")
@@ -2927,23 +2940,6 @@ class DebateEngine:
 
                 logger.info(f"stream_completion DONE for {actor.name}, response length: {len(full_response)}")
 
-                # Store message after completion
-                message = Message(
-                    round_id=db_round.id,
-                    actor_id=actor.id,
-                    role="answer",
-                    content=full_response,
-                )
-                self.db.add(message)
-                await self.db.commit()
-
-                # Track for later rounds
-                self.actor_responses[actor.id].append({
-                    "role": "answer",
-                    "content": full_response,
-                    "cycle": 0,
-                })
-
                 # Emit actor_end
                 await self._emit({
                     "event": "actor_end",
@@ -2968,9 +2964,28 @@ class DebateEngine:
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
+        # Store messages AFTER all parallel tasks complete (sequential DB writes)
         for i, result in enumerate(results):
             if isinstance(result, Exception):
                 logger.error(f"Actor {self.actors[i].name} failed: {result}")
+            elif isinstance(result, tuple):
+                actor_id, full_response = result
+                message = Message(
+                    round_id=db_round.id,
+                    actor_id=actor_id,
+                    role="answer",
+                    content=full_response,
+                )
+                self.db.add(message)
+                # Track for later rounds
+                self.actor_responses[actor_id].append({
+                    "role": "answer",
+                    "content": full_response,
+                    "cycle": 0,
+                })
+
+        # Commit all messages at once
+        await self.db.commit()
 
     async def _run_review_round(self, cycle: int, db_round: DBRound):
         """Run review round where each actor critiques others' answers"""
@@ -3009,12 +3024,22 @@ class DebateEngine:
                     if other_actor:
                         other_responses.append(f"**{other_actor.name}**: {content}")
 
-            # Build review prompt
+            my_answer = latest_answers.get(actor.id, "")
+
+            # Build review prompt using prompt_service
             system_prompt = actor.review_prompt or f"You are {actor.name}. Provide a critical review."
             if actor.custom_instructions:
                 system_prompt += f"\n\n{actor.custom_instructions}"
 
-            review_prompt = f"""Original question: {self.session.question}
+            try:
+                review_prompt = await self.prompt_service.get_review_prompt(
+                    question=self.session.question,
+                    own_answer=my_answer,
+                    other_answers="\n\n".join(other_responses),
+                )
+            except PromptError:
+                # Fallback to hardcoded prompt if template not found
+                review_prompt = f"""Original question: {self.session.question}
 
 Here are the responses from other participants:
 
@@ -3042,22 +3067,6 @@ Please provide a critical review of these responses. Focus on:
                     }
                 })
 
-            # Store message
-            message = Message(
-                round_id=db_round.id,
-                actor_id=actor.id,
-                role="review",
-                content=full_response,
-            )
-            self.db.add(message)
-            await self.db.commit()
-
-            self.actor_responses[actor.id].append({
-                "role": "review",
-                "content": full_response,
-                "cycle": cycle,
-            })
-
             await self._emit({
                 "event": "actor_end",
                 "data": {
@@ -3070,7 +3079,26 @@ Please provide a critical review of these responses. Focus on:
             return actor.id, full_response
 
         tasks = [actor_review_stream(actor) for actor in self.actors]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Store messages AFTER all parallel tasks complete
+        for result in results:
+            if isinstance(result, tuple):
+                actor_id, full_response = result
+                message = Message(
+                    round_id=db_round.id,
+                    actor_id=actor_id,
+                    role="review",
+                    content=full_response,
+                )
+                self.db.add(message)
+                self.actor_responses[actor_id].append({
+                    "role": "review",
+                    "content": full_response,
+                    "cycle": cycle,
+                })
+
+        await self.db.commit()
 
     async def _run_revision_round(self, cycle: int, review_round: DBRound, db_round: DBRound):
         """Run revision round where actors improve their answers"""
@@ -3117,12 +3145,20 @@ Please provide a critical review of these responses. Focus on:
 
             my_answer = latest_answers.get(actor.id, "")
 
-            # Build revision prompt
+            # Build revision prompt using prompt_service
             system_prompt = actor.revision_prompt or f"You are {actor.name}. Revise based on feedback."
             if actor.custom_instructions:
                 system_prompt += f"\n\n{actor.custom_instructions}"
 
-            revision_prompt = f"""Original question: {self.session.question}
+            try:
+                revision_prompt = await self.prompt_service.get_revision_prompt(
+                    question=self.session.question,
+                    own_answer=my_answer,
+                    reviews_about_me="\n\n".join(reviews_about_me),
+                )
+            except PromptError:
+                # Fallback to hardcoded prompt if template not found
+                revision_prompt = f"""Original question: {self.session.question}
 
 Your current response:
 {my_answer}
@@ -3153,22 +3189,6 @@ Please revise your response to:
                     }
                 })
 
-            # Store message
-            message = Message(
-                round_id=db_round.id,
-                actor_id=actor.id,
-                role="revision",
-                content=full_response,
-            )
-            self.db.add(message)
-            await self.db.commit()
-
-            self.actor_responses[actor.id].append({
-                "role": "revision",
-                "content": full_response,
-                "cycle": cycle,
-            })
-
             await self._emit({
                 "event": "actor_end",
                 "data": {
@@ -3181,7 +3201,26 @@ Please revise your response to:
             return actor.id, full_response
 
         tasks = [actor_revision_stream(actor) for actor in self.actors]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Store messages AFTER all parallel tasks complete
+        for result in results:
+            if isinstance(result, tuple):
+                actor_id, full_response = result
+                message = Message(
+                    round_id=db_round.id,
+                    actor_id=actor_id,
+                    role="revision",
+                    content=full_response,
+                )
+                self.db.add(message)
+                self.actor_responses[actor_id].append({
+                    "role": "revision",
+                    "content": full_response,
+                    "cycle": cycle,
+                })
+
+        await self.db.commit()
 
     async def _check_convergence(self) -> ConvergenceResult:
         """Check if responses have converged."""
@@ -3204,11 +3243,11 @@ Please revise your response to:
 
     async def _run_semantic_analysis(self, round_number: int, phase: str, cycle: int = 0):
         """
-        Run semantic analysis on the latest responses.
+        Run semantic analysis on the latest responses with parallel execution.
 
         This method:
         1. Analyzes question intent (first time only)
-        2. Extracts semantic topics from each actor's response
+        2. Extracts semantic topics from each actor's response (parallel)
         3. Compares topics across actors
         4. Emits semantic_comparison event with canonical phase_id
 
@@ -3227,26 +3266,54 @@ Please revise your response to:
             judge = result.scalar_one_or_none()
 
             if not judge:
-                logger.warning("Judge actor not found for semantic analysis")
+                logger.warning("Judge actor not found for semantic analysis, skipping")
                 return
 
             adapter = self.get_adapter(judge)
 
-            # Step 1: Analyze question intent (only once)
+            # Step 1: Analyze question intent (only once) - with timeout
             if not self.question_intent:
                 logger.info("Analyzing question intent...")
-                self.question_intent = await self.semantic_service.analyze_question_intent(
-                    question=self.session.question,
-                    adapter=adapter,
-                )
-                # Save to database
-                await self.semantic_service.save_question_intent(
-                    session_id=self.session.id,
-                    result=self.question_intent,
-                )
-                logger.info(f"Question intent analyzed: {len(self.question_intent.comparison_axes)} axes")
+                try:
+                    self.question_intent = await asyncio.wait_for(
+                        self.semantic_service.analyze_question_intent(
+                            question=self.session.question,
+                            adapter=adapter,
+                        ),
+                        timeout=60.0  # 60 second timeout
+                    )
+                    # Save to database
+                    await self.semantic_service.save_question_intent(
+                        session_id=self.session.id,
+                        result=self.question_intent,
+                    )
+                    logger.info(f"Question intent analyzed: {len(self.question_intent.comparison_axes)} axes")
+                except asyncio.TimeoutError:
+                    logger.warning("Question intent analysis timed out, using defaults")
+                    # Use default comparison axes
+                    self.question_intent = type('QuestionIntentResult', (), {
+                        'question_type': 'general',
+                        'user_goal': '',
+                        'time_horizons': [],
+                        'comparison_axes': [
+                            {"axis_id": "main_topic", "label": "核心观点"},
+                            {"axis_id": "approach", "label": "解决思路"},
+                        ]
+                    })()
+                except Exception as e:
+                    logger.error(f"Question intent analysis failed: {e}")
+                    # Use default comparison axes
+                    self.question_intent = type('QuestionIntentResult', (), {
+                        'question_type': 'general',
+                        'user_goal': '',
+                        'time_horizons': [],
+                        'comparison_axes': [
+                            {"axis_id": "main_topic", "label": "核心观点"},
+                            {"axis_id": "approach", "label": "解决思路"},
+                        ]
+                    })()
 
-            # Step 2: Extract semantic topics from each actor's latest response
+            # Step 2: Extract semantic topics from each actor's latest response (parallel)
             latest_answers = {}
             for actor in self.actors:
                 responses = self.actor_responses.get(actor.id, [])
@@ -3255,103 +3322,140 @@ Please revise your response to:
                         latest_answers[actor.id] = r["content"]
                         break
 
-            topics_by_actor = {}
-            for actor in self.actors:
+            if not latest_answers:
+                logger.warning("No answers found for semantic analysis")
+                return
+
+            # Parallel topic extraction using asyncio.gather with timeout
+            async def extract_topics_for_actor(actor: Actor):
                 content = latest_answers.get(actor.id, "")
                 if not content:
-                    continue
+                    return actor.id, []
 
                 logger.info(f"Extracting topics for actor {actor.name}...")
-                topics = await self.semantic_service.extract_semantic_topics(
-                    question=self.session.question,
-                    answer=content,
-                    comparison_axes=self.question_intent.comparison_axes,
-                    actor_id=actor.id,
-                    adapter=adapter,
-                )
-                topics_by_actor[actor.id] = topics
-
-                # Save to database
-                if topics:
-                    await self.semantic_service.save_semantic_topics(
-                        session_id=self.session.id,
-                        round_number=round_number,
-                        phase=phase,
-                        actor_id=actor.id,
-                        topics=topics,
-                        cycle=cycle,
+                try:
+                    topics = await asyncio.wait_for(
+                        self.semantic_service.extract_semantic_topics(
+                            question=self.session.question,
+                            answer=content,
+                            comparison_axes=self.question_intent.comparison_axes,
+                            actor_id=actor.id,
+                            adapter=adapter,
+                        ),
+                        timeout=30.0  # 30 second timeout per actor
                     )
+                    return actor.id, topics
+                except asyncio.TimeoutError:
+                    logger.warning(f"Topic extraction timed out for actor {actor.name}")
+                    return actor.id, []
+                except Exception as e:
+                    logger.error(f"Topic extraction failed for actor {actor.name}: {e}")
+                    return actor.id, []
+
+            extraction_tasks = [extract_topics_for_actor(actor) for actor in self.actors]
+            extraction_results = await asyncio.gather(*extraction_tasks, return_exceptions=True)
+
+            topics_by_actor = {}
+            for result in extraction_results:
+                if isinstance(result, tuple):
+                    actor_id, topics = result
+                    topics_by_actor[actor_id] = topics
+                    # Save to database
+                    if topics:
+                        try:
+                            await self.semantic_service.save_semantic_topics(
+                                session_id=self.session.id,
+                                round_number=round_number,
+                                phase=phase,
+                                actor_id=actor_id,
+                                topics=topics,
+                                cycle=cycle,
+                            )
+                        except Exception as e:
+                            logger.error(f"Failed to save semantic topics: {e}")
+                elif isinstance(result, Exception):
+                    logger.error(f"Topic extraction task failed: {result}")
 
             # Step 3: Compare topics across actors
             if len(topics_by_actor) >= 2:
                 logger.info("Comparing topics across actors...")
-                comparisons = await self.semantic_service.compare_actors(
-                    question=self.session.question,
-                    topics_by_actor=topics_by_actor,
-                    actors=self.actors,
-                    adapter=adapter,
-                )
-
-                # Save to database
-                if comparisons:
-                    await self.semantic_service.save_semantic_comparisons(
-                        session_id=self.session.id,
-                        round_number=round_number,
-                        phase=phase,
-                        comparisons=comparisons,
-                        cycle=cycle,
+                try:
+                    comparisons = await asyncio.wait_for(
+                        self.semantic_service.compare_actors(
+                            question=self.session.question,
+                            topics_by_actor=topics_by_actor,
+                            actors=self.actors,
+                            adapter=adapter,
+                        ),
+                        timeout=60.0  # 60 second timeout
                     )
 
-                self.latest_semantic_comparisons = comparisons
+                    # Save to database
+                    if comparisons:
+                        await self.semantic_service.save_semantic_comparisons(
+                            session_id=self.session.id,
+                            round_number=round_number,
+                            phase=phase,
+                            comparisons=comparisons,
+                            cycle=cycle,
+                        )
 
-                # Emit semantic_comparison event with canonical phase_id
-                # phase_id format: "step:phase[:cycle]" (cycle only for revision)
-                phase_id = f"{round_number}:{phase}"
-                if phase == "revision" and cycle:
-                    phase_id = f"{round_number}:{phase}:{cycle}"
+                    self.latest_semantic_comparisons = comparisons
 
-                comparison_data = [
-                    {
-                        "topic_id": c.topic_id,
-                        "label": c.label,
-                        "salience": c.salience,
-                        "disagreement_score": c.disagreement_score,
-                        "status": c.status,
-                        "difference_types": c.difference_types,
-                        "agreement_summary": c.agreement_summary,
-                        "disagreement_summary": c.disagreement_summary,
-                        "actor_positions": [
-                            {
-                                "actor_id": p.actor_id,
-                                "actor_name": p.actor_name,
-                                "stance_label": p.stance_label,
-                                "summary": p.summary,
-                                "quotes": p.quotes,
-                            }
-                            for p in c.actor_positions
-                        ],
-                    }
-                    for c in comparisons
-                ]
+                    # Emit semantic_comparison event with canonical phase_id
+                    phase_id = f"{round_number}:{phase}"
+                    if phase == "revision" and cycle:
+                        phase_id = f"{round_number}:{phase}:{cycle}"
 
-                await self._emit({
-                    "event": "semantic_comparison",
-                    "data": {
-                        "phase_id": phase_id,
-                        "round_number": round_number,
-                        "phase": phase,
-                        "cycle": cycle,
-                        "question_intent": {
-                            "question_type": self.question_intent.question_type,
-                            "user_goal": self.question_intent.user_goal,
-                            "time_horizons": self.question_intent.time_horizons,
-                            "comparison_axes": self.question_intent.comparison_axes,
-                        },
-                        "comparisons": comparison_data,
-                    }
-                })
+                    comparison_data = [
+                        {
+                            "topic_id": c.topic_id,
+                            "label": c.label,
+                            "salience": c.salience,
+                            "disagreement_score": c.disagreement_score,
+                            "status": c.status,
+                            "difference_types": c.difference_types,
+                            "agreement_summary": c.agreement_summary,
+                            "disagreement_summary": c.disagreement_summary,
+                            "actor_positions": [
+                                {
+                                    "actor_id": p.actor_id,
+                                    "actor_name": p.actor_name,
+                                    "stance_label": p.stance_label,
+                                    "summary": p.summary,
+                                    "quotes": p.quotes,
+                                }
+                                for p in c.actor_positions
+                            ],
+                        }
+                        for c in comparisons
+                    ]
 
-                logger.info(f"Semantic analysis complete: {len(comparisons)} topics analyzed")
+                    await self._emit({
+                        "event": "semantic_comparison",
+                        "data": {
+                            "phase_id": phase_id,
+                            "round_number": round_number,
+                            "phase": phase,
+                            "cycle": cycle,
+                            "question_intent": {
+                                "question_type": self.question_intent.question_type,
+                                "user_goal": self.question_intent.user_goal,
+                                "time_horizons": self.question_intent.time_horizons,
+                                "comparison_axes": self.question_intent.comparison_axes,
+                            },
+                            "comparisons": comparison_data,
+                        }
+                    })
+
+                    logger.info(f"Semantic analysis complete: {len(comparisons)} topics analyzed")
+
+                except asyncio.TimeoutError:
+                    logger.warning("Topic comparison timed out")
+                except Exception as e:
+                    logger.error(f"Topic comparison failed: {e}")
+            else:
+                logger.info(f"Not enough actors with topics ({len(topics_by_actor)}), skipping comparison")
 
         except Exception as e:
             logger.error(f"Semantic analysis failed: {e}", exc_info=True)
@@ -3415,8 +3519,18 @@ Please revise your response to:
         await self.db.commit()
         await self.db.refresh(final_round)
 
-        # Build final answer prompt
-        final_answer_prompt = f"""你是一个综合决策助手，需要基于多轮互评的结果，输出一篇面向用户的最终回答。
+        # Build final answer prompt using prompt_service
+        system_prompt = judge.system_prompt or "你是一个专业的综合决策助手，输出简洁明了的最终回答。"
+
+        try:
+            final_answer_prompt = await self.prompt_service.get_final_answer_prompt(
+                question=self.session.question,
+                actor_answers="\n\n".join(answer_list),
+                convergence_info=convergence_info,
+            )
+        except PromptError:
+            # Fallback to hardcoded prompt if template not found
+            final_answer_prompt = f"""你是一个综合决策助手，需要基于多轮互评的结果，输出一篇面向用户的最终回答。
 
 ## 原始问题
 
@@ -3436,8 +3550,6 @@ Please revise your response to:
 4. 使用清晰、自然的语言，不要使用 JSON 格式
 5. 直接给出最终回答，不要解释过程
 """
-
-        system_prompt = judge.system_prompt or "你是一个专业的综合决策助手，输出简洁明了的最终回答。"
 
         # Emit actor_start with judge's info
         await self._emit({
@@ -3544,26 +3656,6 @@ Please revise your response to:
 {chr(10).join(f"- {d}" for d in convergence_result.disagreements) if convergence_result.disagreements else "- 无"}
 """
 
-        # Build summary prompt
-        summary_prompt = f"""Based on the following multi-agent review, please provide a comprehensive summary.
-{history}
-{convergence_info}
-Please provide:
-1. A concise summary of the key conclusions
-2. Points where all participants agreed
-3. Points where participants disagreed
-4. Your confidence level (0-1) in the consensus
-5. A final recommendation
-
-Format your response as JSON:
-{{
-  "summary": "...",
-  "agreements": ["point 1", "point 2"],
-  "disagreements": ["point 1"],
-  "confidence": 0.85,
-  "recommendation": "..."
-}}"""
-
         system_prompt = judge.system_prompt or "You are an impartial Meta Judge synthesizing multi-agent reviews. Always respond with valid JSON."
 
         # Create DB round for summary
@@ -3575,6 +3667,33 @@ Format your response as JSON:
         self.db.add(summary_round)
         await self.db.commit()
         await self.db.refresh(summary_round)
+
+        # Build summary prompt using prompt_service
+        try:
+            summary_prompt = await self.prompt_service.get_summary_prompt(
+                question=self.session.question,
+                history=history,
+            )
+        except PromptError:
+            # Fallback to hardcoded prompt if template not found
+            summary_prompt = f"""Based on the following multi-agent review, please provide a comprehensive summary.
+{history}
+{convergence_info}
+Please provide:
+1. A concise summary of the key conclusions
+2. Points where all participants agreed
+3. Points where participants disagreed
+4. Your confidence level (0-1) in the consensus - only provide a number if you can make a confident assessment
+5. A final recommendation
+
+Format your response as JSON:
+{{
+  "summary": "...",
+  "agreements": ["point 1", "point 2"],
+  "disagreements": ["point 1"],
+  "confidence": <0.0-1.0 or omit if uncertain>,
+  "recommendation": "..."
+}}"""
 
         # Emit judge start with judge's actual id
         await self._emit({
@@ -3621,18 +3740,21 @@ Format your response as JSON:
         except json.JSONDecodeError:
             pass
 
-        # If first attempt failed, try a more structured retry
+        # If first attempt failed, try a more structured retry with context
         if not parse_success:
             logger.warning(f"Summary JSON parse failed, attempting retry with stricter prompt")
-            retry_prompt = """The previous response could not be parsed as JSON. Please provide ONLY a valid JSON object with no additional text:
+            retry_prompt = f"""Based on this multi-agent review, provide ONLY a valid JSON object with no additional text.
 
-{
+Original Question: {self.session.question}
+
+The previous response could not be parsed. Please provide ONLY a valid JSON object:
+{{
   "summary": "Brief summary of conclusions",
   "agreements": ["point 1", "point 2"],
   "disagreements": ["point 1"],
-  "confidence": 0.85,
+  "confidence": <0.0-1.0 or omit if uncertain>,
   "recommendation": "Brief recommendation"
-}"""
+}}"""
 
             retry_response = ""
             async for token in adapter.stream_completion(
@@ -4340,8 +4462,8 @@ class SemanticService:
 
 请以 JSON 格式返回：
 {{
-  "salience": 0.9,
-  "disagreement_score": 0.3,
+  "salience": "<0.0-1.0之间的小数，表示该主题的重要性>",
+  "disagreement_score": "<0.0-1.0之间的小数，0表示完全一致，1表示完全分歧>",
   "status": "converged/divergent/partial",
   "difference_types": ["solution_class", "time_horizon", "risk_preference"],
   "agreement_summary": "一致点",
@@ -4966,32 +5088,36 @@ module.exports = nextConfig
     "lint": "next lint"
   },
   "dependencies": {
-    "next": "14.2.3",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "zustand": "^4.5.2",
-    "framer-motion": "^11.0.24",
-    "clsx": "^2.1.0",
-    "tailwind-merge": "^2.2.2",
     "@radix-ui/react-dialog": "^1.0.5",
     "@radix-ui/react-dropdown-menu": "^2.0.6",
     "@radix-ui/react-select": "^2.0.0",
     "@radix-ui/react-tabs": "^1.0.4",
     "@radix-ui/react-tooltip": "^1.0.7",
-    "lucide-react": "^0.363.0"
+    "clsx": "^2.1.0",
+    "framer-motion": "^11.0.24",
+    "lucide-react": "^0.363.0",
+    "next": "14.2.3",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-markdown": "^10.1.0",
+    "rehype-sanitize": "^6.0.0",
+    "remark-gfm": "^4.0.1",
+    "tailwind-merge": "^2.2.2",
+    "zustand": "^4.5.2"
   },
   "devDependencies": {
-    "typescript": "^5.4.3",
     "@types/node": "^20.11.30",
     "@types/react": "^18.2.67",
     "@types/react-dom": "^18.2.22",
     "autoprefixer": "^10.4.19",
+    "eslint": "^8.57.0",
+    "eslint-config-next": "14.2.3",
     "postcss": "^8.4.38",
     "tailwindcss": "^3.4.3",
-    "eslint": "^8.57.0",
-    "eslint-config-next": "14.2.3"
+    "typescript": "^5.4.3"
   }
 }
+
 ```
 
 
@@ -5746,7 +5872,7 @@ import ActorManager from './ActorManager'
 import SessionHistory from './SessionHistory'
 import SettingsView from './SettingsView'
 import SessionDetailView from './SessionDetailView'
-import ConsensusView from './ConsensusView'
+import ProgressBar from './ProgressBar'
 import { apiClient } from '@/lib/apiClient'
 
 type View = 'arena' | 'debate' | 'actors' | 'history' | 'settings' | 'sessionDetail'
@@ -5770,7 +5896,6 @@ export default function Arena() {
 
   const {
     status,
-    currentRound,
     currentPhase,
     currentSession,
     currentSessionId,
@@ -5784,6 +5909,7 @@ export default function Arena() {
     stopDebate,
     reset,
     error,
+    progress,
   } = useDebateStore()
 
   const inputRef = useRef<HTMLTextAreaElement>(null)
@@ -5854,7 +5980,7 @@ export default function Arena() {
       <div className="h-screen flex flex-col overflow-hidden">
         {/* Header */}
         <header className="border-b border-border px-6 py-4 shrink-0">
-          <div className="flex items-center justify-between max-w-7xl mx-auto">
+          <div className="flex items-center justify-between max-w-[1600px] mx-auto">
             <button
               onClick={handleBackToArena}
               className="text-text-secondary hover:text-text-primary transition-colors"
@@ -5868,7 +5994,7 @@ export default function Arena() {
 
         {/* Debate content - main area with fixed height */}
         <main className="flex-1 overflow-hidden">
-          <div className="h-full max-w-7xl mx-auto px-6 py-4 flex flex-col">
+          <div className="h-full max-w-[1600px] mx-auto px-6 py-4 flex flex-col">
             {/* Question - fixed at top */}
             <div className="mb-4 shrink-0">
               <h2 className="text-lg text-text-secondary mb-1">问题</h2>
@@ -5884,11 +6010,15 @@ export default function Arena() {
                 </div>
               )}
               {status === 'streaming' && (
-                <div className="flex items-center gap-2">
-                  <span className="text-accent-blue">Round {currentRound}</span>
-                  <span className="text-text-tertiary">•</span>
-                  <span className="text-text-secondary capitalize">{currentPhase}</span>
-                </div>
+                <ProgressBar
+                  startedAt={progress.startedAt}
+                  currentPhaseStartedAt={progress.currentPhaseStartedAt}
+                  completedSteps={progress.completedSteps}
+                  estimatedTotalSteps={progress.estimatedTotalSteps}
+                  currentStepProgress={progress.currentStepProgress}
+                  currentPhase={currentPhase}
+                  status={status}
+                />
               )}
               {status === 'completed' && (
                 <div className="text-accent-green">互评完成</div>
@@ -5901,7 +6031,7 @@ export default function Arena() {
               )}
             </div>
 
-            {/* Debate view - scrollable area */}
+            {/* Debate view - scrollable area with consensus inside */}
             {status !== 'idle' && (
               <div className="flex-1 min-h-0">
                 <DebateView
@@ -5915,14 +6045,8 @@ export default function Arena() {
                   semanticComparisons={semanticComparisons}
                   selectedTopicId={selectedTopicId}
                   onSelectTopic={selectTopic}
+                  consensus={currentSession?.consensus}  // Pass consensus to DebateView
                 />
-              </div>
-            )}
-
-            {/* Consensus - fixed at bottom */}
-            {currentSession?.consensus && status === 'completed' && (
-              <div className="mt-4 shrink-0">
-                <ConsensusView consensus={currentSession.consensus} />
               </div>
             )}
           </div>
@@ -6139,6 +6263,7 @@ export default function Arena() {
 import { motion } from 'framer-motion'
 import { Consensus } from '@/types'
 import { Check, X, Lightbulb } from 'lucide-react'
+import MarkdownBlock from './MarkdownBlock'
 
 interface ConsensusViewProps {
   consensus: Consensus
@@ -6181,7 +6306,7 @@ export default function ConsensusView({ consensus }: ConsensusViewProps) {
         {/* Summary */}
         <div>
           <h4 className="text-text-secondary text-sm mb-2">Summary</h4>
-          <p className="text-text-primary">{consensus.summary}</p>
+          <MarkdownBlock content={consensus.summary} />
         </div>
 
         {/* Agreements */}
@@ -6195,7 +6320,7 @@ export default function ConsensusView({ consensus }: ConsensusViewProps) {
               {consensus.agreements.map((agreement, i) => (
                 <li key={i} className="flex items-start gap-2">
                   <span className="text-accent-green mt-1">•</span>
-                  <span className="text-text-primary">{agreement}</span>
+                  <MarkdownBlock content={agreement} className="flex-1" />
                 </li>
               ))}
             </ul>
@@ -6213,7 +6338,7 @@ export default function ConsensusView({ consensus }: ConsensusViewProps) {
               {consensus.disagreements.map((disagreement, i) => (
                 <li key={i} className="flex items-start gap-2">
                   <span className="text-accent-orange mt-1">•</span>
-                  <span className="text-text-primary">{disagreement}</span>
+                  <MarkdownBlock content={disagreement} className="flex-1" />
                 </li>
               ))}
             </ul>
@@ -6227,7 +6352,7 @@ export default function ConsensusView({ consensus }: ConsensusViewProps) {
               <Lightbulb className="w-4 h-4 text-accent-blue" />
               Recommendation
             </h4>
-            <p className="text-text-primary">{consensus.recommendation}</p>
+            <MarkdownBlock content={consensus.recommendation} />
           </div>
         )}
       </div>
@@ -6244,7 +6369,7 @@ export default function ConsensusView({ consensus }: ConsensusViewProps) {
 
 import { useState, useMemo, useEffect } from 'react'
 import { motion } from 'framer-motion'
-import { Actor, LivePhaseRecord, TopicComparison } from '@/types'
+import { Actor, LivePhaseRecord, TopicComparison, Consensus } from '@/types'
 import ReviewChatView from './ReviewChatView'
 import SemanticSidebar from './SemanticSidebar'
 import DiffSidebar from './DiffSidebar'
@@ -6260,6 +6385,7 @@ interface DebateViewProps {
   semanticComparisons?: Map<string, TopicComparison[]>
   selectedTopicId?: string | null
   onSelectTopic?: (topicId: string | null) => void
+  consensus?: Consensus | null  // Add consensus prop
 }
 
 type SidebarTab = 'semantic' | 'diff'
@@ -6275,6 +6401,7 @@ export default function DebateView({
   semanticComparisons = new Map(),
   selectedTopicId = null,
   onSelectTopic,
+  consensus,
 }: DebateViewProps) {
   // Sidebar tab state
   const [sidebarTab, setSidebarTab] = useState<SidebarTab>('semantic')
@@ -6307,20 +6434,6 @@ export default function DebateView({
     return semanticComparisons.size > 0
   }, [semanticComparisons])
 
-  // Auto-switch to diff tab if no semantic data available
-  useEffect(() => {
-    if (!hasSemanticData && phaseHistory.length > 0) {
-      // Check if there are comparable phases for diff
-      const comparablePhases = phaseHistory.filter((record) => {
-        if (!['initial', 'review', 'revision'].includes(record.phase)) return false
-        return Object.keys(record.messages).length >= 2
-      })
-      if (comparablePhases.length > 0 && sidebarTab === 'semantic') {
-        setSidebarTab('diff')
-      }
-    }
-  }, [hasSemanticData, phaseHistory, sidebarTab])
-
   return (
     <div className="flex h-full min-h-0">
       {/* Main chat area (left ~2/3) - scrolls independently */}
@@ -6334,6 +6447,7 @@ export default function DebateView({
             // On click, set this actor as base for diff
             setSelectedBaseId(actorId)
           }}
+          consensus={consensus}
         />
       </div>
 
@@ -6373,6 +6487,7 @@ export default function DebateView({
               onSelectDiffPhase={onSelectDiffPhase}
               selectedTopicId={selectedTopicId}
               onSelectTopic={onSelectTopic || (() => {})}
+              onSwitchToDiffTab={() => setSidebarTab('diff')}
             />
           ) : (
             <DiffSidebar
@@ -6661,6 +6776,256 @@ export { default as SettingsView } from './SettingsView'
 export { default as SessionDetailView } from './SessionDetailView'
 export { default as ReviewChatView } from './ReviewChatView'
 export { default as DiffSidebar } from './DiffSidebar'
+export { default as MarkdownBlock } from './MarkdownBlock'
+```
+
+
+### frontend\src\components\MarkdownBlock.tsx
+
+```tsx
+'use client'
+
+import { useMemo } from 'react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+import rehypeSanitize from 'rehype-sanitize'
+
+interface MarkdownBlockProps {
+  content: string
+  className?: string
+}
+
+/**
+ * MarkdownBlock - Renders markdown content with GFM support and XSS protection.
+ *
+ * Features:
+ * - GitHub Flavored Markdown (tables, strikethrough, task lists)
+ * - XSS protection via rehype-sanitize
+ * - Tailwind typography styles
+ * - Streaming-friendly (works with partial markdown)
+ */
+export default function MarkdownBlock({ content, className = '' }: MarkdownBlockProps) {
+  // Memoize the sanitize schema to avoid recreation on every render
+  const sanitizeSchema = useMemo(() => ({
+    // Allow standard HTML tags but strip dangerous attributes
+    tagNames: [
+      'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+      'p', 'br', 'hr',
+      'ul', 'ol', 'li',
+      'blockquote', 'pre', 'code',
+      'strong', 'em', 'del', 's',
+      'a', 'img',
+      'table', 'thead', 'tbody', 'tr', 'th', 'td',
+      'span', 'div',
+    ],
+    attributes: {
+      a: ['href', 'title'],
+      img: ['src', 'alt', 'title'],
+      code: ['className'],
+      pre: ['className'],
+      span: ['className'],
+      th: ['align'],
+      td: ['align'],
+    },
+  }), [])
+
+  return (
+    <div className={`prose prose-invert prose-sm max-w-none ${className}`}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        rehypePlugins={[[rehypeSanitize, sanitizeSchema]]}
+        components={{
+          // Custom styling for code blocks
+          pre: ({ children }) => (
+            <pre className="bg-bg-tertiary rounded-lg p-3 overflow-x-auto text-xs">
+              {children}
+            </pre>
+          ),
+          code: ({ className, children, ...props }) => {
+            const isInline = !className
+            if (isInline) {
+              return (
+                <code className="bg-bg-tertiary px-1.5 py-0.5 rounded text-xs" {...props}>
+                  {children}
+                </code>
+              )
+            }
+            return (
+              <code className={className} {...props}>
+                {children}
+              </code>
+            )
+          },
+          // Custom link styling
+          a: ({ href, children }) => (
+            <a
+              href={href}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-accent-blue hover:underline"
+            >
+              {children}
+            </a>
+          ),
+          // Custom table styling
+          table: ({ children }) => (
+            <div className="overflow-x-auto my-3">
+              <table className="min-w-full border-collapse text-xs">
+                {children}
+              </table>
+            </div>
+          ),
+          th: ({ children }) => (
+            <th className="border border-border px-2 py-1 bg-bg-tertiary text-left font-medium">
+              {children}
+            </th>
+          ),
+          td: ({ children }) => (
+            <td className="border border-border px-2 py-1">
+              {children}
+            </td>
+          ),
+          // Custom list styling
+          ul: ({ children }) => (
+            <ul className="list-disc list-inside space-y-1 my-2 text-text-primary">
+              {children}
+            </ul>
+          ),
+          ol: ({ children }) => (
+            <ol className="list-decimal list-inside space-y-1 my-2 text-text-primary">
+              {children}
+            </ol>
+          ),
+          // Blockquote styling
+          blockquote: ({ children }) => (
+            <blockquote className="border-l-2 border-accent-blue pl-3 my-2 text-text-secondary italic">
+              {children}
+            </blockquote>
+          ),
+          // Heading styles
+          h1: ({ children }) => (
+            <h1 className="text-xl font-bold mt-4 mb-2 text-text-primary">{children}</h1>
+          ),
+          h2: ({ children }) => (
+            <h2 className="text-lg font-bold mt-3 mb-2 text-text-primary">{children}</h2>
+          ),
+          h3: ({ children }) => (
+            <h3 className="text-base font-bold mt-2 mb-1 text-text-primary">{children}</h3>
+          ),
+          // Paragraph
+          p: ({ children }) => (
+            <p className="my-1 text-text-primary">{children}</p>
+          ),
+        }}
+      >
+        {content}
+      </ReactMarkdown>
+    </div>
+  )
+}
+```
+
+
+### frontend\src\components\ProgressBar.tsx
+
+```tsx
+'use client'
+
+import { useMemo } from 'react'
+
+interface ProgressProps {
+  startedAt: number | null
+  currentPhaseStartedAt: number | null
+  completedSteps: number
+  estimatedTotalSteps: number
+  currentStepProgress: number
+  currentPhase: string
+  status: string
+}
+
+const phaseLabels: Record<string, string> = {
+  initial: '初始回答',
+  review: '互评',
+  revision: '修订',
+  final_answer: '最终回答',
+  summary: '总结',
+}
+
+function formatDuration(ms: number): string {
+  const seconds = Math.floor(ms / 1000)
+  if (seconds < 60) return `${seconds}秒`
+  const minutes = Math.floor(seconds / 60)
+  const remainingSeconds = seconds % 60
+  return `${minutes}分${remainingSeconds}秒`
+}
+
+function formatETA(remainingMs: number): string {
+  if (remainingMs < 0) return '即将完成'
+  return formatDuration(remainingMs)
+}
+
+export default function ProgressBar({
+  startedAt,
+  currentPhaseStartedAt,
+  completedSteps,
+  estimatedTotalSteps,
+  currentStepProgress,
+  currentPhase,
+  status,
+}: ProgressProps) {
+  const progress = useMemo(() => {
+    if (!startedAt) return { percent: 0, elapsed: 0, eta: 0 }
+
+    const now = Date.now()
+    const elapsed = now - startedAt
+
+    // Calculate overall progress
+    const overallProgress = (completedSteps + currentStepProgress) / estimatedTotalSteps
+    const percent = Math.min(100, Math.round(overallProgress * 100))
+
+    // Calculate ETA based on average time per step
+    let eta = 0
+    if (completedSteps > 0 && overallProgress > 0) {
+      const avgTimePerStep = elapsed / (completedSteps + currentStepProgress)
+      const remainingSteps = estimatedTotalSteps - completedSteps - currentStepProgress
+      eta = Math.max(0, remainingSteps * avgTimePerStep)
+    }
+
+    return { percent, elapsed, eta }
+  }, [startedAt, completedSteps, estimatedTotalSteps, currentStepProgress])
+
+  if (status === 'idle' || status === 'completed') return null
+
+  const phaseLabel = phaseLabels[currentPhase] || currentPhase
+
+  return (
+    <div className="flex items-center gap-4 text-sm">
+      {/* Progress bar */}
+      <div className="flex-1 max-w-xs">
+        <div className="h-2 bg-bg-tertiary rounded-full overflow-hidden">
+          <div
+            className="h-full bg-accent-blue rounded-full transition-all duration-300"
+            style={{ width: `${progress.percent}%` }}
+          />
+        </div>
+      </div>
+
+      {/* Progress text */}
+      <div className="flex items-center gap-3 text-text-secondary">
+        <span className="text-xs">{progress.percent}%</span>
+        <span className="text-xs">{phaseLabel}</span>
+        <span className="text-xs text-text-tertiary">
+          {formatDuration(progress.elapsed)}
+        </span>
+        {progress.eta > 0 && status === 'streaming' && (
+          <span className="text-xs text-text-tertiary">
+            预计 {formatETA(progress.eta)}
+          </span>
+        )}
+      </div>
+    </div>
+  )
+}
 ```
 
 
@@ -6671,7 +7036,9 @@ export { default as DiffSidebar } from './DiffSidebar'
 
 import { useMemo, useRef, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Actor, LivePhaseRecord, LiveMessage, ConvergenceData } from '@/types'
+import { Actor, LivePhaseRecord, LiveMessage, ConvergenceData, Consensus } from '@/types'
+import ConsensusView from './ConsensusView'
+import MarkdownBlock from './MarkdownBlock'
 
 interface ReviewChatViewProps {
   question: string
@@ -6679,6 +7046,7 @@ interface ReviewChatViewProps {
   phaseHistory: LivePhaseRecord[]
   status: string
   onMessageClick?: (actorId: string, phase: string) => void
+  consensus?: Consensus | null  // Add consensus prop
 }
 
 const phaseLabels: Record<string, string> = {
@@ -6732,12 +7100,10 @@ function MessageCard({
 
       {/* Content */}
       <div className="px-4 py-4">
-        <div className="text-text-primary whitespace-pre-wrap">
-          {message.content}
-          {message.status === 'streaming' && (
-            <span className="inline-block w-2 h-4 bg-text-primary animate-pulse ml-1" />
-          )}
-        </div>
+        <MarkdownBlock content={message.content} />
+        {message.status === 'streaming' && (
+          <span className="inline-block w-2 h-4 bg-text-primary animate-pulse ml-1" />
+        )}
       </div>
     </motion.div>
   )
@@ -6758,7 +7124,7 @@ function ConvergenceCard({ convergence }: { convergence: ConvergenceData }) {
         <span className={`ml-auto px-2 py-0.5 rounded text-xs font-bold ${
           convergence.converged
             ? 'bg-accent-green/20 text-accent-green'
-            : 'bg-accent-yellow/20 text-accent-yellow'
+            : 'bg-accent-orange/20 text-accent-orange'
         }`}>
           {convergence.converged ? '已收敛' : '继续讨论'}
         </span>
@@ -6801,7 +7167,7 @@ function ConvergenceCard({ convergence }: { convergence: ConvergenceData }) {
         {/* Disagreements */}
         {convergence.disagreements && convergence.disagreements.length > 0 && (
           <div>
-            <div className="text-accent-yellow text-xs mb-1">⚡ 仍存分歧</div>
+            <div className="text-accent-orange text-xs mb-1">⚡ 仍存分歧</div>
             <ul className="text-text-tertiary text-xs space-y-1 list-disc list-inside">
               {convergence.disagreements.map((d, i) => (
                 <li key={i}>{d}</li>
@@ -6820,6 +7186,7 @@ export default function ReviewChatView({
   phaseHistory,
   status,
   onMessageClick,
+  consensus,
 }: ReviewChatViewProps) {
   const scrollRef = useRef<HTMLDivElement>(null)
 
@@ -6905,6 +7272,11 @@ export default function ReviewChatView({
           <div className="animate-pulse">等待响应...</div>
         </div>
       )}
+
+      {/* Consensus - rendered inside scrollable area */}
+      {consensus && status === 'completed' && (
+        <ConsensusView consensus={consensus} />
+      )}
     </div>
   )
 }
@@ -6928,6 +7300,7 @@ interface SemanticSidebarProps {
   selectedTopicId: string | null
   onSelectTopic: (topicId: string | null) => void
   onShowRawDiff?: () => void
+  onSwitchToDiffTab?: () => void  // Callback to switch to diff tab
 }
 
 const phaseLabels: Record<string, string> = {
@@ -6974,6 +7347,7 @@ export default function SemanticSidebar({
   selectedTopicId,
   onSelectTopic,
   onShowRawDiff,
+  onSwitchToDiffTab,
 }: SemanticSidebarProps) {
   const [showRawDiff, setShowRawDiff] = useState(false)
   const [hasUserSelectedPhase, setHasUserSelectedPhase] = useState(false)
@@ -7104,10 +7478,33 @@ export default function SemanticSidebar({
       {/* Topic list with labels - not just bubbles - scrollable */}
       <div className="flex-1 overflow-y-auto p-3 min-h-0">
         {!selectedComparisons.length ? (
-          <div className="text-text-tertiary text-xs text-center py-8">
-            {comparablePhases.length === 0
-              ? '等待语义分析完成...'
-              : '该阶段暂无语义分析结果'}
+          <div className="text-text-tertiary text-xs text-center py-8 space-y-4">
+            {comparablePhases.length === 0 ? (
+              <>
+                <div className="text-text-secondary">当前阶段的语义图谱尚未生成</div>
+                <div>语义分析会在本轮回答完成后自动生成</div>
+                {phaseHistory.some(r => ['initial', 'review', 'revision'].includes(r.phase) && Object.keys(r.messages).length >= 2) && onSwitchToDiffTab && (
+                  <button
+                    onClick={onSwitchToDiffTab}
+                    className="px-4 py-2 bg-accent-blue/20 text-accent-blue rounded-lg hover:bg-accent-blue/30 transition-colors"
+                  >
+                    查看原文差异对比
+                  </button>
+                )}
+              </>
+            ) : (
+              <>
+                <div>该阶段暂无语义分析结果</div>
+                {onSwitchToDiffTab && (
+                  <button
+                    onClick={onSwitchToDiffTab}
+                    className="px-4 py-2 bg-accent-blue/20 text-accent-blue rounded-lg hover:bg-accent-blue/30 transition-colors"
+                  >
+                    查看原文差异对比
+                  </button>
+                )}
+              </>
+            )}
           </div>
         ) : (
           <div className="space-y-3">
@@ -7143,7 +7540,7 @@ export default function SemanticSidebar({
                             ? 'text-accent-green'
                             : comparison.status === 'divergent'
                             ? 'text-accent-red'
-                            : 'text-accent-yellow'
+                            : 'text-accent-orange'
                         }`}>
                           {getStatusLabel(comparison.status)}
                         </span>
@@ -7279,48 +7676,28 @@ function ActorPositionCard({ position }: { position: ActorPosition }) {
 
 import { useState, useEffect, useMemo } from 'react'
 import { motion } from 'framer-motion'
-import { ArrowLeft, Loader2 } from 'lucide-react'
+import { ArrowLeft, Loader2, AlertCircle } from 'lucide-react'
 import { apiClient } from '@/lib/apiClient'
-import { DebateSession, Actor, Round, Message } from '@/types'
+import { DebateSession, Actor, SemanticAnalysisResult, TopicComparison } from '@/types'
+import {
+  hydrateSessionToPhaseHistory,
+  hydrateSemanticToMap,
+  hydrateConsensus,
+} from '@/lib/sessionHydrator'
+import DebateView from './DebateView'
 
 interface SessionDetailViewProps {
   sessionId: string
   onBack: () => void
 }
 
-// Diff utility for comparing texts
-function computeDiff(oldText: string, newText: string): { type: 'add' | 'remove' | 'same'; text: string }[] {
-  const oldLines = oldText.split(/[。！？\n]/).filter(l => l.trim())
-  const newLines = newText.split(/[。！？\n]/).filter(l => l.trim())
-
-  const result: { type: 'add' | 'remove' | 'same'; text: string }[] = []
-  const oldSet = new Set(oldLines)
-  const newSet = new Set(newLines)
-
-  // Simple line-based diff
-  for (const line of oldLines) {
-    if (!newSet.has(line)) {
-      result.push({ type: 'remove', text: line })
-    }
-  }
-  for (const line of newLines) {
-    if (!oldSet.has(line)) {
-      result.push({ type: 'add', text: line })
-    } else {
-      result.push({ type: 'same', text: line })
-    }
-  }
-
-  return result
-}
-
 export default function SessionDetailView({ sessionId, onBack }: SessionDetailViewProps) {
   const [session, setSession] = useState<DebateSession | null>(null)
+  const [semantic, setSemantic] = useState<SemanticAnalysisResult | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [selectedPhase, setSelectedPhase] = useState<string>('initial')
-  const [baseActorId, setBaseActorId] = useState<string | null>(null)
-  const [compareActorId, setCompareActorId] = useState<string | null>(null)
+  const [selectedDiffPhaseId, setSelectedDiffPhaseId] = useState<string | null>(null)
+  const [selectedTopicId, setSelectedTopicId] = useState<string | null>(null)
 
   useEffect(() => {
     loadSession()
@@ -7330,14 +7707,13 @@ export default function SessionDetailView({ sessionId, onBack }: SessionDetailVi
     setLoading(true)
     setError(null)
     try {
-      const data = await apiClient.getDebate(sessionId)
-      setSession(data)
-      // Set default actor selection for diff
-      const actors = data.actors.filter(a => !a.is_meta_judge)
-      if (actors.length >= 2) {
-        setBaseActorId(actors[0].id)
-        setCompareActorId(actors[1].id)
-      }
+      // Load both session and semantic analysis in parallel
+      const [sessionData, semanticData] = await Promise.all([
+        apiClient.getDebate(sessionId),
+        apiClient.getSemanticAnalysis(sessionId).catch(() => null), // Don't fail if semantic is missing
+      ])
+      setSession(sessionData)
+      setSemantic(semanticData)
     } catch (err) {
       setError((err as Error).message)
     } finally {
@@ -7345,113 +7721,34 @@ export default function SessionDetailView({ sessionId, onBack }: SessionDetailVi
     }
   }
 
-  // Get messages grouped by phase for chat timeline
-  // Filter out summary phase - it should only show via ConsensusView, not in chat
-  const chatMessages = useMemo(() => {
+  // Convert historical data to live format
+  const phaseHistory = useMemo(() => {
     if (!session) return []
-
-    const messages: {
-      actor_id: string
-      actor_name: string
-      actor_color: string
-      actor_icon: string
-      round_number: number
-      phase: string
-      role: string
-      content: string
-      created_at: string
-    }[] = []
-
-    // Build actor lookup including judge_actor
-    const allActors: Actor[] = [...session.actors]
-    if (session.judge_actor) {
-      allActors.push(session.judge_actor)
-    }
-
-    for (const round of session.rounds) {
-      // Skip summary phase - only show via ConsensusView
-      if (round.phase === 'summary') continue
-
-      for (const msg of round.messages) {
-        // Skip summary role messages as well
-        if (msg.role === 'summary') continue
-
-        // First try to find actor in allActors (including judge)
-        let actor = allActors.find(a => a.id === msg.actor_id)
-        // If not found and we have actor_name from API, use it
-        if (!actor && msg.actor_name) {
-          // Create a synthetic actor from message data
-          actor = {
-            id: msg.actor_id,
-            name: msg.actor_name,
-            display_color: '#9333EA', // Default purple for judge
-            icon: '⚖️',
-            is_meta_judge: true,
-            provider: 'openai' as const,
-            model: '',
-            created_at: '',
-          }
-        }
-        if (actor) {
-          messages.push({
-            actor_id: msg.actor_id,
-            actor_name: actor.name,
-            actor_color: actor.display_color,
-            actor_icon: actor.icon,
-            round_number: round.round_number,
-            phase: round.phase,
-            role: msg.role,
-            content: msg.content,
-            created_at: msg.created_at,
-          })
-        }
-      }
-    }
-
-    return messages
+    return hydrateSessionToPhaseHistory(session)
   }, [session])
 
-  // Get unique phases from rounds (excluding summary for diff)
-  const phases = useMemo(() => {
-    if (!session) return []
-    const phaseSet = new Set<string>()
-    for (const round of session.rounds) {
-      // Exclude summary from phase selector
-      if (round.phase !== 'summary') {
-        phaseSet.add(round.phase)
-      }
-    }
-    return Array.from(phaseSet)
+  // Convert semantic data to comparisons map
+  const semanticComparisons = useMemo(() => {
+    return hydrateSemanticToMap(semantic)
+  }, [semantic])
+
+  // Get consensus
+  const consensus = useMemo(() => {
+    if (!session) return null
+    return hydrateConsensus(session)
   }, [session])
 
-  // Get messages for selected phase (for diff view)
-  const phaseMessages = useMemo(() => {
-    if (!session || !selectedPhase) return []
-    return session.rounds
-      .filter(r => r.phase === selectedPhase)
-      .flatMap(r => r.messages)
-  }, [session, selectedPhase])
+  // Get actors (non-judge for debate view)
+  const debateActors = useMemo(() => {
+    if (!session) return []
+    return session.actors.filter(a => !a.is_meta_judge)
+  }, [session])
 
-  // Compute diff between two actors
-  const diffResult = useMemo(() => {
-    if (!baseActorId || !compareActorId) return null
-
-    const baseMsg = phaseMessages.find(m => m.actor_id === baseActorId)
-    const compareMsg = phaseMessages.find(m => m.actor_id === compareActorId)
-
-    if (!baseMsg || !compareMsg) return null
-
-    return computeDiff(baseMsg.content, compareMsg.content)
-  }, [phaseMessages, baseActorId, compareActorId])
-
-  // Phase labels for display
-  const phaseLabels: Record<string, string> = {
-    initial: '初始回答',
-    review: '互评',
-    revision: '修订',
-    final_answer: '最终回答',
-    summary: '共识总结',
-  }
+  // Get judge actor
+  const judgeActor = useMemo(() => {
+    if (!session) return undefined
+    return session.judge_actor
+  }, [session])
 
   const formatDate = (dateStr: string) => {
     return new Date(dateStr).toLocaleString('zh-CN', {
@@ -7464,13 +7761,13 @@ export default function SessionDetailView({ sessionId, onBack }: SessionDetailVi
 
   if (loading) {
     return (
-      <div className="min-h-screen flex flex-col">
-        <header className="border-b border-border px-6 py-4">
-          <div className="flex items-center justify-between max-w-6xl mx-auto">
+      <div className="h-screen flex flex-col">
+        <header className="border-b border-border px-6 py-4 shrink-0">
+          <div className="flex items-center justify-between max-w-[1600px] mx-auto">
             <button onClick={onBack} className="text-text-secondary hover:text-text-primary transition-colors">
               ← Back
             </button>
-            <h1 className="text-lg font-semibold tracking-wider text-accent-orange">Session Detail</h1>
+            <h1 className="text-lg font-semibold tracking-wider text-accent-orange">MAGI</h1>
             <div className="w-16" />
           </div>
         </header>
@@ -7483,30 +7780,35 @@ export default function SessionDetailView({ sessionId, onBack }: SessionDetailVi
 
   if (error || !session) {
     return (
-      <div className="min-h-screen flex flex-col">
-        <header className="border-b border-border px-6 py-4">
-          <div className="flex items-center justify-between max-w-6xl mx-auto">
+      <div className="h-screen flex flex-col">
+        <header className="border-b border-border px-6 py-4 shrink-0">
+          <div className="flex items-center justify-between max-w-[1600px] mx-auto">
             <button onClick={onBack} className="text-text-secondary hover:text-text-primary transition-colors">
               ← Back
             </button>
-            <h1 className="text-lg font-semibold tracking-wider text-accent-orange">Session Detail</h1>
+            <h1 className="text-lg font-semibold tracking-wider text-accent-orange">MAGI</h1>
             <div className="w-16" />
           </div>
         </header>
-        <main className="flex-1 flex items-center justify-center">
-          <div className="text-accent-red">{error || 'Session not found'}</div>
+        <main className="flex-1 flex flex-col items-center justify-center gap-4">
+          <AlertCircle className="w-12 h-12 text-accent-red" />
+          <div className="text-accent-red text-lg">{error || 'Session not found'}</div>
+          <button
+            onClick={onBack}
+            className="px-4 py-2 bg-accent-blue/20 text-accent-blue rounded-lg hover:bg-accent-blue/30 transition-colors"
+          >
+            返回列表
+          </button>
         </main>
       </div>
     )
   }
 
-  const nonJudgeActors = session.actors.filter(a => !a.is_meta_judge)
-
   return (
-    <div className="min-h-screen flex flex-col">
+    <div className="h-screen flex flex-col overflow-hidden">
       {/* Header */}
-      <header className="border-b border-border px-6 py-4">
-        <div className="flex items-center justify-between max-w-6xl mx-auto">
+      <header className="border-b border-border px-6 py-4 shrink-0">
+        <div className="flex items-center justify-between max-w-[1600px] mx-auto">
           <button
             onClick={onBack}
             className="text-text-secondary hover:text-text-primary transition-colors"
@@ -7518,176 +7820,42 @@ export default function SessionDetailView({ sessionId, onBack }: SessionDetailVi
         </div>
       </header>
 
-      {/* Main Content */}
-      <main className="flex-1 flex overflow-hidden">
-        {/* Chat Timeline (left 2/3) */}
-        <div className="flex-1 overflow-auto p-6">
-          <div className="max-w-3xl mx-auto">
-            {/* Question */}
-            <div className="mb-8">
-              <h2 className="text-xl text-text-secondary mb-2">问题</h2>
-              <p className="text-2xl font-medium">{session.question}</p>
-              <p className="text-text-tertiary text-sm mt-2">{formatDate(session.created_at)}</p>
-            </div>
-
-            {/* Status */}
-            <div className="mb-6">
-              <span className={`px-3 py-1 rounded-full text-sm ${
-                session.status === 'completed' ? 'bg-accent-green/20 text-accent-green' :
-                session.status === 'debating' ? 'bg-accent-blue/20 text-accent-blue' :
-                'bg-text-tertiary/20 text-text-tertiary'
-              }`}>
-                {session.status === 'completed' ? '已完成' : session.status}
-              </span>
-            </div>
-
-            {/* Chat Messages */}
-            <div className="space-y-4">
-              {chatMessages.map((msg, idx) => (
-                <motion.div
-                  key={idx}
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ delay: idx * 0.02 }}
-                  className="bg-bg-secondary border border-border rounded-2xl overflow-hidden"
-                >
-                  {/* Header */}
-                  <div
-                    className="px-4 py-3 flex items-center gap-3 border-b border-border"
-                    style={{ backgroundColor: `${msg.actor_color}15` }}
-                  >
-                    <span className="text-xl">{msg.actor_icon}</span>
-                    <span className="font-medium" style={{ color: msg.actor_color }}>
-                      {msg.actor_name}
-                    </span>
-                    <span className="px-2 py-0.5 bg-text-tertiary/20 text-text-tertiary text-xs rounded">
-                      {phaseLabels[msg.phase] || msg.phase}
-                    </span>
-                  </div>
-
-                  {/* Content */}
-                  <div className="px-4 py-4">
-                    <div className="text-text-primary whitespace-pre-wrap">{msg.content}</div>
-                  </div>
-                </motion.div>
-              ))}
-            </div>
-
-            {/* Consensus */}
-            {session.consensus && (
-              <motion.div
-                initial={{ opacity: 0, y: 20 }}
-                animate={{ opacity: 1, y: 0 }}
-                className="mt-8 bg-accent-purple/10 border border-accent-purple/30 rounded-2xl p-6"
-              >
-                <h3 className="text-lg font-semibold text-accent-purple mb-4">综合结论</h3>
-                <div className="text-text-primary mb-4">{session.consensus.summary}</div>
-
-                {session.consensus.agreements.length > 0 && (
-                  <div className="mb-4">
-                    <h4 className="text-sm text-accent-green mb-2">共识点：</h4>
-                    <ul className="list-disc list-inside text-text-secondary text-sm">
-                      {session.consensus.agreements.map((a, i) => (
-                        <li key={i}>{a}</li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-
-                {session.consensus.disagreements.length > 0 && (
-                  <div className="mb-4">
-                    <h4 className="text-sm text-accent-orange mb-2">分歧点：</h4>
-                    <ul className="list-disc list-inside text-text-secondary text-sm">
-                      {session.consensus.disagreements.map((d, i) => (
-                        <li key={i}>{d}</li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-
-                <div className="flex items-center gap-2 text-sm">
-                  <span className="text-text-tertiary">置信度：</span>
-                  {session.consensus.confidence !== null && session.consensus.confidence !== undefined ? (
-                    <span className="text-accent-blue">{Math.round(session.consensus.confidence * 100)}%</span>
-                  ) : (
-                    <span className="text-text-tertiary">暂不可用</span>
-                  )}
-                </div>
-              </motion.div>
-            )}
-          </div>
-        </div>
-
-        {/* Diff Sidebar (right 1/3) */}
-        <div className="w-96 border-l border-border overflow-auto p-4 bg-bg-secondary">
-          <h3 className="text-text-secondary text-sm font-medium mb-4">差异对比</h3>
-
-          {/* Phase selector */}
-          <div className="mb-4">
-            <label className="text-text-tertiary text-xs block mb-1">阶段</label>
-            <select
-              value={selectedPhase}
-              onChange={(e) => setSelectedPhase(e.target.value)}
-              className="w-full px-3 py-2 bg-bg-tertiary border border-border rounded-lg text-sm focus:outline-none focus:border-accent-blue"
-            >
-              {phases.map((p) => (
-                <option key={p} value={p}>{phaseLabels[p] || p}</option>
-              ))}
-            </select>
+      {/* Main Content - uses unified DebateView */}
+      <main className="flex-1 overflow-hidden">
+        <div className="h-full max-w-[1600px] mx-auto px-6 py-4 flex flex-col">
+          {/* Question */}
+          <div className="mb-4 shrink-0">
+            <h2 className="text-lg text-text-secondary mb-1">问题</h2>
+            <p className="text-xl font-medium">{session.question}</p>
+            <p className="text-text-tertiary text-sm mt-1">{formatDate(session.created_at)}</p>
           </div>
 
-          {/* Actor selectors */}
-          <div className="flex gap-2 mb-4">
-            <div className="flex-1">
-              <label className="text-text-tertiary text-xs block mb-1">Base</label>
-              <select
-                value={baseActorId || ''}
-                onChange={(e) => setBaseActorId(e.target.value)}
-                className="w-full px-3 py-2 bg-bg-tertiary border border-border rounded-lg text-sm focus:outline-none focus:border-accent-blue"
-              >
-                {nonJudgeActors.map((a) => (
-                  <option key={a.id} value={a.id}>{a.name}</option>
-                ))}
-              </select>
-            </div>
-            <div className="flex-1">
-              <label className="text-text-tertiary text-xs block mb-1">Compare</label>
-              <select
-                value={compareActorId || ''}
-                onChange={(e) => setCompareActorId(e.target.value)}
-                className="w-full px-3 py-2 bg-bg-tertiary border border-border rounded-lg text-sm focus:outline-none focus:border-accent-blue"
-              >
-                {nonJudgeActors.map((a) => (
-                  <option key={a.id} value={a.id}>{a.name}</option>
-                ))}
-              </select>
-            </div>
+          {/* Status */}
+          <div className="mb-4 shrink-0">
+            <span className={`px-3 py-1 rounded-full text-sm ${
+              session.status === 'completed' ? 'bg-accent-green/20 text-accent-green' :
+              session.status === 'debating' ? 'bg-accent-blue/20 text-accent-blue' :
+              'bg-text-tertiary/20 text-text-tertiary'
+            }`}>
+              {session.status === 'completed' ? '已完成' : session.status}
+            </span>
           </div>
 
-          {/* Diff display */}
-          <div className="bg-bg-tertiary rounded-lg p-3 font-mono text-xs">
-            {diffResult ? (
-              <div className="space-y-1">
-                {diffResult.map((item, idx) => (
-                  <div
-                    key={idx}
-                    className={`${
-                      item.type === 'add' ? 'text-accent-green bg-accent-green/10' :
-                      item.type === 'remove' ? 'text-accent-red bg-accent-red/10' :
-                      'text-text-tertiary'
-                    } px-2 py-1 rounded`}
-                  >
-                    {item.type === 'add' && '+ '}
-                    {item.type === 'remove' && '- '}
-                    {item.text}
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <div className="text-text-tertiary text-center py-4">
-                选择两个 Actor 进行比较
-              </div>
-            )}
+          {/* Debate view - uses the same component as live mode */}
+          <div className="flex-1 min-h-0">
+            <DebateView
+              actors={debateActors}
+              judgeActor={judgeActor}
+              phaseHistory={phaseHistory}
+              selectedDiffPhaseId={selectedDiffPhaseId}
+              onSelectDiffPhase={setSelectedDiffPhaseId}
+              status="completed"
+              question={session.question}
+              semanticComparisons={semanticComparisons}
+              selectedTopicId={selectedTopicId}
+              onSelectTopic={setSelectedTopicId}
+              consensus={consensus}
+            />
           </div>
         </div>
       </main>
@@ -8511,6 +8679,11 @@ class ApiClient {
     return this.request<import('@/types').SessionListItem[]>('/api/sessions')
   }
 
+  // Semantic Analysis
+  async getSemanticAnalysis(sessionId: string) {
+    return this.request<import('@/types').SemanticAnalysisResult>(`/api/debate/${sessionId}/semantic`)
+  }
+
   // SSE Stream URL
   getStreamUrl(sessionId: string) {
     return `${API_BASE}/api/debate/${sessionId}/stream`
@@ -8619,6 +8792,139 @@ export function canShowDiff(text1: string | undefined | null, text2: string | un
   if (!text1 || !text2) return false
   if (text1.length < 10 || text2.length < 10) return false
   return true
+}
+```
+
+
+### frontend\src\lib\sessionHydrator.ts
+
+```typescript
+/**
+ * Session Hydrator - Convert historical session data to live format.
+ *
+ * This module provides utilities to transform database session data
+ * into the same format used by live SSE streaming, enabling the
+ * unified DebateWorkspace component to render both live and historical
+ * sessions consistently.
+ */
+
+import {
+  DebateSession,
+  Round,
+  Message,
+  LivePhaseRecord,
+  LiveMessage,
+  LivePhaseType,
+  TopicComparison,
+  SemanticAnalysisResult,
+  Consensus,
+  ConvergenceData,
+} from '@/types'
+
+/**
+ * Convert a historical session to live phase history format.
+ */
+export function hydrateSessionToPhaseHistory(session: DebateSession): LivePhaseRecord[] {
+  const phaseHistory: LivePhaseRecord[] = []
+  const actorMap = new Map(session.actors.map(a => [a.id, a]))
+  if (session.judge_actor) {
+    actorMap.set(session.judge_actor.id, session.judge_actor)
+  }
+
+  // Group messages by round/phase
+  for (const round of session.rounds) {
+    // Skip summary phase in chat - it's shown via ConsensusView
+    if (round.phase === 'summary') continue
+
+    const record: LivePhaseRecord = {
+      id: `${round.round_number}:${round.phase}`,
+      step: round.round_number,
+      phase: round.phase as LivePhaseType,
+      messages: {},
+    }
+
+    for (const msg of round.messages) {
+      // Skip summary role messages
+      if (msg.role === 'summary') continue
+
+      const actor = actorMap.get(msg.actor_id)
+      const liveMessage: LiveMessage = {
+        actorId: msg.actor_id,
+        actorName: actor?.name || msg.actor_name || 'Unknown',
+        actorIcon: actor?.icon || '🤖',
+        actorColor: actor?.display_color || '#9333EA',
+        phase: round.phase as LivePhaseType,
+        step: round.round_number,
+        content: msg.content,
+        status: 'done',
+      }
+      record.messages[msg.actor_id] = liveMessage
+    }
+
+    phaseHistory.push(record)
+  }
+
+  return phaseHistory
+}
+
+/**
+ * Convert semantic analysis result to comparisons map.
+ *
+ * The key format matches the phase_id used in live streaming:
+ * - For initial: "1:initial"
+ * - For revision: "step:revision" (cycle is not stored in DB, use step)
+ */
+export function hydrateSemanticToMap(
+  semantic: SemanticAnalysisResult | null
+): Map<string, TopicComparison[]> {
+  const comparisons = new Map<string, TopicComparison[]>()
+
+  if (!semantic || !semantic.comparisons) {
+    return comparisons
+  }
+
+  // Group comparisons by phase_id
+  // The API returns round_number and phase, construct phase_id from them
+  for (const comp of semantic.comparisons) {
+    if (comp.round_number && comp.phase) {
+      const phaseId = `${comp.round_number}:${comp.phase}`
+      if (!comparisons.has(phaseId)) {
+        comparisons.set(phaseId, [])
+      }
+      comparisons.get(phaseId)!.push(comp)
+    }
+  }
+
+  return comparisons
+}
+
+/**
+ * Extract consensus from session.
+ */
+export function hydrateConsensus(session: DebateSession): Consensus | null {
+  if (!session.consensus) return null
+
+  return {
+    summary: session.consensus.summary,
+    agreements: session.consensus.agreements,
+    disagreements: session.consensus.disagreements,
+    confidence: session.consensus.confidence,
+    recommendation: session.consensus.recommendation,
+  }
+}
+
+/**
+ * Extract question intent from semantic analysis.
+ */
+export function hydrateQuestionIntent(semantic: SemanticAnalysisResult | null) {
+  if (!semantic || !semantic.question_intent) return null
+
+  return {
+    question_type: semantic.question_intent.question_type,
+    user_goal: semantic.question_intent.user_goal,
+    time_horizons: semantic.question_intent.time_horizons,
+    comparison_axes: semantic.question_intent.comparison_axes,
+  }
 }
 ```
 
@@ -8810,6 +9116,15 @@ import { create } from 'zustand'
 import { DebateSession, SessionListItem, Consensus, LivePhaseRecord, LiveMessage, LivePhaseType, ConvergenceData, TopicComparison, QuestionIntent } from '@/types'
 import { apiClient } from '@/lib/apiClient'
 
+interface ProgressState {
+  startedAt: number | null
+  currentPhaseStartedAt: number | null
+  completedSteps: number
+  estimatedTotalSteps: number
+  currentStepProgress: number  // 0-1 for current phase
+  phaseTimings: Map<string, number>  // phase_id -> duration in ms
+}
+
 interface DebateState {
   currentSessionId: string | null
   currentSession: DebateSession | null
@@ -8832,6 +9147,9 @@ interface DebateState {
   questionIntent: QuestionIntent | null
   semanticComparisons: Map<string, TopicComparison[]>  // phaseId -> comparisons
   selectedTopicId: string | null
+
+  // Progress tracking
+  progress: ProgressState
 
   status: 'idle' | 'connecting' | 'streaming' | 'completed' | 'error'
   error: string | null
@@ -8877,6 +9195,14 @@ export const useDebateStore = create<DebateState>((set, get) => ({
   questionIntent: null,
   semanticComparisons: new Map(),
   selectedTopicId: null,
+  progress: {
+    startedAt: null,
+    currentPhaseStartedAt: null,
+    completedSteps: 0,
+    estimatedTotalSteps: 9,  // Default: 1 initial + 2*3 review/revision + 1 final + 1 summary
+    currentStepProgress: 0,
+    phaseTimings: new Map(),
+  },
   status: 'idle',
   error: null,
 
@@ -8890,12 +9216,19 @@ export const useDebateStore = create<DebateState>((set, get) => ({
   },
 
   startDebate: async (question, actorIds, judgeActorId, config) => {
+    // Reset expectedClose flag for new debate
+    expectedClose = false
+
     const data = await apiClient.startDebate({
       question,
       actor_ids: actorIds,
       judge_actor_id: judgeActorId,
       config: config || { max_rounds: 3 },
     })
+
+    // Calculate estimated total steps: 1 initial + 2*max_rounds review/revision + 1 final + 1 summary
+    const maxRounds = config?.max_rounds || 3
+    const estimatedTotalSteps = 1 + 2 * maxRounds + 2
 
     set({
       currentSessionId: data.session_id,
@@ -8913,6 +9246,14 @@ export const useDebateStore = create<DebateState>((set, get) => ({
       semanticComparisons: new Map(),
       selectedTopicId: null,
       error: null,
+      progress: {
+        startedAt: Date.now(),
+        currentPhaseStartedAt: null,
+        completedSteps: 0,
+        estimatedTotalSteps,
+        currentStepProgress: 0,
+        phaseTimings: new Map(),
+      },
     })
 
     get().streamDebate(data.session_id)
@@ -8921,6 +9262,9 @@ export const useDebateStore = create<DebateState>((set, get) => ({
   },
 
   streamDebate: (sessionId) => {
+    // Reset expectedClose flag for new stream
+    expectedClose = false
+
     set({
       status: 'connecting',
       error: null,
@@ -8936,6 +9280,14 @@ export const useDebateStore = create<DebateState>((set, get) => ({
       questionIntent: null,
       semanticComparisons: new Map(),
       selectedTopicId: null,
+      progress: {
+        startedAt: Date.now(),
+        currentPhaseStartedAt: null,
+        completedSteps: 0,
+        estimatedTotalSteps: 9,
+        currentStepProgress: 0,
+        phaseTimings: new Map(),
+      },
     })
 
     if (eventSource) {
@@ -8987,6 +9339,17 @@ export const useDebateStore = create<DebateState>((set, get) => ({
 
       set((state) => {
         const newHistory = [...state.phaseHistory, newRecord]
+
+        // Update progress
+        const prevPhaseStartedAt = state.progress.currentPhaseStartedAt
+        const prevPhaseId = state.currentPhaseRecord?.id
+        const newPhaseTimings = new Map(state.progress.phaseTimings)
+
+        // Record previous phase timing if exists
+        if (prevPhaseStartedAt && prevPhaseId) {
+          newPhaseTimings.set(prevPhaseId, Date.now() - prevPhaseStartedAt)
+        }
+
         return {
           currentPhase: phase,
           currentRound: data.round || cycle || 1,
@@ -8996,6 +9359,13 @@ export const useDebateStore = create<DebateState>((set, get) => ({
           // Clear legacy streaming state for new phase
           streamingContent: new Map(),
           activeActors: new Set(),
+          // Update progress
+          progress: {
+            ...state.progress,
+            currentPhaseStartedAt: Date.now(),
+            currentStepProgress: 0,
+            phaseTimings: newPhaseTimings,
+          },
         }
       })
     })
@@ -9142,7 +9512,14 @@ export const useDebateStore = create<DebateState>((set, get) => ({
 
     eventSource.addEventListener('phase_end', (e: MessageEvent) => {
       console.log('[SSE] phase_end:', e.data)
-      // Phase ended, nothing special to do - history is preserved
+      // Phase ended, update progress
+      set((state) => ({
+        progress: {
+          ...state.progress,
+          completedSteps: state.progress.completedSteps + 1,
+          currentStepProgress: 1,
+        }
+      }))
     })
 
     // Convergence result - attach to latest revision phase
@@ -9438,6 +9815,14 @@ export const useDebateStore = create<DebateState>((set, get) => ({
       selectedTopicId: null,
       status: 'idle',
       error: null,
+      progress: {
+        startedAt: null,
+        currentPhaseStartedAt: null,
+        completedSteps: 0,
+        estimatedTotalSteps: 9,
+        currentStepProgress: 0,
+        phaseTimings: new Map(),
+      },
     })
   },
 }))

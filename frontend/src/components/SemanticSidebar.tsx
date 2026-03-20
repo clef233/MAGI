@@ -12,6 +12,7 @@ interface SemanticSidebarProps {
   selectedTopicId: string | null
   onSelectTopic: (topicId: string | null) => void
   onShowRawDiff?: () => void
+  onSwitchToDiffTab?: () => void  // Callback to switch to diff tab
 }
 
 const phaseLabels: Record<string, string> = {
@@ -58,6 +59,7 @@ export default function SemanticSidebar({
   selectedTopicId,
   onSelectTopic,
   onShowRawDiff,
+  onSwitchToDiffTab,
 }: SemanticSidebarProps) {
   const [showRawDiff, setShowRawDiff] = useState(false)
   const [hasUserSelectedPhase, setHasUserSelectedPhase] = useState(false)
@@ -188,10 +190,33 @@ export default function SemanticSidebar({
       {/* Topic list with labels - not just bubbles - scrollable */}
       <div className="flex-1 overflow-y-auto p-3 min-h-0">
         {!selectedComparisons.length ? (
-          <div className="text-text-tertiary text-xs text-center py-8">
-            {comparablePhases.length === 0
-              ? '等待语义分析完成...'
-              : '该阶段暂无语义分析结果'}
+          <div className="text-text-tertiary text-xs text-center py-8 space-y-4">
+            {comparablePhases.length === 0 ? (
+              <>
+                <div className="text-text-secondary">当前阶段的语义图谱尚未生成</div>
+                <div>语义分析会在本轮回答完成后自动生成</div>
+                {phaseHistory.some(r => ['initial', 'review', 'revision'].includes(r.phase) && Object.keys(r.messages).length >= 2) && onSwitchToDiffTab && (
+                  <button
+                    onClick={onSwitchToDiffTab}
+                    className="px-4 py-2 bg-accent-blue/20 text-accent-blue rounded-lg hover:bg-accent-blue/30 transition-colors"
+                  >
+                    查看原文差异对比
+                  </button>
+                )}
+              </>
+            ) : (
+              <>
+                <div>该阶段暂无语义分析结果</div>
+                {onSwitchToDiffTab && (
+                  <button
+                    onClick={onSwitchToDiffTab}
+                    className="px-4 py-2 bg-accent-blue/20 text-accent-blue rounded-lg hover:bg-accent-blue/30 transition-colors"
+                  >
+                    查看原文差异对比
+                  </button>
+                )}
+              </>
+            )}
           </div>
         ) : (
           <div className="space-y-3">
@@ -227,7 +252,7 @@ export default function SemanticSidebar({
                             ? 'text-accent-green'
                             : comparison.status === 'divergent'
                             ? 'text-accent-red'
-                            : 'text-accent-yellow'
+                            : 'text-accent-orange'
                         }`}>
                           {getStatusLabel(comparison.status)}
                         </span>

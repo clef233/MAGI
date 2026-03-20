@@ -154,8 +154,9 @@ class DebateEngine:
                 "data": {"step": self.step_number, "phase": "initial"}
             })
 
-            # Run semantic analysis after initial round
-            await self._run_semantic_analysis(round_number=1, phase="initial")
+            # Run semantic analysis in background - don't block the main flow
+            # Semantic analysis is for UI enrichment, not critical for debate logic
+            asyncio.create_task(self._run_semantic_analysis_safe(round_number=1, phase="initial"))
 
             # ===== REVIEW/REVISION CYCLES =====
             max_cycles = self.session.max_rounds or 3
@@ -227,12 +228,12 @@ class DebateEngine:
                     "data": {"step": self.step_number, "phase": "revision", "cycle": cycle}
                 })
 
-                # Run semantic analysis after revision
-                await self._run_semantic_analysis(
+                # Run semantic analysis in background - don't block the main flow
+                asyncio.create_task(self._run_semantic_analysis_safe(
                     round_number=self.step_number,
                     phase="revision",
                     cycle=cycle,
-                )
+                ))
 
                 # --- Convergence Check ---
                 if self.session.auto_stop:
@@ -378,23 +379,6 @@ class DebateEngine:
 
                 logger.info(f"stream_completion DONE for {actor.name}, response length: {len(full_response)}")
 
-                # Store message after completion
-                message = Message(
-                    round_id=db_round.id,
-                    actor_id=actor.id,
-                    role="answer",
-                    content=full_response,
-                )
-                self.db.add(message)
-                await self.db.commit()
-
-                # Track for later rounds
-                self.actor_responses[actor.id].append({
-                    "role": "answer",
-                    "content": full_response,
-                    "cycle": 0,
-                })
-
                 # Emit actor_end
                 await self._emit({
                     "event": "actor_end",
@@ -419,9 +403,28 @@ class DebateEngine:
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
+        # Store messages AFTER all parallel tasks complete (sequential DB writes)
         for i, result in enumerate(results):
             if isinstance(result, Exception):
                 logger.error(f"Actor {self.actors[i].name} failed: {result}")
+            elif isinstance(result, tuple):
+                actor_id, full_response = result
+                message = Message(
+                    round_id=db_round.id,
+                    actor_id=actor_id,
+                    role="answer",
+                    content=full_response,
+                )
+                self.db.add(message)
+                # Track for later rounds
+                self.actor_responses[actor_id].append({
+                    "role": "answer",
+                    "content": full_response,
+                    "cycle": 0,
+                })
+
+        # Commit all messages at once
+        await self.db.commit()
 
     async def _run_review_round(self, cycle: int, db_round: DBRound):
         """Run review round where each actor critiques others' answers"""
@@ -460,12 +463,22 @@ class DebateEngine:
                     if other_actor:
                         other_responses.append(f"**{other_actor.name}**: {content}")
 
-            # Build review prompt
+            my_answer = latest_answers.get(actor.id, "")
+
+            # Build review prompt using prompt_service
             system_prompt = actor.review_prompt or f"You are {actor.name}. Provide a critical review."
             if actor.custom_instructions:
                 system_prompt += f"\n\n{actor.custom_instructions}"
 
-            review_prompt = f"""Original question: {self.session.question}
+            try:
+                review_prompt = await self.prompt_service.get_review_prompt(
+                    question=self.session.question,
+                    own_answer=my_answer,
+                    other_answers="\n\n".join(other_responses),
+                )
+            except PromptError:
+                # Fallback to hardcoded prompt if template not found
+                review_prompt = f"""Original question: {self.session.question}
 
 Here are the responses from other participants:
 
@@ -493,22 +506,6 @@ Please provide a critical review of these responses. Focus on:
                     }
                 })
 
-            # Store message
-            message = Message(
-                round_id=db_round.id,
-                actor_id=actor.id,
-                role="review",
-                content=full_response,
-            )
-            self.db.add(message)
-            await self.db.commit()
-
-            self.actor_responses[actor.id].append({
-                "role": "review",
-                "content": full_response,
-                "cycle": cycle,
-            })
-
             await self._emit({
                 "event": "actor_end",
                 "data": {
@@ -521,7 +518,26 @@ Please provide a critical review of these responses. Focus on:
             return actor.id, full_response
 
         tasks = [actor_review_stream(actor) for actor in self.actors]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Store messages AFTER all parallel tasks complete
+        for result in results:
+            if isinstance(result, tuple):
+                actor_id, full_response = result
+                message = Message(
+                    round_id=db_round.id,
+                    actor_id=actor_id,
+                    role="review",
+                    content=full_response,
+                )
+                self.db.add(message)
+                self.actor_responses[actor_id].append({
+                    "role": "review",
+                    "content": full_response,
+                    "cycle": cycle,
+                })
+
+        await self.db.commit()
 
     async def _run_revision_round(self, cycle: int, review_round: DBRound, db_round: DBRound):
         """Run revision round where actors improve their answers"""
@@ -568,12 +584,20 @@ Please provide a critical review of these responses. Focus on:
 
             my_answer = latest_answers.get(actor.id, "")
 
-            # Build revision prompt
+            # Build revision prompt using prompt_service
             system_prompt = actor.revision_prompt or f"You are {actor.name}. Revise based on feedback."
             if actor.custom_instructions:
                 system_prompt += f"\n\n{actor.custom_instructions}"
 
-            revision_prompt = f"""Original question: {self.session.question}
+            try:
+                revision_prompt = await self.prompt_service.get_revision_prompt(
+                    question=self.session.question,
+                    own_answer=my_answer,
+                    reviews_about_me="\n\n".join(reviews_about_me),
+                )
+            except PromptError:
+                # Fallback to hardcoded prompt if template not found
+                revision_prompt = f"""Original question: {self.session.question}
 
 Your current response:
 {my_answer}
@@ -604,22 +628,6 @@ Please revise your response to:
                     }
                 })
 
-            # Store message
-            message = Message(
-                round_id=db_round.id,
-                actor_id=actor.id,
-                role="revision",
-                content=full_response,
-            )
-            self.db.add(message)
-            await self.db.commit()
-
-            self.actor_responses[actor.id].append({
-                "role": "revision",
-                "content": full_response,
-                "cycle": cycle,
-            })
-
             await self._emit({
                 "event": "actor_end",
                 "data": {
@@ -632,7 +640,26 @@ Please revise your response to:
             return actor.id, full_response
 
         tasks = [actor_revision_stream(actor) for actor in self.actors]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Store messages AFTER all parallel tasks complete
+        for result in results:
+            if isinstance(result, tuple):
+                actor_id, full_response = result
+                message = Message(
+                    round_id=db_round.id,
+                    actor_id=actor_id,
+                    role="revision",
+                    content=full_response,
+                )
+                self.db.add(message)
+                self.actor_responses[actor_id].append({
+                    "role": "revision",
+                    "content": full_response,
+                    "cycle": cycle,
+                })
+
+        await self.db.commit()
 
     async def _check_convergence(self) -> ConvergenceResult:
         """Check if responses have converged."""
@@ -653,13 +680,29 @@ Please revise your response to:
             threshold=self.session.convergence_threshold or 0.85,
         )
 
+    async def _run_semantic_analysis_safe(self, round_number: int, phase: str, cycle: int = 0):
+        """
+        Safe wrapper for semantic analysis that runs in background.
+
+        This method catches all exceptions to prevent background task failures
+        from affecting the main debate flow. Semantic analysis is optional
+        enrichment for the UI and should not block or crash the debate.
+        """
+        try:
+            await self._run_semantic_analysis(round_number, phase, cycle)
+        except asyncio.CancelledError:
+            logger.info(f"Semantic analysis cancelled for round {round_number}, phase {phase}")
+        except Exception as e:
+            # Log but don't propagate - semantic analysis is optional
+            logger.error(f"Semantic analysis failed (non-blocking): {e}", exc_info=True)
+
     async def _run_semantic_analysis(self, round_number: int, phase: str, cycle: int = 0):
         """
-        Run semantic analysis on the latest responses.
+        Run semantic analysis on the latest responses with parallel execution.
 
         This method:
         1. Analyzes question intent (first time only)
-        2. Extracts semantic topics from each actor's response
+        2. Extracts semantic topics from each actor's response (parallel)
         3. Compares topics across actors
         4. Emits semantic_comparison event with canonical phase_id
 
@@ -678,26 +721,54 @@ Please revise your response to:
             judge = result.scalar_one_or_none()
 
             if not judge:
-                logger.warning("Judge actor not found for semantic analysis")
+                logger.warning("Judge actor not found for semantic analysis, skipping")
                 return
 
             adapter = self.get_adapter(judge)
 
-            # Step 1: Analyze question intent (only once)
+            # Step 1: Analyze question intent (only once) - with timeout
             if not self.question_intent:
                 logger.info("Analyzing question intent...")
-                self.question_intent = await self.semantic_service.analyze_question_intent(
-                    question=self.session.question,
-                    adapter=adapter,
-                )
-                # Save to database
-                await self.semantic_service.save_question_intent(
-                    session_id=self.session.id,
-                    result=self.question_intent,
-                )
-                logger.info(f"Question intent analyzed: {len(self.question_intent.comparison_axes)} axes")
+                try:
+                    self.question_intent = await asyncio.wait_for(
+                        self.semantic_service.analyze_question_intent(
+                            question=self.session.question,
+                            adapter=adapter,
+                        ),
+                        timeout=60.0  # 60 second timeout
+                    )
+                    # Save to database
+                    await self.semantic_service.save_question_intent(
+                        session_id=self.session.id,
+                        result=self.question_intent,
+                    )
+                    logger.info(f"Question intent analyzed: {len(self.question_intent.comparison_axes)} axes")
+                except asyncio.TimeoutError:
+                    logger.warning("Question intent analysis timed out, using defaults")
+                    # Use default comparison axes
+                    self.question_intent = type('QuestionIntentResult', (), {
+                        'question_type': 'general',
+                        'user_goal': '',
+                        'time_horizons': [],
+                        'comparison_axes': [
+                            {"axis_id": "main_topic", "label": "核心观点"},
+                            {"axis_id": "approach", "label": "解决思路"},
+                        ]
+                    })()
+                except Exception as e:
+                    logger.error(f"Question intent analysis failed: {e}")
+                    # Use default comparison axes
+                    self.question_intent = type('QuestionIntentResult', (), {
+                        'question_type': 'general',
+                        'user_goal': '',
+                        'time_horizons': [],
+                        'comparison_axes': [
+                            {"axis_id": "main_topic", "label": "核心观点"},
+                            {"axis_id": "approach", "label": "解决思路"},
+                        ]
+                    })()
 
-            # Step 2: Extract semantic topics from each actor's latest response
+            # Step 2: Extract semantic topics from each actor's latest response (parallel)
             latest_answers = {}
             for actor in self.actors:
                 responses = self.actor_responses.get(actor.id, [])
@@ -706,103 +777,140 @@ Please revise your response to:
                         latest_answers[actor.id] = r["content"]
                         break
 
-            topics_by_actor = {}
-            for actor in self.actors:
+            if not latest_answers:
+                logger.warning("No answers found for semantic analysis")
+                return
+
+            # Parallel topic extraction using asyncio.gather with timeout
+            async def extract_topics_for_actor(actor: Actor):
                 content = latest_answers.get(actor.id, "")
                 if not content:
-                    continue
+                    return actor.id, []
 
                 logger.info(f"Extracting topics for actor {actor.name}...")
-                topics = await self.semantic_service.extract_semantic_topics(
-                    question=self.session.question,
-                    answer=content,
-                    comparison_axes=self.question_intent.comparison_axes,
-                    actor_id=actor.id,
-                    adapter=adapter,
-                )
-                topics_by_actor[actor.id] = topics
-
-                # Save to database
-                if topics:
-                    await self.semantic_service.save_semantic_topics(
-                        session_id=self.session.id,
-                        round_number=round_number,
-                        phase=phase,
-                        actor_id=actor.id,
-                        topics=topics,
-                        cycle=cycle,
+                try:
+                    topics = await asyncio.wait_for(
+                        self.semantic_service.extract_semantic_topics(
+                            question=self.session.question,
+                            answer=content,
+                            comparison_axes=self.question_intent.comparison_axes,
+                            actor_id=actor.id,
+                            adapter=adapter,
+                        ),
+                        timeout=30.0  # 30 second timeout per actor
                     )
+                    return actor.id, topics
+                except asyncio.TimeoutError:
+                    logger.warning(f"Topic extraction timed out for actor {actor.name}")
+                    return actor.id, []
+                except Exception as e:
+                    logger.error(f"Topic extraction failed for actor {actor.name}: {e}")
+                    return actor.id, []
+
+            extraction_tasks = [extract_topics_for_actor(actor) for actor in self.actors]
+            extraction_results = await asyncio.gather(*extraction_tasks, return_exceptions=True)
+
+            topics_by_actor = {}
+            for result in extraction_results:
+                if isinstance(result, tuple):
+                    actor_id, topics = result
+                    topics_by_actor[actor_id] = topics
+                    # Save to database
+                    if topics:
+                        try:
+                            await self.semantic_service.save_semantic_topics(
+                                session_id=self.session.id,
+                                round_number=round_number,
+                                phase=phase,
+                                actor_id=actor_id,
+                                topics=topics,
+                                cycle=cycle,
+                            )
+                        except Exception as e:
+                            logger.error(f"Failed to save semantic topics: {e}")
+                elif isinstance(result, Exception):
+                    logger.error(f"Topic extraction task failed: {result}")
 
             # Step 3: Compare topics across actors
             if len(topics_by_actor) >= 2:
                 logger.info("Comparing topics across actors...")
-                comparisons = await self.semantic_service.compare_actors(
-                    question=self.session.question,
-                    topics_by_actor=topics_by_actor,
-                    actors=self.actors,
-                    adapter=adapter,
-                )
-
-                # Save to database
-                if comparisons:
-                    await self.semantic_service.save_semantic_comparisons(
-                        session_id=self.session.id,
-                        round_number=round_number,
-                        phase=phase,
-                        comparisons=comparisons,
-                        cycle=cycle,
+                try:
+                    comparisons = await asyncio.wait_for(
+                        self.semantic_service.compare_actors(
+                            question=self.session.question,
+                            topics_by_actor=topics_by_actor,
+                            actors=self.actors,
+                            adapter=adapter,
+                        ),
+                        timeout=60.0  # 60 second timeout
                     )
 
-                self.latest_semantic_comparisons = comparisons
+                    # Save to database
+                    if comparisons:
+                        await self.semantic_service.save_semantic_comparisons(
+                            session_id=self.session.id,
+                            round_number=round_number,
+                            phase=phase,
+                            comparisons=comparisons,
+                            cycle=cycle,
+                        )
 
-                # Emit semantic_comparison event with canonical phase_id
-                # phase_id format: "step:phase[:cycle]" (cycle only for revision)
-                phase_id = f"{round_number}:{phase}"
-                if phase == "revision" and cycle:
-                    phase_id = f"{round_number}:{phase}:{cycle}"
+                    self.latest_semantic_comparisons = comparisons
 
-                comparison_data = [
-                    {
-                        "topic_id": c.topic_id,
-                        "label": c.label,
-                        "salience": c.salience,
-                        "disagreement_score": c.disagreement_score,
-                        "status": c.status,
-                        "difference_types": c.difference_types,
-                        "agreement_summary": c.agreement_summary,
-                        "disagreement_summary": c.disagreement_summary,
-                        "actor_positions": [
-                            {
-                                "actor_id": p.actor_id,
-                                "actor_name": p.actor_name,
-                                "stance_label": p.stance_label,
-                                "summary": p.summary,
-                                "quotes": p.quotes,
-                            }
-                            for p in c.actor_positions
-                        ],
-                    }
-                    for c in comparisons
-                ]
+                    # Emit semantic_comparison event with canonical phase_id
+                    phase_id = f"{round_number}:{phase}"
+                    if phase == "revision" and cycle:
+                        phase_id = f"{round_number}:{phase}:{cycle}"
 
-                await self._emit({
-                    "event": "semantic_comparison",
-                    "data": {
-                        "phase_id": phase_id,
-                        "round_number": round_number,
-                        "phase": phase,
-                        "cycle": cycle,
-                        "question_intent": {
-                            "question_type": self.question_intent.question_type,
-                            "user_goal": self.question_intent.user_goal,
-                            "time_horizons": self.question_intent.time_horizons,
-                            "comparison_axes": self.question_intent.comparison_axes,
-                        },
-                        "comparisons": comparison_data,
-                    }
-                })
+                    comparison_data = [
+                        {
+                            "topic_id": c.topic_id,
+                            "label": c.label,
+                            "salience": c.salience,
+                            "disagreement_score": c.disagreement_score,
+                            "status": c.status,
+                            "difference_types": c.difference_types,
+                            "agreement_summary": c.agreement_summary,
+                            "disagreement_summary": c.disagreement_summary,
+                            "actor_positions": [
+                                {
+                                    "actor_id": p.actor_id,
+                                    "actor_name": p.actor_name,
+                                    "stance_label": p.stance_label,
+                                    "summary": p.summary,
+                                    "quotes": p.quotes,
+                                }
+                                for p in c.actor_positions
+                            ],
+                        }
+                        for c in comparisons
+                    ]
 
-                logger.info(f"Semantic analysis complete: {len(comparisons)} topics analyzed")
+                    await self._emit({
+                        "event": "semantic_comparison",
+                        "data": {
+                            "phase_id": phase_id,
+                            "round_number": round_number,
+                            "phase": phase,
+                            "cycle": cycle,
+                            "question_intent": {
+                                "question_type": self.question_intent.question_type,
+                                "user_goal": self.question_intent.user_goal,
+                                "time_horizons": self.question_intent.time_horizons,
+                                "comparison_axes": self.question_intent.comparison_axes,
+                            },
+                            "comparisons": comparison_data,
+                        }
+                    })
+
+                    logger.info(f"Semantic analysis complete: {len(comparisons)} topics analyzed")
+
+                except asyncio.TimeoutError:
+                    logger.warning("Topic comparison timed out")
+                except Exception as e:
+                    logger.error(f"Topic comparison failed: {e}")
+            else:
+                logger.info(f"Not enough actors with topics ({len(topics_by_actor)}), skipping comparison")
 
         except Exception as e:
             logger.error(f"Semantic analysis failed: {e}", exc_info=True)
@@ -866,8 +974,18 @@ Please revise your response to:
         await self.db.commit()
         await self.db.refresh(final_round)
 
-        # Build final answer prompt
-        final_answer_prompt = f"""你是一个综合决策助手，需要基于多轮互评的结果，输出一篇面向用户的最终回答。
+        # Build final answer prompt using prompt_service
+        system_prompt = judge.system_prompt or "你是一个专业的综合决策助手，输出简洁明了的最终回答。"
+
+        try:
+            final_answer_prompt = await self.prompt_service.get_final_answer_prompt(
+                question=self.session.question,
+                actor_answers="\n\n".join(answer_list),
+                convergence_info=convergence_info,
+            )
+        except PromptError:
+            # Fallback to hardcoded prompt if template not found
+            final_answer_prompt = f"""你是一个综合决策助手，需要基于多轮互评的结果，输出一篇面向用户的最终回答。
 
 ## 原始问题
 
@@ -887,8 +1005,6 @@ Please revise your response to:
 4. 使用清晰、自然的语言，不要使用 JSON 格式
 5. 直接给出最终回答，不要解释过程
 """
-
-        system_prompt = judge.system_prompt or "你是一个专业的综合决策助手，输出简洁明了的最终回答。"
 
         # Emit actor_start with judge's info
         await self._emit({
@@ -995,26 +1111,6 @@ Please revise your response to:
 {chr(10).join(f"- {d}" for d in convergence_result.disagreements) if convergence_result.disagreements else "- 无"}
 """
 
-        # Build summary prompt
-        summary_prompt = f"""Based on the following multi-agent review, please provide a comprehensive summary.
-{history}
-{convergence_info}
-Please provide:
-1. A concise summary of the key conclusions
-2. Points where all participants agreed
-3. Points where participants disagreed
-4. Your confidence level (0-1) in the consensus
-5. A final recommendation
-
-Format your response as JSON:
-{{
-  "summary": "...",
-  "agreements": ["point 1", "point 2"],
-  "disagreements": ["point 1"],
-  "confidence": 0.85,
-  "recommendation": "..."
-}}"""
-
         system_prompt = judge.system_prompt or "You are an impartial Meta Judge synthesizing multi-agent reviews. Always respond with valid JSON."
 
         # Create DB round for summary
@@ -1026,6 +1122,33 @@ Format your response as JSON:
         self.db.add(summary_round)
         await self.db.commit()
         await self.db.refresh(summary_round)
+
+        # Build summary prompt using prompt_service
+        try:
+            summary_prompt = await self.prompt_service.get_summary_prompt(
+                question=self.session.question,
+                history=history,
+            )
+        except PromptError:
+            # Fallback to hardcoded prompt if template not found
+            summary_prompt = f"""Based on the following multi-agent review, please provide a comprehensive summary.
+{history}
+{convergence_info}
+Please provide:
+1. A concise summary of the key conclusions
+2. Points where all participants agreed
+3. Points where participants disagreed
+4. Your confidence level (0-1) in the consensus - only provide a number if you can make a confident assessment
+5. A final recommendation
+
+Format your response as JSON:
+{{
+  "summary": "...",
+  "agreements": ["point 1", "point 2"],
+  "disagreements": ["point 1"],
+  "confidence": <0.0-1.0 or omit if uncertain>,
+  "recommendation": "..."
+}}"""
 
         # Emit judge start with judge's actual id
         await self._emit({
@@ -1072,18 +1195,21 @@ Format your response as JSON:
         except json.JSONDecodeError:
             pass
 
-        # If first attempt failed, try a more structured retry
+        # If first attempt failed, try a more structured retry with context
         if not parse_success:
             logger.warning(f"Summary JSON parse failed, attempting retry with stricter prompt")
-            retry_prompt = """The previous response could not be parsed as JSON. Please provide ONLY a valid JSON object with no additional text:
+            retry_prompt = f"""Based on this multi-agent review, provide ONLY a valid JSON object with no additional text.
 
-{
+Original Question: {self.session.question}
+
+The previous response could not be parsed. Please provide ONLY a valid JSON object:
+{{
   "summary": "Brief summary of conclusions",
   "agreements": ["point 1", "point 2"],
   "disagreements": ["point 1"],
-  "confidence": 0.85,
+  "confidence": <0.0-1.0 or omit if uncertain>,
   "recommendation": "Brief recommendation"
-}"""
+}}"""
 
             retry_response = ""
             async for token in adapter.stream_completion(

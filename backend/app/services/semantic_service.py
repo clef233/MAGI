@@ -200,8 +200,8 @@ class SemanticService:
 
 请以 JSON 格式返回：
 {{
-  "salience": 0.9,
-  "disagreement_score": 0.3,
+  "salience": "<0.0-1.0之间的小数，表示该主题的重要性>",
+  "disagreement_score": "<0.0-1.0之间的小数，0表示完全一致，1表示完全分歧>",
   "status": "converged/divergent/partial",
   "difference_types": ["solution_class", "time_horizon", "risk_preference"],
   "agreement_summary": "一致点",

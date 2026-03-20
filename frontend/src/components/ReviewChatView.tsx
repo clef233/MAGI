@@ -1,8 +1,10 @@
 'use client'
 
-import { useMemo, useRef, useEffect } from 'react'
+import { memo, useMemo, useRef, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Actor, LivePhaseRecord, LiveMessage, ConvergenceData } from '@/types'
+import { Actor, LivePhaseRecord, LiveMessage, ConvergenceData, Consensus } from '@/types'
+import ConsensusView from './ConsensusView'
+import MarkdownBlock from './MarkdownBlock'
 
 interface ReviewChatViewProps {
   question: string
@@ -10,6 +12,7 @@ interface ReviewChatViewProps {
   phaseHistory: LivePhaseRecord[]
   status: string
   onMessageClick?: (actorId: string, phase: string) => void
+  consensus?: Consensus | null  // Add consensus prop
 }
 
 const phaseLabels: Record<string, string> = {
@@ -29,13 +32,17 @@ function getPhaseTitle(record: LivePhaseRecord): string {
   return `第 ${record.step} 步 · ${base}`
 }
 
-function MessageCard({
+// Memoized MessageCard to prevent re-renders when unrelated state changes
+const MessageCard = memo(function MessageCard({
   message,
   onMessageClick,
 }: {
   message: LiveMessage
   onMessageClick?: (actorId: string, phase: string) => void
 }) {
+  // Don't render Markdown during streaming - use plain text for performance
+  const isStreaming = message.status === 'streaming'
+
   return (
     <motion.div
       key={`${message.actorId}`}
@@ -56,25 +63,30 @@ function MessageCard({
         <span className="px-2 py-0.5 bg-text-tertiary/20 text-text-tertiary text-xs rounded">
           {phaseLabels[message.phase] || message.phase}
         </span>
-        {message.status === 'streaming' && (
+        {isStreaming && (
           <span className="text-xs text-accent-blue animate-pulse">streaming...</span>
         )}
       </div>
 
-      {/* Content */}
+      {/* Content - plain text during streaming, Markdown when done */}
       <div className="px-4 py-4">
-        <div className="text-text-primary whitespace-pre-wrap">
-          {message.content}
-          {message.status === 'streaming' && (
+        {isStreaming ? (
+          // Plain text during streaming for performance
+          <div className="whitespace-pre-wrap break-words text-text-primary">
+            {message.content}
             <span className="inline-block w-2 h-4 bg-text-primary animate-pulse ml-1" />
-          )}
-        </div>
+          </div>
+        ) : (
+          // Full Markdown rendering only when message is complete
+          <MarkdownBlock content={message.content} />
+        )}
       </div>
     </motion.div>
   )
-}
+})
 
-function ConvergenceCard({ convergence }: { convergence: ConvergenceData }) {
+// Memoized ConvergenceCard
+const ConvergenceCard = memo(function ConvergenceCard({ convergence }: { convergence: ConvergenceData }) {
   const scorePercent = Math.round(convergence.score * 100)
 
   return (
@@ -89,7 +101,7 @@ function ConvergenceCard({ convergence }: { convergence: ConvergenceData }) {
         <span className={`ml-auto px-2 py-0.5 rounded text-xs font-bold ${
           convergence.converged
             ? 'bg-accent-green/20 text-accent-green'
-            : 'bg-accent-yellow/20 text-accent-yellow'
+            : 'bg-accent-orange/20 text-accent-orange'
         }`}>
           {convergence.converged ? '已收敛' : '继续讨论'}
         </span>
@@ -132,7 +144,7 @@ function ConvergenceCard({ convergence }: { convergence: ConvergenceData }) {
         {/* Disagreements */}
         {convergence.disagreements && convergence.disagreements.length > 0 && (
           <div>
-            <div className="text-accent-yellow text-xs mb-1">⚡ 仍存分歧</div>
+            <div className="text-accent-orange text-xs mb-1">⚡ 仍存分歧</div>
             <ul className="text-text-tertiary text-xs space-y-1 list-disc list-inside">
               {convergence.disagreements.map((d, i) => (
                 <li key={i}>{d}</li>
@@ -143,7 +155,7 @@ function ConvergenceCard({ convergence }: { convergence: ConvergenceData }) {
       </div>
     </motion.div>
   )
-}
+})
 
 export default function ReviewChatView({
   question,
@@ -151,6 +163,7 @@ export default function ReviewChatView({
   phaseHistory,
   status,
   onMessageClick,
+  consensus,
 }: ReviewChatViewProps) {
   const scrollRef = useRef<HTMLDivElement>(null)
 
@@ -181,11 +194,6 @@ export default function ReviewChatView({
         }
       })
   }, [phaseHistory, actors])
-
-  // Find if there's a final consensus in summary phase (for reference, not displayed)
-  const summaryPhase = useMemo(() => {
-    return phaseHistory.find((r) => r.phase === 'summary')
-  }, [phaseHistory])
 
   return (
     <div ref={scrollRef} className="space-y-6 overflow-y-auto h-full pb-8 pr-2">
@@ -235,6 +243,11 @@ export default function ReviewChatView({
         <div className="text-center text-text-tertiary py-8">
           <div className="animate-pulse">等待响应...</div>
         </div>
+      )}
+
+      {/* Consensus - rendered inside scrollable area */}
+      {consensus && status === 'completed' && (
+        <ConsensusView consensus={consensus} />
       )}
     </div>
   )

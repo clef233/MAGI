@@ -2,6 +2,18 @@ import { create } from 'zustand'
 import { DebateSession, SessionListItem, Consensus, LivePhaseRecord, LiveMessage, LivePhaseType, ConvergenceData, TopicComparison, QuestionIntent } from '@/types'
 import { apiClient } from '@/lib/apiClient'
 
+interface ProgressState {
+  startedAt: number | null
+  currentPhaseStartedAt: number | null
+  completedSteps: number
+  estimatedTotalSteps: number
+  currentStepProgress: number  // 0-1 for current phase (based on actors completed)
+  phaseTimings: Map<string, number>  // phase_id -> duration in ms
+  // Actor-level progress tracking
+  totalActorsInPhase: number
+  completedActorsInPhase: number
+}
+
 interface DebateState {
   currentSessionId: string | null
   currentSession: DebateSession | null
@@ -24,6 +36,9 @@ interface DebateState {
   questionIntent: QuestionIntent | null
   semanticComparisons: Map<string, TopicComparison[]>  // phaseId -> comparisons
   selectedTopicId: string | null
+
+  // Progress tracking
+  progress: ProgressState
 
   status: 'idle' | 'connecting' | 'streaming' | 'completed' | 'error'
   error: string | null
@@ -48,6 +63,21 @@ interface DebateState {
 let eventSource: EventSource | null = null
 let expectedClose = false  // Flag to track expected connection close
 
+// Token batching for performance optimization
+// Instead of updating Zustand state on every token, we buffer tokens and flush periodically
+const tokenBuffer = new Map<string, string>()  // actorId -> accumulated tokens
+let flushTimeoutId: ReturnType<typeof setTimeout> | null = null
+const FLUSH_INTERVAL = 50  // ms - flush every 50ms
+
+// Helper to clear token buffer and flush timeout
+function clearTokenBufferState() {
+  if (flushTimeoutId) {
+    clearTimeout(flushTimeoutId)
+    flushTimeoutId = null
+  }
+  tokenBuffer.clear()
+}
+
 // Helper to create a phase record ID
 function makePhaseId(step: number, phase: LivePhaseType, cycle?: number): string {
   return `${step}:${phase}${cycle !== undefined ? `:${cycle}` : ''}`
@@ -69,6 +99,16 @@ export const useDebateStore = create<DebateState>((set, get) => ({
   questionIntent: null,
   semanticComparisons: new Map(),
   selectedTopicId: null,
+  progress: {
+    startedAt: null,
+    currentPhaseStartedAt: null,
+    completedSteps: 0,
+    estimatedTotalSteps: 9,  // Default: 1 initial + 2*3 review/revision + 1 final + 1 summary
+    currentStepProgress: 0,
+    phaseTimings: new Map(),
+    totalActorsInPhase: 0,
+    completedActorsInPhase: 0,
+  },
   status: 'idle',
   error: null,
 
@@ -82,12 +122,19 @@ export const useDebateStore = create<DebateState>((set, get) => ({
   },
 
   startDebate: async (question, actorIds, judgeActorId, config) => {
+    // Reset expectedClose flag for new debate
+    expectedClose = false
+
     const data = await apiClient.startDebate({
       question,
       actor_ids: actorIds,
       judge_actor_id: judgeActorId,
       config: config || { max_rounds: 3 },
     })
+
+    // Calculate estimated total steps: 1 initial + 2*max_rounds review/revision + 1 final + 1 summary
+    const maxRounds = config?.max_rounds || 3
+    const estimatedTotalSteps = 1 + 2 * maxRounds + 2
 
     set({
       currentSessionId: data.session_id,
@@ -105,6 +152,14 @@ export const useDebateStore = create<DebateState>((set, get) => ({
       semanticComparisons: new Map(),
       selectedTopicId: null,
       error: null,
+      progress: {
+        startedAt: Date.now(),
+        currentPhaseStartedAt: null,
+        completedSteps: 0,
+        estimatedTotalSteps,
+        currentStepProgress: 0,
+        phaseTimings: new Map(),
+      },
     })
 
     get().streamDebate(data.session_id)
@@ -113,6 +168,9 @@ export const useDebateStore = create<DebateState>((set, get) => ({
   },
 
   streamDebate: (sessionId) => {
+    // Reset expectedClose flag for new stream
+    expectedClose = false
+
     set({
       status: 'connecting',
       error: null,
@@ -128,6 +186,14 @@ export const useDebateStore = create<DebateState>((set, get) => ({
       questionIntent: null,
       semanticComparisons: new Map(),
       selectedTopicId: null,
+      progress: {
+        startedAt: Date.now(),
+        currentPhaseStartedAt: null,
+        completedSteps: 0,
+        estimatedTotalSteps: 9,
+        currentStepProgress: 0,
+        phaseTimings: new Map(),
+      },
     })
 
     if (eventSource) {
@@ -179,6 +245,17 @@ export const useDebateStore = create<DebateState>((set, get) => ({
 
       set((state) => {
         const newHistory = [...state.phaseHistory, newRecord]
+
+        // Update progress
+        const prevPhaseStartedAt = state.progress.currentPhaseStartedAt
+        const prevPhaseId = state.currentPhaseRecord?.id
+        const newPhaseTimings = new Map(state.progress.phaseTimings)
+
+        // Record previous phase timing if exists
+        if (prevPhaseStartedAt && prevPhaseId) {
+          newPhaseTimings.set(prevPhaseId, Date.now() - prevPhaseStartedAt)
+        }
+
         return {
           currentPhase: phase,
           currentRound: data.round || cycle || 1,
@@ -188,6 +265,16 @@ export const useDebateStore = create<DebateState>((set, get) => ({
           // Clear legacy streaming state for new phase
           streamingContent: new Map(),
           activeActors: new Set(),
+          // Update progress
+          progress: {
+            ...state.progress,
+            currentPhaseStartedAt: Date.now(),
+            currentStepProgress: 0,
+            phaseTimings: newPhaseTimings,
+            // Reset actor counts for new phase
+            totalActorsInPhase: 0,
+            completedActorsInPhase: 0,
+          },
         }
       })
     })
@@ -237,11 +324,20 @@ export const useDebateStore = create<DebateState>((set, get) => ({
             r.id === updatedRecord.id ? updatedRecord : r
           )
 
+          // Track total actors - increment when we see a new actor for this phase
+          const currentActorCount = Object.keys(phaseRecord.messages).length
+          const newActorCount = currentActorCount + 1
+
           return {
             streamingContent: newMap,
             activeActors: newActive,
             currentPhaseRecord: updatedRecord,
             phaseHistory: updatedHistory,
+            progress: {
+              ...state.progress,
+              totalActorsInPhase: newActorCount,
+              currentStepProgress: state.progress.completedActorsInPhase / Math.max(newActorCount, 1),
+            },
           }
         }
 
@@ -254,41 +350,66 @@ export const useDebateStore = create<DebateState>((set, get) => ({
       const actorId = data.actor_id as string
       const token = data.content as string
 
-      set((state) => {
-        // Update legacy state
-        const newMap = new Map(state.streamingContent)
-        const existing = newMap.get(actorId) || ''
-        newMap.set(actorId, existing + token)
+      // Buffer the token instead of immediately updating state
+      const existing = tokenBuffer.get(actorId) || ''
+      tokenBuffer.set(actorId, existing + token)
 
-        // Update phase history
-        const phaseRecord = state.currentPhaseRecord
-        if (phaseRecord && phaseRecord.messages[actorId]) {
-          const updatedMessage: LiveMessage = {
-            ...phaseRecord.messages[actorId],
-            content: phaseRecord.messages[actorId].content + token,
-          }
+      // Schedule a flush if not already scheduled
+      if (!flushTimeoutId) {
+        flushTimeoutId = setTimeout(() => {
+          flushTimeoutId = null
+          // Flush all buffered tokens to state
+          const bufferedTokens = new Map(tokenBuffer)
+          tokenBuffer.clear()
 
-          const updatedRecord: LivePhaseRecord = {
-            ...phaseRecord,
-            messages: {
-              ...phaseRecord.messages,
-              [actorId]: updatedMessage,
-            },
-          }
+          if (bufferedTokens.size === 0) return
 
-          const updatedHistory = state.phaseHistory.map((r) =>
-            r.id === updatedRecord.id ? updatedRecord : r
-          )
+          set((state) => {
+            // Update legacy state
+            const newMap = new Map(state.streamingContent)
+            bufferedTokens.forEach((tokens, actorId) => {
+              const existing = newMap.get(actorId) || ''
+              newMap.set(actorId, existing + tokens)
+            })
 
-          return {
-            streamingContent: newMap,
-            currentPhaseRecord: updatedRecord,
-            phaseHistory: updatedHistory,
-          }
-        }
+            // Update phase history
+            const phaseRecord = state.currentPhaseRecord
+            if (phaseRecord) {
+              const updatedMessages = { ...phaseRecord.messages }
+              let hasUpdates = false
 
-        return { streamingContent: newMap }
-      })
+              bufferedTokens.forEach((tokens, actorId) => {
+                if (updatedMessages[actorId]) {
+                  updatedMessages[actorId] = {
+                    ...updatedMessages[actorId],
+                    content: updatedMessages[actorId].content + tokens,
+                  }
+                  hasUpdates = true
+                }
+              })
+
+              if (hasUpdates) {
+                const updatedRecord: LivePhaseRecord = {
+                  ...phaseRecord,
+                  messages: updatedMessages,
+                }
+
+                const updatedHistory = state.phaseHistory.map((r) =>
+                  r.id === updatedRecord.id ? updatedRecord : r
+                )
+
+                return {
+                  streamingContent: newMap,
+                  currentPhaseRecord: updatedRecord,
+                  phaseHistory: updatedHistory,
+                }
+              }
+            }
+
+            return { streamingContent: newMap }
+          })
+        }, FLUSH_INTERVAL)
+      }
     })
 
     eventSource.addEventListener('actor_end', (e: MessageEvent) => {
@@ -296,10 +417,23 @@ export const useDebateStore = create<DebateState>((set, get) => ({
       const data = JSON.parse(e.data)
       const actorId = data.actor_id as string
 
+      // Flush any remaining tokens for this actor before marking as done
+      const remainingTokens = tokenBuffer.get(actorId)
+      if (remainingTokens) {
+        tokenBuffer.delete(actorId)
+      }
+
       set((state) => {
-        // Update legacy state
+        // Update legacy state - include any remaining buffered tokens
         const newActive = new Set(state.activeActors)
         newActive.delete(actorId)
+
+        // Update legacy streaming content with remaining tokens
+        const newMap = new Map(state.streamingContent)
+        if (remainingTokens) {
+          const existing = newMap.get(actorId) || ''
+          newMap.set(actorId, existing + remainingTokens)
+        }
 
         // Update phase history
         const phaseRecord = state.currentPhaseRecord
@@ -307,6 +441,8 @@ export const useDebateStore = create<DebateState>((set, get) => ({
           const updatedMessage: LiveMessage = {
             ...phaseRecord.messages[actorId],
             status: 'done',
+            // Include remaining buffered tokens
+            content: phaseRecord.messages[actorId].content + (remainingTokens || ''),
           }
 
           const updatedRecord: LivePhaseRecord = {
@@ -321,20 +457,41 @@ export const useDebateStore = create<DebateState>((set, get) => ({
             r.id === updatedRecord.id ? updatedRecord : r
           )
 
+          // Update progress - increment completed actors and calculate progress
+          const newCompletedActors = state.progress.completedActorsInPhase + 1
+          const totalActors = Math.max(state.progress.totalActorsInPhase, newCompletedActors)
+          const newProgress = totalActors > 0 ? newCompletedActors / totalActors : 0
+
           return {
             activeActors: newActive,
+            streamingContent: newMap,
             currentPhaseRecord: updatedRecord,
             phaseHistory: updatedHistory,
+            progress: {
+              ...state.progress,
+              completedActorsInPhase: newCompletedActors,
+              currentStepProgress: newProgress,
+            },
           }
         }
 
-        return { activeActors: newActive }
+        return { activeActors: newActive, streamingContent: newMap }
       })
     })
 
     eventSource.addEventListener('phase_end', (e: MessageEvent) => {
       console.log('[SSE] phase_end:', e.data)
-      // Phase ended, nothing special to do - history is preserved
+      // Phase ended, update progress
+      set((state) => ({
+        progress: {
+          ...state.progress,
+          completedSteps: state.progress.completedSteps + 1,
+          currentStepProgress: 1,
+          // Reset actor counts for next phase
+          totalActorsInPhase: 0,
+          completedActorsInPhase: 0,
+        }
+      }))
     })
 
     // Convergence result - attach to latest revision phase
@@ -528,6 +685,7 @@ export const useDebateStore = create<DebateState>((set, get) => ({
     eventSource.addEventListener('complete', async (e: MessageEvent) => {
       console.log('[SSE] complete:', e.data)
       expectedClose = true  // Mark as expected close
+      clearTokenBufferState()  // Clear token buffer
 
       try {
         const session = await apiClient.getDebate(sessionId)
@@ -544,6 +702,7 @@ export const useDebateStore = create<DebateState>((set, get) => ({
     eventSource.addEventListener('debate_error', (e: MessageEvent) => {
       console.error('[SSE] debate_error:', e.data)
       const data = JSON.parse(e.data)
+      clearTokenBufferState()  // Clear token buffer
       set({ status: 'error', error: data.message })
       eventSource?.close()
       eventSource = null
@@ -552,6 +711,7 @@ export const useDebateStore = create<DebateState>((set, get) => ({
     eventSource.addEventListener('cancelled', () => {
       console.log('[SSE] cancelled')
       expectedClose = true  // Mark as expected close
+      clearTokenBufferState()  // Clear token buffer
       set({ status: 'idle', error: 'Review was cancelled' })
       eventSource?.close()
       eventSource = null
@@ -560,6 +720,7 @@ export const useDebateStore = create<DebateState>((set, get) => ({
 
   stopDebate: async () => {
     expectedClose = true  // Mark as expected close
+    clearTokenBufferState()  // Clear token buffer
     if (eventSource) {
       eventSource.close()
       eventSource = null
@@ -609,6 +770,7 @@ export const useDebateStore = create<DebateState>((set, get) => ({
   selectTopic: (topicId) => set({ selectedTopicId: topicId }),
   reset: () => {
     expectedClose = true  // Mark as expected close
+    clearTokenBufferState()  // Clear token buffer and timeout
     if (eventSource) {
       eventSource.close()
       eventSource = null
@@ -630,6 +792,14 @@ export const useDebateStore = create<DebateState>((set, get) => ({
       selectedTopicId: null,
       status: 'idle',
       error: null,
+      progress: {
+        startedAt: null,
+        currentPhaseStartedAt: null,
+        completedSteps: 0,
+        estimatedTotalSteps: 9,
+        currentStepProgress: 0,
+        phaseTimings: new Map(),
+      },
     })
   },
 }))

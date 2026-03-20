@@ -193,51 +193,61 @@ async def check_convergence(
 """
 
     try:
-        adapter = create_adapter(
-            provider=judge.provider.value,
-            api_key=judge.api_key,
-            base_url=judge.base_url,
-            model=judge.model,
-        )
-
-        full_response = ""
-        async for token in adapter.stream_completion(
-            messages=[{"role": "user", "content": prompt}],
-            system_prompt="你是一个专业的收敛判断器。请以JSON格式返回判断结果。",
-            max_tokens=judge.max_tokens,
-            temperature=0.3,
-        ):
-            full_response += token
-
-        # Parse JSON response
-        json_start = full_response.find("{")
-        json_end = full_response.rfind("}") + 1
-
-        if json_start >= 0 and json_end > json_start:
-            json_str = full_response[json_start:json_end]
-            data = json.loads(json_str)
-
-            converged = data.get("converged", False)
-            score = float(data.get("score", 0.5))
-
-            # Apply threshold
-            if score >= threshold:
-                converged = True
-
-            return ConvergenceResult(
-                converged=converged,
-                score=score,
-                reason=data.get("reason", ""),
-                agreements=data.get("agreements", []),
-                disagreements=data.get("disagreements", []),
+            adapter = create_adapter(
+                provider=judge.provider.value,
+                api_key=judge.api_key,
+                base_url=judge.base_url,
+                model=judge.model,
             )
-        else:
-            logger.warning(f"Could not parse convergence response: {full_response}")
-            return ConvergenceResult(
-                converged=False,
-                score=0.5,
-                reason="Could not parse convergence response",
-            )
+
+            full_response = ""
+            async for token in adapter.stream_completion(
+                messages=[{"role": "user", "content": prompt}],
+                system_prompt="你是一个专业的收敛判断器。请以JSON格式返回判断结果。",
+                max_tokens=judge.max_tokens,
+                temperature=0.3,
+            ):
+                full_response += token
+
+            # Parse JSON response
+            json_start = full_response.find("{")
+            json_end = full_response.rfind("}") + 1
+
+            if json_start >= 0 and json_end > json_start:
+                json_str = full_response[json_start:json_end]
+                data = json.loads(json_str)
+
+                converged = data.get("converged", False)
+                score = data.get("score")
+
+                # Validate score - if not provided or invalid, mark as unavailable
+                if score is None:
+                    score = None
+                    converged = False
+                else:
+                    try:
+                        score = float(score)
+                        # Apply threshold
+                        if score >= threshold:
+                            converged = True
+                    except (ValueError, TypeError):
+                        score = None
+                        converged = False
+
+                return ConvergenceResult(
+                    converged=converged,
+                    score=score if score is not None else 0.0,
+                    reason=data.get("reason", "") + (" (置信度不可用)" if score is None else ""),
+                    agreements=data.get("agreements", []),
+                    disagreements=data.get("disagreements", []),
+                )
+            else:
+                logger.warning(f"Could not parse convergence response: {full_response}")
+                return ConvergenceResult(
+                    converged=False,
+                    score=0.0,
+                    reason="无法解析收敛判断结果",
+                )
 
     except Exception as e:
         logger.error(f"Convergence check failed: {e}")

@@ -2,7 +2,7 @@
 
 import { useState, useMemo, useEffect } from 'react'
 import { motion } from 'framer-motion'
-import { Actor, LivePhaseRecord, TopicComparison } from '@/types'
+import { Actor, LivePhaseRecord, TopicComparison, Consensus } from '@/types'
 import ReviewChatView from './ReviewChatView'
 import SemanticSidebar from './SemanticSidebar'
 import DiffSidebar from './DiffSidebar'
@@ -18,6 +18,7 @@ interface DebateViewProps {
   semanticComparisons?: Map<string, TopicComparison[]>
   selectedTopicId?: string | null
   onSelectTopic?: (topicId: string | null) => void
+  consensus?: Consensus | null  // Add consensus prop
 }
 
 type SidebarTab = 'semantic' | 'diff'
@@ -33,6 +34,7 @@ export default function DebateView({
   semanticComparisons = new Map(),
   selectedTopicId = null,
   onSelectTopic,
+  consensus,
 }: DebateViewProps) {
   // Sidebar tab state
   const [sidebarTab, setSidebarTab] = useState<SidebarTab>('semantic')
@@ -65,20 +67,6 @@ export default function DebateView({
     return semanticComparisons.size > 0
   }, [semanticComparisons])
 
-  // Auto-switch to diff tab if no semantic data available
-  useEffect(() => {
-    if (!hasSemanticData && phaseHistory.length > 0) {
-      // Check if there are comparable phases for diff
-      const comparablePhases = phaseHistory.filter((record) => {
-        if (!['initial', 'review', 'revision'].includes(record.phase)) return false
-        return Object.keys(record.messages).length >= 2
-      })
-      if (comparablePhases.length > 0 && sidebarTab === 'semantic') {
-        setSidebarTab('diff')
-      }
-    }
-  }, [hasSemanticData, phaseHistory, sidebarTab])
-
   return (
     <div className="flex h-full min-h-0">
       {/* Main chat area (left ~2/3) - scrolls independently */}
@@ -92,6 +80,7 @@ export default function DebateView({
             // On click, set this actor as base for diff
             setSelectedBaseId(actorId)
           }}
+          consensus={consensus}
         />
       </div>
 
@@ -131,6 +120,7 @@ export default function DebateView({
               onSelectDiffPhase={onSelectDiffPhase}
               selectedTopicId={selectedTopicId}
               onSelectTopic={onSelectTopic || (() => {})}
+              onSwitchToDiffTab={() => setSidebarTab('diff')}
             />
           ) : (
             <DiffSidebar

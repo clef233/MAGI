@@ -11,7 +11,7 @@ import ActorManager from './ActorManager'
 import SessionHistory from './SessionHistory'
 import SettingsView from './SettingsView'
 import SessionDetailView from './SessionDetailView'
-import ConsensusView from './ConsensusView'
+import ProgressBar from './ProgressBar'
 import { apiClient } from '@/lib/apiClient'
 
 type View = 'arena' | 'debate' | 'actors' | 'history' | 'settings' | 'sessionDetail'
@@ -23,33 +23,43 @@ export default function Arena() {
   const [recentSessions, setRecentSessions] = useState<SessionListItem[]>([])
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null)
 
-  const {
-    actors,
-    selectedActors,
-    judgeActorId,
-    fetchActors,
-    selectActor,
-    deselectActor,
-    setJudgeActor,
-  } = useActorStore()
+  // Actor store - separate selectors for different data
+  const actors = useActorStore((state) => state.actors)
+  const selectedActors = useActorStore((state) => state.selectedActors)
+  const judgeActorId = useActorStore((state) => state.judgeActorId)
+  const fetchActors = useActorStore((state) => state.fetchActors)
+  const selectActor = useActorStore((state) => state.selectActor)
+  const deselectActor = useActorStore((state) => state.deselectActor)
+  const setJudgeActor = useActorStore((state) => state.setJudgeActor)
 
-  const {
-    status,
-    currentRound,
-    currentPhase,
-    currentSession,
-    currentSessionId,
-    phaseHistory,
-    selectedDiffPhaseId,
-    selectDiffPhase,
-    semanticComparisons,
-    selectedTopicId,
-    selectTopic,
-    startDebate,
-    stopDebate,
-    reset,
-    error,
-  } = useDebateStore()
+  // Debate store - use individual selectors to minimize re-renders
+  // Status and error are frequently checked but change less often during streaming
+  const status = useDebateStore((state) => state.status)
+  const error = useDebateStore((state) => state.error)
+  const currentPhase = useDebateStore((state) => state.currentPhase)
+
+  // Session-related state - only changes at start/end
+  const currentSession = useDebateStore((state) => state.currentSession)
+
+  // Phase history - changes frequently during streaming
+  const phaseHistory = useDebateStore((state) => state.phaseHistory)
+
+  // Diff selection - changes when user interacts with diff sidebar
+  const selectedDiffPhaseId = useDebateStore((state) => state.selectedDiffPhaseId)
+  const selectDiffPhase = useDebateStore((state) => state.selectDiffPhase)
+
+  // Semantic state
+  const semanticComparisons = useDebateStore((state) => state.semanticComparisons)
+  const selectedTopicId = useDebateStore((state) => state.selectedTopicId)
+  const selectTopic = useDebateStore((state) => state.selectTopic)
+
+  // Progress state
+  const progress = useDebateStore((state) => state.progress)
+
+  // Actions - stable references
+  const startDebate = useDebateStore((state) => state.startDebate)
+  const stopDebate = useDebateStore((state) => state.stopDebate)
+  const reset = useDebateStore((state) => state.reset)
 
   const inputRef = useRef<HTMLTextAreaElement>(null)
 
@@ -119,7 +129,7 @@ export default function Arena() {
       <div className="h-screen flex flex-col overflow-hidden">
         {/* Header */}
         <header className="border-b border-border px-6 py-4 shrink-0">
-          <div className="flex items-center justify-between max-w-7xl mx-auto">
+          <div className="flex items-center justify-between max-w-[1600px] mx-auto">
             <button
               onClick={handleBackToArena}
               className="text-text-secondary hover:text-text-primary transition-colors"
@@ -133,7 +143,7 @@ export default function Arena() {
 
         {/* Debate content - main area with fixed height */}
         <main className="flex-1 overflow-hidden">
-          <div className="h-full max-w-7xl mx-auto px-6 py-4 flex flex-col">
+          <div className="h-full max-w-[1600px] mx-auto px-6 py-4 flex flex-col">
             {/* Question - fixed at top */}
             <div className="mb-4 shrink-0">
               <h2 className="text-lg text-text-secondary mb-1">问题</h2>
@@ -149,11 +159,15 @@ export default function Arena() {
                 </div>
               )}
               {status === 'streaming' && (
-                <div className="flex items-center gap-2">
-                  <span className="text-accent-blue">Round {currentRound}</span>
-                  <span className="text-text-tertiary">•</span>
-                  <span className="text-text-secondary capitalize">{currentPhase}</span>
-                </div>
+                <ProgressBar
+                  startedAt={progress.startedAt}
+                  currentPhaseStartedAt={progress.currentPhaseStartedAt}
+                  completedSteps={progress.completedSteps}
+                  estimatedTotalSteps={progress.estimatedTotalSteps}
+                  currentStepProgress={progress.currentStepProgress}
+                  currentPhase={currentPhase}
+                  status={status}
+                />
               )}
               {status === 'completed' && (
                 <div className="text-accent-green">互评完成</div>
@@ -166,7 +180,7 @@ export default function Arena() {
               )}
             </div>
 
-            {/* Debate view - scrollable area */}
+            {/* Debate view - scrollable area with consensus inside */}
             {status !== 'idle' && (
               <div className="flex-1 min-h-0">
                 <DebateView
@@ -180,14 +194,8 @@ export default function Arena() {
                   semanticComparisons={semanticComparisons}
                   selectedTopicId={selectedTopicId}
                   onSelectTopic={selectTopic}
+                  consensus={currentSession?.consensus}  // Pass consensus to DebateView
                 />
-              </div>
-            )}
-
-            {/* Consensus - fixed at bottom */}
-            {currentSession?.consensus && status === 'completed' && (
-              <div className="mt-4 shrink-0">
-                <ConsensusView consensus={currentSession.consensus} />
               </div>
             )}
           </div>

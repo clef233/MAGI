@@ -170,7 +170,7 @@ async def _seed_default_prompts():
   "summary": "综合总结",
   "agreements": ["共识点1", "共识点2"],
   "disagreements": ["分歧点1"],
-  "confidence": 0.85,
+  "confidence": <你对结论的信心程度，0.0-1.0之间的小数，如果不确定则省略此字段>,
   "recommendation": "最终建议"
 }""",
                 required_variables=["question", "history"],
