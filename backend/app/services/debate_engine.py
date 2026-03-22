@@ -1161,12 +1161,16 @@ class DebateEngine:
             responses = self.actor_responses.get(actor.id, [])
             for r in responses:
                 role = r.get("role", "response")
-                history_items.append({
+                item = {
                     "actor_name": actor.name,
                     "role": role,
                     "cycle": r.get("cycle", 0),
                     "content": r.get("content", ""),
-                })
+                }
+                # Reviews address all participants
+                if role == "review":
+                    item["about_actor_name"] = "all participants"
+                history_items.append(item)
 
         history_blocks = self.prompt_service.build_history_blocks(
             history_items=history_items,
