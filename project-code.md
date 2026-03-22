@@ -1,8 +1,8 @@
 # Project: MAGI
 
-Generated: 2026-03-22 18:11:54
+Generated: 2026-03-22 19:55:38
 Root: D:\Projects\MAGI
-Files: 63
+Files: 67
 
 ---
 
@@ -67,6 +67,7 @@ frontend/
       MiniMagiMonitor.tsx
       ProgressBar.tsx
       QuestionBox.tsx
+      QuickSetup.tsx
       ReviewChatView.tsx
       SemanticSidebar.tsx
       SessionDetailView.tsx
@@ -84,8 +85,11 @@ frontend/
   tailwind.config.ts
   tsconfig.json
 merge_code.py
+setup.bat
+setup.sh
 start.bat
 START.HTML
+start.sh
 stop.bat
 ```
 
@@ -106,7 +110,9 @@ stop.bat
       "Bash(timeout 10 python -c \"from app.main import app; print\\(''Backend imports OK''\\)\")",
       "Bash(python -c \"import sys; print\\(sys.executable\\)\")",
       "Bash(C:/Python313/python.exe -m pip install -e .)",
-      "Bash(curl -s http://localhost:8000/api/health)"
+      "Bash(curl -s http://localhost:8000/api/health)",
+      "Bash(npm run:*)",
+      "Bash(npx tsc:*)"
     ]
   }
 }
@@ -893,45 +899,262 @@ async def get_semantic_analysis(
 ### backend\app\api\presets.py
 
 ```python
-from fastapi import APIRouter
-from typing import List
-from app.models.schemas import ActorCreate, ActorResponse, APIConfigCreate, PromptConfigBase, ProviderType
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from typing import List, Optional
+from pydantic import BaseModel
+
+from app.services.database import get_db
+from app.models.database import Actor as DBActor, SemanticModelConfig, ProviderType, PromptPreset
+from app.models.schemas import ActorResponse, PromptConfigBase
 
 router = APIRouter(prefix="/api/presets", tags=["presets"])
 
 
-# Default prompt templates
-DEFAULT_PROMPTS = {
-    "conservative": PromptConfigBase(
-        system_prompt="You are a cautious and thorough analyst. You prioritize risk assessment and careful consideration of all possibilities. You tend to be skeptical of bold claims and prefer conservative, well-established solutions.",
-        review_prompt="Review the responses with a critical eye towards risks, edge cases, and potential issues. Highlight any assumptions that may not hold.",
-        revision_prompt="Revise your response to address valid concerns while maintaining your cautious perspective.",
-        personality="conservative",
-    ),
-    "innovative": PromptConfigBase(
-        system_prompt="You are an innovative thinker who embraces new approaches and creative solutions. You enjoy exploring unconventional ideas and pushing boundaries. You believe the best solutions often come from unexpected directions.",
-        review_prompt="Review the responses and identify opportunities for innovation. Point out where traditional thinking might be limiting.",
-        revision_prompt="Revise your response to incorporate creative insights while remaining practical.",
-        personality="innovative",
-    ),
-    "academic": PromptConfigBase(
-        system_prompt="You are an academic researcher with deep expertise. You value precision, citations, and logical rigor. You communicate in a scholarly manner and always seek evidence-based conclusions.",
-        review_prompt="Review the responses for logical consistency, evidentiary support, and academic rigor. Identify any logical fallacies or unsupported claims.",
-        revision_prompt="Revise your response to be more precise and evidence-based.",
-        personality="academic",
-    ),
-    "practical": PromptConfigBase(
-        system_prompt="You are a pragmatic problem-solver focused on real-world applications. You value simplicity, efficiency, and actionable solutions. You prefer approaches that can be implemented quickly and effectively.",
-        review_prompt="Review the responses for practical applicability. Identify overly complex solutions and suggest simplifications.",
-        revision_prompt="Revise your response to be more actionable and implementable.",
-        personality="practical",
-    ),
+# ========== 预设配置定义 ==========
+
+PROVIDER_PRESETS = {
+    "siliconflow": {
+        "name": "硅基流动 SiliconFlow",
+        "description": "国内 AI 模型聚合平台，支持多种模型，性价比高",
+        "base_url": "https://api.siliconflow.cn/v1",
+        "provider": "custom",
+        "api_format": "openai_compatible",
+        "actors": [
+            {
+                "name": "MiniMax-M2.5",
+                "model": "Pro/MiniMaxAI/MiniMax-M2.5",
+                "display_color": "#4ECDC4",
+                "icon": "🔵",
+                "is_meta_judge": False,
+                "preset_key": "innovative",
+            },
+            {
+                "name": "GLM-5",
+                "model": "Pro/zai-org/GLM-5",
+                "display_color": "#FF6B35",
+                "icon": "🔶",
+                "is_meta_judge": False,
+                "preset_key": "conservative",
+            },
+            {
+                "name": "Kimi-K2.5",
+                "model": "Pro/moonshotai/Kimi-K2.5",
+                "display_color": "#A855F7",
+                "icon": "🟣",
+                "is_meta_judge": True,
+                "preset_key": "synthesizer",
+            },
+        ],
+        "semantic_model": {
+            "model": "Qwen/Qwen3-14B",
+            "max_tokens": 2048,
+            "temperature": 0.3,
+        },
+    },
 }
+
+
+# ========== 请求/响应 Schema ==========
+
+class QuickSetupRequest(BaseModel):
+    provider_preset: str  # e.g. "siliconflow"
+    api_key: str
+
+
+class QuickSetupActorResult(BaseModel):
+    id: str
+    name: str
+    model: str
+    is_meta_judge: bool
+
+
+class QuickSetupResponse(BaseModel):
+    success: bool
+    message: str
+    actors_created: List[QuickSetupActorResult]
+    semantic_configured: bool
+
+
+class ProviderPresetInfo(BaseModel):
+    key: str
+    name: str
+    description: str
+    actor_count: int
+    actor_names: List[str]
+    semantic_model: str
+
+
+# ========== API 端点 ==========
+
+@router.get("/providers")
+async def list_provider_presets() -> List[ProviderPresetInfo]:
+    """列出所有可用的服务商预设配置"""
+    result = []
+    for key, preset in PROVIDER_PRESETS.items():
+        result.append(ProviderPresetInfo(
+            key=key,
+            name=preset["name"],
+            description=preset["description"],
+            actor_count=len(preset["actors"]),
+            actor_names=[a["name"] for a in preset["actors"]],
+            semantic_model=preset["semantic_model"]["model"],
+        ))
+    return result
+
+
+@router.post("/quick-setup", response_model=QuickSetupResponse)
+async def quick_setup(
+    data: QuickSetupRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """一键配置：根据服务商预设创建所有 Actor 和语义分析模型"""
+
+    preset = PROVIDER_PRESETS.get(data.provider_preset)
+    if not preset:
+        raise HTTPException(
+            status_code=400,
+            detail=f"未知的服务商预设: {data.provider_preset}，"
+                   f"可用选项: {list(PROVIDER_PRESETS.keys())}"
+        )
+
+    if not data.api_key or not data.api_key.strip():
+        raise HTTPException(status_code=400, detail="API Key 不能为空")
+
+    api_key = data.api_key.strip()
+    base_url = preset["base_url"]
+    provider = preset["provider"]
+    api_format = preset["api_format"]
+
+    # 加载 prompt presets
+    prompt_presets_map = {}
+    result = await db.execute(select(PromptPreset))
+    for pp in result.scalars().all():
+        prompt_presets_map[pp.key] = pp
+
+    actors_created = []
+
+    # 检查是否已存在同名 actor（避免重复创建）
+    result = await db.execute(
+        select(DBActor).where(DBActor.is_active == True)
+    )
+    existing_names = {a.name for a in result.scalars().all()}
+
+    for actor_def in preset["actors"]:
+        # 跳过已存在的同名 actor
+        if actor_def["name"] in existing_names:
+            # 查找已存在的 actor，返回其信息
+            result = await db.execute(
+                select(DBActor).where(
+                    DBActor.name == actor_def["name"],
+                    DBActor.is_active == True,
+                )
+            )
+            existing = result.scalar_one_or_none()
+            if existing:
+                actors_created.append(QuickSetupActorResult(
+                    id=existing.id,
+                    name=existing.name,
+                    model=existing.model,
+                    is_meta_judge=existing.is_meta_judge,
+                ))
+            continue
+
+        # 获取对应的 prompt preset
+        pp = prompt_presets_map.get(actor_def["preset_key"])
+        system_prompt = pp.system_prompt if pp else ""
+        review_prompt = pp.review_prompt if pp else ""
+        revision_prompt = pp.revision_prompt if pp else ""
+        personality = pp.personality if pp else "neutral"
+        custom_instructions = pp.custom_instructions if pp else ""
+
+        actor = DBActor(
+            name=actor_def["name"],
+            display_color=actor_def["display_color"],
+            icon=actor_def["icon"],
+            is_meta_judge=actor_def["is_meta_judge"],
+            provider=ProviderType(provider),
+            api_format=api_format,
+            base_url=base_url,
+            api_key=api_key,
+            model=actor_def["model"],
+            max_tokens=4096,
+            temperature=0.7,
+            system_prompt=system_prompt,
+            review_prompt=review_prompt,
+            revision_prompt=revision_prompt,
+            personality=personality,
+            custom_instructions=custom_instructions,
+        )
+        db.add(actor)
+        await db.flush()
+
+        actors_created.append(QuickSetupActorResult(
+            id=actor.id,
+            name=actor.name,
+            model=actor.model,
+            is_meta_judge=actor.is_meta_judge,
+        ))
+
+    # 配置语义分析模型
+    semantic_configured = False
+    semantic_def = preset.get("semantic_model")
+    if semantic_def:
+        # 检查是否已有配置
+        result = await db.execute(
+            select(SemanticModelConfig).limit(1)
+        )
+        existing_config = result.scalar_one_or_none()
+
+        if existing_config:
+            # 更新现有配置
+            existing_config.provider = ProviderType(provider)
+            existing_config.api_format = api_format
+            existing_config.base_url = base_url
+            existing_config.api_key = api_key
+            existing_config.model = semantic_def["model"]
+            existing_config.max_tokens = semantic_def.get("max_tokens", 2048)
+            existing_config.temperature = semantic_def.get("temperature", 0.3)
+            existing_config.is_active = True
+        else:
+            # 创建新配置
+            config = SemanticModelConfig(
+                provider=ProviderType(provider),
+                api_format=api_format,
+                base_url=base_url,
+                api_key=api_key,
+                model=semantic_def["model"],
+                max_tokens=semantic_def.get("max_tokens", 2048),
+                temperature=semantic_def.get("temperature", 0.3),
+                is_active=True,
+            )
+            db.add(config)
+
+        semantic_configured = True
+
+    await db.commit()
+
+    skipped = len([a for a in preset["actors"] if a["name"] in existing_names])
+    created = len(actors_created) - skipped
+
+    message = f"配置完成！创建了 {created} 个 Actor"
+    if skipped > 0:
+        message += f"（跳过 {skipped} 个已存在的）"
+    if semantic_configured:
+        message += "，语义分析模型已配置"
+
+    return QuickSetupResponse(
+        success=True,
+        message=message,
+        actors_created=actors_created,
+        semantic_configured=semantic_configured,
+    )
 
 
 @router.get("/actors")
 async def get_preset_actors() -> List[dict]:
-    """Get preset actor templates"""
+    """Get preset actor templates (legacy endpoint)"""
     return [
         {
             "name": "CASPER",
@@ -943,48 +1166,22 @@ async def get_preset_actors() -> List[dict]:
                 "model": "gpt-4o",
                 "api_format": "openai_compatible",
             },
-            "prompt_config": DEFAULT_PROMPTS["conservative"].model_dump(),
-            "description": "Conservative analyst - cautious and thorough",
-        },
-        {
-            "name": "BALTHASAR",
-            "display_color": "#4ECDC4",
-            "icon": "🔵",
-            "is_meta_judge": False,
-            "api_config": {
-                "provider": "anthropic",
-                "model": "claude-sonnet-4-20250514",
-                "api_format": "anthropic",
-            },
-            "prompt_config": DEFAULT_PROMPTS["innovative"].model_dump(),
-            "description": "Innovative thinker - creative and forward-looking",
-        },
-        {
-            "name": "MELCHIOR",
-            "display_color": "#A855F7",
-            "icon": "🟣",
-            "is_meta_judge": True,
-            "api_config": {
-                "provider": "anthropic",
-                "model": "claude-sonnet-4-20250514",
-                "api_format": "anthropic",
-            },
             "prompt_config": {
-                "system_prompt": "You are an impartial Meta Judge for multi-agent debates. Your role is to synthesize different perspectives into coherent consensus reports.",
+                "system_prompt": "",
                 "review_prompt": "",
                 "revision_prompt": "",
-                "personality": "neutral",
-                "custom_instructions": "Always provide balanced, fair judgments that respect all perspectives.",
+                "personality": "conservative",
+                "custom_instructions": "",
             },
-            "description": "Meta Judge - consensus synthesizer",
+            "description": "Conservative analyst - cautious and thorough",
         },
     ]
 
 
 @router.get("/prompts")
 async def get_preset_prompts() -> dict:
-    """Get preset prompt templates"""
-    return {k: v.model_dump() for k, v in DEFAULT_PROMPTS.items()}
+    """Get preset prompt templates (legacy endpoint)"""
+    return {}
 ```
 
 
@@ -2387,24 +2584,28 @@ async def check_convergence(
             converged = data.get("converged", False)
             score = data.get("score")
 
-            # Validate score - if not provided or invalid, mark as unavailable
-            if score is None:
-                score = None
-                converged = False
-            else:
+            # Validate score
+            if score is not None:
                 try:
                     score = float(score)
-                    # Apply threshold
+                    # Apply threshold to override converged flag
                     if score >= threshold:
                         converged = True
+                    elif score < threshold:
+                        converged = False
                 except (ValueError, TypeError):
                     score = None
-                    converged = False
+
+            # If score is unavailable, respect the LLM's converged judgment
+            # instead of forcing converged=False
+            score_note = ""
+            if score is None:
+                score_note = " (置信度不可用，基于LLM判断)"
 
             return ConvergenceResult(
                 converged=converged,
                 score=score if score is not None else 0.0,
-                reason=data.get("reason", "") + (" (置信度不可用)" if score is None else ""),
+                reason=data.get("reason", "") + score_note,
                 agreements=data.get("agreements", []),
                 disagreements=data.get("disagreements", []),
             )
@@ -2603,10 +2804,10 @@ async def _seed_default_prompts():
             WorkflowPromptTemplate(
                 key="final_answer",
                 name="最终回答提示词",
-                description="综合各专家回答生成独立成文的面向用户的最终回答",
+                description="综合各专家互评结果生成高质量面向用户的最终回答",
                 template_text="""## 任务
 
-基于以下多位专家的讨论结果，撰写一篇直接回答用户问题的文章。
+基于以下多位专家的讨论和互评结果，撰写一篇直接回答用户问题的高质量文章。
 
 ## 原始问题
 
@@ -2616,7 +2817,7 @@ async def _seed_default_prompts():
 
 {{actor_answer_blocks}}
 
-## 收敛分析
+## 讨论过程分析与收敛信息
 
 {{convergence_info}}
 
@@ -2624,9 +2825,17 @@ async def _seed_default_prompts():
 
 你是 {{self_actor_name}}，请以你的身份直接输出最终回答。
 
-- 写一篇**独立成文**的回答。读者不需要知道这背后有多个模型参与讨论
-- 在有共识的部分直接给出结论，不需要说"各方一致认为"
-- 在有分歧的部分，呈现为"不同条件下的不同策略"或"需要权衡的取舍"，而非"A模型认为X，B模型认为Y"
+### 质量标准（最重要）
+
+1. **优先采纳经过互评检验后仍然成立的观点**。如果某个观点在互评中被有效质疑且未能充分反驳，应降低其权重或标注不确定性
+2. **对于各方都认可的数据和结论**，可以直接引用并作为核心论据
+3. **对于只有单方提出且未经验证的具体数字**（如精确的百分比、系数），使用范围表述或加"需验证"标注，不要给读者虚假的精确感
+4. **在有实质分歧的部分**，给出你的综合判断和理由，而非简单罗列两种方案。呈现为"不同条件下的不同策略"或"需要权衡的取舍"
+5. **综合各方的优势**：如果 A 专家的框架更好但 B 专家的细节更严谨，应融合两者
+
+### 格式要求
+
+- 写一篇**独立成文**的回答，读者可以知道这背后有多个模型参与讨论
 - 如果某些结论只有部分专家支持且理由充分，可以作为"值得考虑的替代方案"呈现
 - 不要输出 JSON""",
                 required_variables=["question", "self_actor_name", "actor_answer_blocks", "convergence_info"],
@@ -3935,6 +4144,22 @@ class DebateEngine:
 
         actor_answer_blocks = self.prompt_service.build_latest_answer_blocks(actor_answers)
 
+        # Build review summary: extract key critiques from review rounds
+        review_summary_parts = []
+        for actor in self.actors:
+            responses = self.actor_responses.get(actor.id, [])
+            for r in responses:
+                if r.get("role") == "review":
+                    # Truncate long reviews to save tokens
+                    content = r["content"]
+                    if len(content) > 1500:
+                        content = content[:1500] + "\n...(已截断)"
+                    review_summary_parts.append(f"**{actor.name} 的互评意见：**\n{content}")
+
+        review_context = ""
+        if review_summary_parts:
+            review_context = "\n\n## 互评中的关键批评与反馈\n\n" + "\n\n---\n\n".join(review_summary_parts)
+
         # Build convergence info
         convergence_info = ""
         if convergence_result:
@@ -3953,6 +4178,11 @@ class DebateEngine:
 分析理由: {convergence_result.reason}
 """
 
+        # Combine convergence_info with review_context
+        full_context = convergence_info
+        if review_context:
+            full_context += "\n" + review_context
+
         # Create DB round for final_answer
         final_round = DBRound(
             session_id=self.session.id,
@@ -3970,7 +4200,7 @@ class DebateEngine:
             question=self.session.question,
             self_actor_name=judge.name,
             actor_answer_blocks=actor_answer_blocks,
-            convergence_info=convergence_info,
+            convergence_info=full_context,
         )
 
         # Emit actor_start with judge's info
@@ -6494,7 +6724,7 @@ function ActorFormModal({ actorId, onClose, onSave }: ActorFormModalProps) {
 
 import { useState, useEffect, useRef, useMemo } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Send, Settings, Users, History, Loader2, AlertCircle } from 'lucide-react'
+import { Send, Settings, Users, History, Loader2, AlertCircle, Zap } from 'lucide-react'
 import { useActorStore, useDebateStore } from '@/stores'
 import { Actor, SessionListItem } from '@/types'
 import ActorCard from './ActorCard'
@@ -6506,6 +6736,7 @@ import SessionDetailView from './SessionDetailView'
 import ProgressBar from './ProgressBar'
 import QuestionBox from './QuestionBox'
 import { apiClient } from '@/lib/apiClient'
+import QuickSetup from './QuickSetup'
 
 type View = 'arena' | 'debate' | 'actors' | 'history' | 'settings' | 'sessionDetail'
 
@@ -6515,6 +6746,7 @@ export default function Arena() {
   const [maxRounds, setMaxRounds] = useState(3)
   const [recentSessions, setRecentSessions] = useState<SessionListItem[]>([])
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null)
+  const [showQuickSetup, setShowQuickSetup] = useState(false)
 
   // Actor store - separate selectors for different data
   const actors = useActorStore((state) => state.actors)
@@ -6707,7 +6939,6 @@ export default function Arena() {
               {status === 'streaming' && (
                 <ProgressBar
                   startedAt={progress.startedAt}
-                  currentPhaseStartedAt={progress.currentPhaseStartedAt}
                   completedSteps={progress.completedSteps}
                   estimatedTotalSteps={progress.estimatedTotalSteps}
                   currentStepProgress={progress.currentStepProgress}
@@ -6783,6 +7014,13 @@ export default function Arena() {
                 <History className="w-4 h-4" />
                 History
               </button>
+              <button
+                onClick={() => setShowQuickSetup(true)}
+                className="text-text-secondary hover:text-text-primary transition-colors flex items-center gap-1"
+              >
+                <Zap className="w-4 h-4" />
+                快速配置
+              </button>
             </nav>
           </div>
           <button
@@ -6808,7 +7046,30 @@ export default function Arena() {
             <p className="text-xl text-text-secondary tracking-wide">
               Multi-Agent Guided Intelligence
             </p>
+            {/* 快速配置入口 - 当没有 actor 或没有 judge 时显示 */}
+            {(actors.length === 0 || nonJudgeActors.length < 2 || judgeActors.length === 0) && (
+              <motion.button
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                transition={{ delay: 0.3 }}
+                onClick={() => setShowQuickSetup(true)}
+                className="mt-6 px-6 py-3 bg-accent-orange text-white font-medium rounded-xl hover:bg-orange-600 transition-colors inline-flex items-center gap-2"
+              >
+                ⚡ 快速配置（首次使用）
+              </motion.button>
+            )}
           </motion.div>
+
+          {/* QuickSetup Modal */}
+          {showQuickSetup && (
+            <QuickSetup
+              onClose={() => setShowQuickSetup(false)}
+              onComplete={() => {
+                setShowQuickSetup(false)
+                fetchActors()
+              }}
+            />
+          )}
 
           {/* Question input */}
           <motion.div
@@ -7648,6 +7909,7 @@ export { default as DiffSidebar } from './DiffSidebar'
 export { default as MarkdownBlock } from './MarkdownBlock'
 export { default as MiniMagiMonitor } from './MiniMagiMonitor'
 export { default as ProgressBar } from './ProgressBar'
+export { default as QuickSetup } from './QuickSetup'
 ```
 
 
@@ -8319,11 +8581,10 @@ function JudgeFlowNode({
 ```tsx
 'use client'
 
-import { useMemo } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 
 interface ProgressProps {
   startedAt: number | null
-  currentPhaseStartedAt: number | null
   completedSteps: number
   estimatedTotalSteps: number
   currentStepProgress: number
@@ -8355,47 +8616,66 @@ const phaseInfo: Record<string, { label: string; explanation: string }> = {
 }
 
 function formatDuration(ms: number): string {
-  const seconds = Math.floor(ms / 1000)
-  if (seconds < 60) return `${seconds}秒`
-  const minutes = Math.floor(seconds / 60)
-  const remainingSeconds = seconds % 60
-  return `${minutes}分${remainingSeconds}秒`
+  const totalSeconds = Math.floor(ms / 1000)
+  if (totalSeconds < 0) return '0秒'
+  if (totalSeconds < 60) return `${totalSeconds}秒`
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  if (minutes >= 60) {
+    // 超过1小时说明计算有误，显示上限
+    return '>60分钟'
+  }
+  return `${minutes}分${seconds}秒`
 }
 
 function formatETA(remainingMs: number): string {
-  if (remainingMs < 0) return '即将完成'
+  if (remainingMs <= 0) return '即将完成'
+  // ETA 上限 30 分钟，超过说明估算不可靠
+  if (remainingMs > 30 * 60 * 1000) return '预计较长'
   return formatDuration(remainingMs)
 }
 
 export default function ProgressBar({
   startedAt,
-  currentPhaseStartedAt,
   completedSteps,
   estimatedTotalSteps,
   currentStepProgress,
   currentPhase,
   status,
 }: ProgressProps) {
+  // 每秒刷新一次，确保 elapsed 实时更新
+  const [now, setNow] = useState(Date.now())
+  useEffect(() => {
+    if (status !== 'streaming' || !startedAt) return
+    const id = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(id)
+  }, [status, startedAt])
+
   const progress = useMemo(() => {
     if (!startedAt) return { percent: 0, elapsed: 0, eta: 0 }
 
-    const now = Date.now()
     const elapsed = now - startedAt
 
-    // Calculate overall progress
-    const overallProgress = (completedSteps + currentStepProgress) / estimatedTotalSteps
-    const percent = Math.min(100, Math.round(overallProgress * 100))
+    // 总进度 = 已完成步数 + 当前步进度（0~1）
+    const totalProgress = completedSteps + currentStepProgress
+    const overallRatio = estimatedTotalSteps > 0
+      ? totalProgress / estimatedTotalSteps
+      : 0
+    const percent = Math.min(99, Math.round(overallRatio * 100))
 
-    // Calculate ETA based on average time per step
+    // ETA 计算：只在至少完成 1 个完整步骤后才估算
+    // 避免早期分母过小导致 ETA 爆炸
     let eta = 0
-    if (completedSteps > 0 && overallProgress > 0) {
-      const avgTimePerStep = elapsed / (completedSteps + currentStepProgress)
-      const remainingSteps = estimatedTotalSteps - completedSteps - currentStepProgress
-      eta = Math.max(0, remainingSteps * avgTimePerStep)
+    if (completedSteps >= 1) {
+      const avgTimePerCompletedStep = elapsed / completedSteps
+      const remainingSteps = Math.max(0, estimatedTotalSteps - totalProgress)
+      eta = remainingSteps * avgTimePerCompletedStep
+      // 安全上限：不超过30分钟
+      eta = Math.min(eta, 30 * 60 * 1000)
     }
 
     return { percent, elapsed, eta }
-  }, [startedAt, completedSteps, estimatedTotalSteps, currentStepProgress])
+  }, [now, startedAt, completedSteps, estimatedTotalSteps, currentStepProgress])
 
   if (status === 'idle' || status === 'completed') return null
 
@@ -8418,16 +8698,16 @@ export default function ProgressBar({
         <span className="text-xs">{progress.percent}%</span>
         <span className="text-xs">{phaseData.label}</span>
         <span className="text-xs text-text-tertiary">
-          {formatDuration(progress.elapsed)}
+          已用 {formatDuration(progress.elapsed)}
         </span>
         {progress.eta > 0 && status === 'streaming' && (
           <span className="text-xs text-text-tertiary">
-            预计 {formatETA(progress.eta)}
+            预计还需 {formatETA(progress.eta)}
           </span>
         )}
       </div>
 
-      {/* Phase explanation - shown on a new line below the progress */}
+      {/* Phase explanation */}
       {phaseData.explanation && (
         <span className="text-xs text-text-tertiary hidden lg:inline">
           {phaseData.explanation}
@@ -8592,6 +8872,268 @@ export default function QuestionBox({
           </>
         )}
       </div>
+    </div>
+  )
+}
+```
+
+
+### frontend\src\components\QuickSetup.tsx
+
+```tsx
+'use client'
+
+import { useState, useEffect } from 'react'
+import { motion } from 'framer-motion'
+import { X, Zap, Check, Loader2, ExternalLink } from 'lucide-react'
+import { apiClient } from '@/lib/apiClient'
+
+interface ProviderPreset {
+  key: string
+  name: string
+  description: string
+  actor_count: number
+  actor_names: string[]
+  semantic_model: string
+}
+
+interface QuickSetupProps {
+  onClose: () => void
+  onComplete: () => void
+}
+
+export default function QuickSetup({ onClose, onComplete }: QuickSetupProps) {
+  const [presets, setPresets] = useState<ProviderPreset[]>([])
+  const [selectedPreset, setSelectedPreset] = useState<string>('')
+  const [apiKey, setApiKey] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [loadingPresets, setLoadingPresets] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+  const [success, setSuccess] = useState<string | null>(null)
+
+  useEffect(() => {
+    loadPresets()
+  }, [])
+
+  const loadPresets = async () => {
+    try {
+      const data = await apiClient.request<ProviderPreset[]>('/api/presets/providers')
+      setPresets(data)
+      if (data.length > 0) {
+        setSelectedPreset(data[0].key)
+      }
+    } catch (err) {
+      console.error('Failed to load presets:', err)
+    } finally {
+      setLoadingPresets(false)
+    }
+  }
+
+  const handleSetup = async () => {
+    if (!selectedPreset || !apiKey.trim()) return
+
+    setLoading(true)
+    setError(null)
+    setSuccess(null)
+
+    try {
+      const result = await apiClient.request<{
+        success: boolean
+        message: string
+        actors_created: Array<{ id: string; name: string; model: string; is_meta_judge: boolean }>
+        semantic_configured: boolean
+      }>('/api/presets/quick-setup', {
+        method: 'POST',
+        body: JSON.stringify({
+          provider_preset: selectedPreset,
+          api_key: apiKey.trim(),
+        }),
+      })
+
+      setSuccess(result.message)
+
+      // 1.5秒后关闭并刷新
+      setTimeout(() => {
+        onComplete()
+      }, 1500)
+    } catch (err) {
+      setError((err as Error).message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const currentPreset = presets.find((p) => p.key === selectedPreset)
+
+  // 服务商注册链接
+  const providerLinks: Record<string, string> = {
+    siliconflow: 'https://cloud.siliconflow.cn/',
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
+      <motion.div
+        initial={{ opacity: 0, scale: 0.95, y: 20 }}
+        animate={{ opacity: 1, scale: 1, y: 0 }}
+        className="bg-bg-secondary border border-border rounded-3xl w-full max-w-lg overflow-hidden"
+      >
+        {/* Header */}
+        <div className="px-6 py-5 border-b border-border bg-accent-orange/5">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 bg-accent-orange/20 rounded-xl flex items-center justify-center">
+                <Zap className="w-5 h-5 text-accent-orange" />
+              </div>
+              <div>
+                <h2 className="text-lg font-semibold">快速配置</h2>
+                <p className="text-text-tertiary text-sm">一键创建所有 Actor 和语义分析模型</p>
+              </div>
+            </div>
+            <button
+              onClick={onClose}
+              className="text-text-tertiary hover:text-text-primary transition-colors"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
+        </div>
+
+        {/* Content */}
+        <div className="px-6 py-5 space-y-5">
+          {loadingPresets ? (
+            <div className="text-center py-8 text-text-secondary">
+              <Loader2 className="w-6 h-6 animate-spin mx-auto mb-2" />
+              加载中...
+            </div>
+          ) : (
+            <>
+              {/* Provider selection */}
+              <div>
+                <label className="text-text-secondary text-sm block mb-2">选择 API 服务商</label>
+                <div className="space-y-2">
+                  {presets.map((preset) => (
+                    <button
+                      key={preset.key}
+                      onClick={() => setSelectedPreset(preset.key)}
+                      className={`w-full text-left px-4 py-3 rounded-xl border-2 transition-all ${
+                        selectedPreset === preset.key
+                          ? 'border-accent-blue bg-accent-blue/5'
+                          : 'border-border hover:border-text-tertiary'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <div className="font-medium">{preset.name}</div>
+                          <div className="text-text-tertiary text-sm mt-0.5">
+                            {preset.description}
+                          </div>
+                        </div>
+                        {selectedPreset === preset.key && (
+                          <Check className="w-5 h-5 text-accent-blue shrink-0" />
+                        )}
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Preset details */}
+              {currentPreset && (
+                <div className="bg-bg-tertiary rounded-xl p-4 space-y-2">
+                  <div className="text-text-secondary text-sm">将自动创建：</div>
+                  <div className="space-y-1">
+                    {currentPreset.actor_names.map((name, i) => (
+                      <div key={i} className="flex items-center gap-2 text-sm">
+                        <span className="text-accent-green">✓</span>
+                        <span className="text-text-primary">{name}</span>
+                      </div>
+                    ))}
+                    <div className="flex items-center gap-2 text-sm">
+                      <span className="text-accent-blue">✓</span>
+                      <span className="text-text-primary">
+                        语义分析: {currentPreset.semantic_model}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* API Key input */}
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <label className="text-text-secondary text-sm">API Key</label>
+                  {selectedPreset && providerLinks[selectedPreset] && (
+                    <a
+                      href={providerLinks[selectedPreset]}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-accent-blue text-xs flex items-center gap-1 hover:underline"
+                    >
+                      获取 API Key
+                      <ExternalLink className="w-3 h-3" />
+                    </a>
+                  )}
+                </div>
+                <input
+                  type="password"
+                  value={apiKey}
+                  onChange={(e) => setApiKey(e.target.value)}
+                  placeholder="sk-..."
+                  className="w-full px-4 py-3 bg-bg-tertiary border border-border rounded-xl focus:outline-none focus:border-accent-blue text-sm"
+                />
+                <p className="text-text-tertiary text-xs mt-1.5">
+                  所有 Actor 和语义分析模型将共用此 API Key
+                </p>
+              </div>
+
+              {/* Error/Success messages */}
+              {error && (
+                <div className="px-4 py-3 bg-accent-red/10 border border-accent-red/20 rounded-xl text-sm text-accent-red">
+                  {error}
+                </div>
+              )}
+              {success && (
+                <div className="px-4 py-3 bg-accent-green/10 border border-accent-green/20 rounded-xl text-sm text-accent-green flex items-center gap-2">
+                  <Check className="w-4 h-4" />
+                  {success}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="px-6 py-4 border-t border-border flex justify-end gap-3">
+          <button
+            onClick={onClose}
+            className="px-4 py-2 text-text-secondary hover:text-text-primary transition-colors"
+          >
+            取消
+          </button>
+          <button
+            onClick={handleSetup}
+            disabled={loading || !apiKey.trim() || !selectedPreset || !!success}
+            className="px-6 py-2 bg-accent-orange text-white font-medium rounded-xl hover:bg-orange-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
+          >
+            {loading ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin" />
+                配置中...
+              </>
+            ) : success ? (
+              <>
+                <Check className="w-4 h-4" />
+                已完成
+              </>
+            ) : (
+              <>
+                <Zap className="w-4 h-4" />
+                一键配置
+              </>
+            )}
+          </button>
+        </div>
+      </motion.div>
     </div>
   )
 }
@@ -9118,9 +9660,8 @@ export default function SemanticSidebar({
       if (semanticComparisons.has(record.id)) return true
       // Check if any key starts with the base phase id (handles cycle mismatch)
       const baseId = `${record.step}:${record.phase}`
-      for (const key of semanticComparisons.keys()) {
-        if (key === baseId || key.startsWith(baseId + ':')) return true
-      }
+      const keys = Array.from(semanticComparisons.keys())
+      if (keys.some(key => key === baseId || key.startsWith(baseId + ':'))) return true
       return false
     })
   }, [phaseHistory, semanticComparisons])
@@ -9145,12 +9686,9 @@ export default function SemanticSidebar({
       // Try prefix match for cycle variants
       // e.g., "4:revision" matches "4:revision:1"
       const baseId = phaseId.split(':').slice(0, 2).join(':')
-      for (const [key, value] of semanticComparisons.entries()) {
-        if (key === baseId || key.startsWith(baseId + ':')) {
-          return value
-        }
-      }
-      return []
+      const entries = Array.from(semanticComparisons.entries())
+      const match = entries.find(([key]) => key === baseId || key.startsWith(baseId + ':'))
+      return match ? match[1] : []
     }
 
     if (!selectedDiffPhaseId) {
@@ -11649,31 +12187,9 @@ export const useDebateStore = create<DebateState>((set, get) => ({
               eventSource = null
             }
 
-            // Re-create EventSource - the existing event listeners from
-            // the outer streamDebate call are lost, so we need a fresh call.
-            // But we must preserve accumulated state.
-            // Strategy: save state, call streamDebate, restore state
-            const preserved = {
-              phaseHistory: get().phaseHistory,
-              currentPhaseRecord: get().currentPhaseRecord,
-              currentPhase: get().currentPhase,
-              currentRound: get().currentRound,
-              currentCycle: get().currentCycle,
-              convergenceResult: get().convergenceResult,
-              semanticComparisons: get().semanticComparisons,
-              questionIntent: get().questionIntent,
-              progress: get().progress,
-              currentSession: get().currentSession,
-            }
-
-            // streamDebate will reset and recreate EventSource + listeners
-            get().streamDebate(sid)
-
-            // Immediately restore accumulated state
-            // Use queueMicrotask to ensure this runs after streamDebate's synchronous set()
-            queueMicrotask(() => {
-              set(preserved)
-            })
+            // Re-create EventSource with preserveState flag
+            // This avoids resetting accumulated state
+            get().streamDebate(sid, { preserveState: true })
           }
         }, delay)
       } else {
@@ -13165,22 +13681,157 @@ if __name__ == '__main__':
 ```
 
 
+### setup.bat
+
+```batch
+@echo off
+chcp 65001 >nul
+echo ========================================
+echo   MAGI 安装向导
+echo ========================================
+echo.
+
+:: 检查 Python
+python --version >nul 2>&1
+if errorlevel 1 (
+    echo [错误] 未找到 Python，请先安装 Python 3.9+
+    echo 下载地址: https://www.python.org/downloads/
+    echo 安装时请勾选 "Add Python to PATH"
+    pause
+    exit /b 1
+)
+echo [OK] Python 已安装
+
+:: 检查 Node.js
+node --version >nul 2>&1
+if errorlevel 1 (
+    echo [错误] 未找到 Node.js，请先安装 Node.js 18+
+    echo 下载地址: https://nodejs.org/
+    pause
+    exit /b 1
+)
+echo [OK] Node.js 已安装
+
+:: 安装后端依赖
+echo.
+echo [1/3] 安装后端依赖...
+cd /d "%~dp0backend"
+pip install -e . >nul 2>&1
+if errorlevel 1 (
+    echo [警告] pip install -e . 失败，尝试直接安装依赖...
+    pip install fastapi uvicorn[standard] pydantic pydantic-settings python-multipart aiosqlite "sqlalchemy[asyncio]" httpx openai anthropic
+)
+echo [OK] 后端依赖已安装
+
+:: 安装前端依赖
+echo.
+echo [2/3] 安装前端依赖...
+cd /d "%~dp0frontend"
+call npm install
+echo [OK] 前端依赖已安装
+
+:: 完成
+echo.
+echo ========================================
+echo   安装完成！
+echo ========================================
+echo.
+echo 运行方法：双击 start.bat
+echo 首次使用：打开浏览器访问 http://localhost:3000
+echo           点击页面上的"快速配置"按钮
+echo.
+pause
+```
+
+
+### setup.sh
+
+```bash
+#!/bin/bash
+echo "========================================"
+echo "  MAGI 安装向导"
+echo "========================================"
+echo ""
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# 检查 Python
+if ! command -v python3 &> /dev/null; then
+    echo "[错误] 未找到 Python3，请先安装"
+    echo "  Mac: brew install python3"
+    echo "  Ubuntu: sudo apt install python3 python3-pip"
+    exit 1
+fi
+echo "[OK] Python3 已安装"
+
+# 检查 Node.js
+if ! command -v node &> /dev/null; then
+    echo "[错误] 未找到 Node.js，请先安装"
+    echo "  下载地址: https://nodejs.org/"
+    exit 1
+fi
+echo "[OK] Node.js 已安装"
+
+# 安装后端
+echo ""
+echo "[1/3] 安装后端依赖..."
+cd "$SCRIPT_DIR/backend"
+pip3 install -e . 2>/dev/null || pip3 install fastapi "uvicorn[standard]" pydantic pydantic-settings python-multipart aiosqlite "sqlalchemy[asyncio]" httpx openai anthropic
+echo "[OK] 后端依赖已安装"
+
+# 安装前端
+echo ""
+echo "[2/3] 安装前端依赖..."
+cd "$SCRIPT_DIR/frontend"
+npm install
+echo "[OK] 前端依赖已安装"
+
+echo ""
+echo "========================================"
+echo "  安装完成！"
+echo "========================================"
+echo ""
+echo "  运行: ./start.sh"
+echo "  首次使用: 打开 http://localhost:3000 点击'快速配置'"
+echo ""
+```
+
+
 ### start.bat
 
 ```batch
 @echo off
-echo Starting MAGI Backend...
-cd /d d:\Projects\MAGI\backend
-start cmd /k "D:\anaconda\python.exe -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000"
-echo Backend starting on http://localhost:8000
+chcp 65001 >nul
+echo ========================================
+echo   启动 MAGI
+echo ========================================
+
+:: 启动后端
+echo [1/2] 启动后端 (http://localhost:8000)...
+cd /d "%~dp0backend"
+start "MAGI-Backend" cmd /k "python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000"
+
+:: 等待后端就绪
+timeout /t 3 /nobreak >nul
+
+:: 启动前端
+echo [2/2] 启动前端 (http://localhost:3000)...
+cd /d "%~dp0frontend"
+start "MAGI-Frontend" cmd /k "npm run dev"
+
 echo.
-echo Starting MAGI Frontend...
-cd /d d:\Projects\MAGI\frontend
-start cmd /k "npm run dev"
-echo Frontend starting on http://localhost:3000
+echo ========================================
+echo   MAGI 已启动
+echo   前端: http://localhost:3000
+echo   后端: http://localhost:8000
+echo ========================================
 echo.
-echo Done! Check the new windows for server logs.
-pause
+echo 关闭方法: 双击 stop.bat 或关闭弹出的窗口
+echo.
+
+:: 等3秒后自动打开浏览器
+timeout /t 5 /nobreak >nul
+start http://localhost:3000
 ```
 
 
@@ -13395,6 +14046,40 @@ pause
 </script>
 </body>
 </html>
+```
+
+
+### start.sh
+
+```bash
+#!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+echo "启动 MAGI..."
+
+# 启动后端
+cd "$SCRIPT_DIR/backend"
+python3 -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000 &
+BACKEND_PID=$!
+
+# 等后端就绪
+sleep 3
+
+# 启动前端
+cd "$SCRIPT_DIR/frontend"
+npm run dev &
+FRONTEND_PID=$!
+
+echo ""
+echo "MAGI 已启动"
+echo "  前端: http://localhost:3000"
+echo "  后端: http://localhost:8000"
+echo ""
+echo "按 Ctrl+C 停止所有服务"
+
+# 捕获退出信号
+trap "kill $BACKEND_PID $FRONTEND_PID 2>/dev/null; exit" SIGINT SIGTERM
+wait
 ```
 
 

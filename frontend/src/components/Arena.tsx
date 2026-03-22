@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useRef, useMemo } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Send, Settings, Users, History, Loader2, AlertCircle } from 'lucide-react'
+import { Send, Settings, Users, History, Loader2, AlertCircle, Zap } from 'lucide-react'
 import { useActorStore, useDebateStore } from '@/stores'
 import { Actor, SessionListItem } from '@/types'
 import ActorCard from './ActorCard'
@@ -14,6 +14,7 @@ import SessionDetailView from './SessionDetailView'
 import ProgressBar from './ProgressBar'
 import QuestionBox from './QuestionBox'
 import { apiClient } from '@/lib/apiClient'
+import QuickSetup from './QuickSetup'
 
 type View = 'arena' | 'debate' | 'actors' | 'history' | 'settings' | 'sessionDetail'
 
@@ -23,6 +24,7 @@ export default function Arena() {
   const [maxRounds, setMaxRounds] = useState(3)
   const [recentSessions, setRecentSessions] = useState<SessionListItem[]>([])
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null)
+  const [showQuickSetup, setShowQuickSetup] = useState(false)
 
   // Actor store - separate selectors for different data
   const actors = useActorStore((state) => state.actors)
@@ -290,6 +292,13 @@ export default function Arena() {
                 <History className="w-4 h-4" />
                 History
               </button>
+              <button
+                onClick={() => setShowQuickSetup(true)}
+                className="text-text-secondary hover:text-text-primary transition-colors flex items-center gap-1"
+              >
+                <Zap className="w-4 h-4" />
+                快速配置
+              </button>
             </nav>
           </div>
           <button
@@ -315,7 +324,30 @@ export default function Arena() {
             <p className="text-xl text-text-secondary tracking-wide">
               Multi-Agent Guided Intelligence
             </p>
+            {/* 快速配置入口 - 当没有 actor 或没有 judge 时显示 */}
+            {(actors.length === 0 || nonJudgeActors.length < 2 || judgeActors.length === 0) && (
+              <motion.button
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                transition={{ delay: 0.3 }}
+                onClick={() => setShowQuickSetup(true)}
+                className="mt-6 px-6 py-3 bg-accent-orange text-white font-medium rounded-xl hover:bg-orange-600 transition-colors inline-flex items-center gap-2"
+              >
+                ⚡ 快速配置（首次使用）
+              </motion.button>
+            )}
           </motion.div>
+
+          {/* QuickSetup Modal */}
+          {showQuickSetup && (
+            <QuickSetup
+              onClose={() => setShowQuickSetup(false)}
+              onComplete={() => {
+                setShowQuickSetup(false)
+                fetchActors()
+              }}
+            />
+          )}
 
           {/* Question input */}
           <motion.div
