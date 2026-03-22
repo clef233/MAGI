@@ -72,7 +72,7 @@ const BASE_RECONNECT_DELAY = 1000 // 1 second
 // Instead of updating Zustand state on every token, we buffer tokens and flush periodically
 const tokenBuffer = new Map<string, string>()  // actorId -> accumulated tokens
 let flushTimeoutId: ReturnType<typeof setTimeout> | null = null
-const FLUSH_INTERVAL = 50  // ms - flush every 50ms
+const FLUSH_INTERVAL = 100  // ms - flush every 100ms (reduced from 50ms for performance)
 
 // Helper to clear token buffer and flush timeout
 function clearTokenBufferState() {
@@ -246,19 +246,40 @@ export const useDebateStore = create<DebateState>((set, get) => ({
           const sid = get().currentSessionId
           if (sid && get().status !== 'completed' && get().status !== 'idle') {
             console.log(`[SSE] Reconnecting to session ${sid}...`)
-            // Re-create EventSource without resetting state
-            // We call streamDebate but need to preserve existing phaseHistory
-            // So we just re-create the EventSource manually
-            const preservedState = {
+            // Directly create a new EventSource without calling streamDebate
+            // (streamDebate resets all state which loses progress)
+            set({ status: 'connecting', error: null })
+
+            if (eventSource) {
+              eventSource.close()
+              eventSource = null
+            }
+
+            // Re-create EventSource - the existing event listeners from
+            // the outer streamDebate call are lost, so we need a fresh call.
+            // But we must preserve accumulated state.
+            // Strategy: save state, call streamDebate, restore state
+            const preserved = {
               phaseHistory: get().phaseHistory,
               currentPhaseRecord: get().currentPhaseRecord,
+              currentPhase: get().currentPhase,
+              currentRound: get().currentRound,
+              currentCycle: get().currentCycle,
+              convergenceResult: get().convergenceResult,
               semanticComparisons: get().semanticComparisons,
               questionIntent: get().questionIntent,
               progress: get().progress,
+              currentSession: get().currentSession,
             }
+
+            // streamDebate will reset and recreate EventSource + listeners
             get().streamDebate(sid)
-            // Restore preserved state after streamDebate resets it
-            set(preservedState)
+
+            // Immediately restore accumulated state
+            // Use queueMicrotask to ensure this runs after streamDebate's synchronous set()
+            queueMicrotask(() => {
+              set(preserved)
+            })
           }
         }, delay)
       } else {
@@ -399,21 +420,21 @@ export const useDebateStore = create<DebateState>((set, get) => ({
       if (!flushTimeoutId) {
         flushTimeoutId = setTimeout(() => {
           flushTimeoutId = null
-          // Flush all buffered tokens to state
           const bufferedTokens = new Map(tokenBuffer)
           tokenBuffer.clear()
 
           if (bufferedTokens.size === 0) return
 
           set((state) => {
-            // Update legacy state
             const newMap = new Map(state.streamingContent)
             bufferedTokens.forEach((tokens, actorId) => {
               const existing = newMap.get(actorId) || ''
               newMap.set(actorId, existing + tokens)
             })
 
-            // Update phase history
+            // Only update currentPhaseRecord, NOT phaseHistory
+            // phaseHistory is synced in phase_end and actor_end events
+            // This avoids creating new phaseHistory array refs every 100ms
             const phaseRecord = state.currentPhaseRecord
             if (phaseRecord) {
               const updatedMessages = { ...phaseRecord.messages }
@@ -434,15 +455,9 @@ export const useDebateStore = create<DebateState>((set, get) => ({
                   ...phaseRecord,
                   messages: updatedMessages,
                 }
-
-                const updatedHistory = state.phaseHistory.map((r) =>
-                  r.id === updatedRecord.id ? updatedRecord : r
-                )
-
                 return {
                   streamingContent: newMap,
                   currentPhaseRecord: updatedRecord,
-                  phaseHistory: updatedHistory,
                 }
               }
             }
@@ -522,17 +537,26 @@ export const useDebateStore = create<DebateState>((set, get) => ({
 
     eventSource.addEventListener('phase_end', (e: MessageEvent) => {
       console.log('[SSE] phase_end:', e.data)
-      // Phase ended, update progress
-      set((state) => ({
-        progress: {
-          ...state.progress,
-          completedSteps: state.progress.completedSteps + 1,
-          currentStepProgress: 1,
-          // Reset actor counts for next phase
-          totalActorsInPhase: 0,
-          completedActorsInPhase: 0,
+      set((state) => {
+        // Sync currentPhaseRecord to phaseHistory as final snapshot
+        let updatedHistory = state.phaseHistory
+        if (state.currentPhaseRecord) {
+          updatedHistory = state.phaseHistory.map((r) =>
+            r.id === state.currentPhaseRecord!.id ? state.currentPhaseRecord! : r
+          )
         }
-      }))
+
+        return {
+          phaseHistory: updatedHistory,
+          progress: {
+            ...state.progress,
+            completedSteps: state.progress.completedSteps + 1,
+            currentStepProgress: 1,
+            totalActorsInPhase: 0,
+            completedActorsInPhase: 0,
+          },
+        }
+      })
     })
 
     // Convergence result - attach to latest revision phase
@@ -725,12 +749,11 @@ export const useDebateStore = create<DebateState>((set, get) => ({
 
     eventSource.addEventListener('complete', async (e: MessageEvent) => {
       console.log('[SSE] complete:', e.data)
-      expectedClose = true  // Mark as expected close
-      clearTokenBufferState()  // Clear token buffer
+      expectedClose = true
+      clearTokenBufferState()
 
       try {
         const session = await apiClient.getDebate(sessionId)
-        // Keep phaseHistory intact, just update the session
         set({ currentSession: session, status: 'completed' })
       } catch {
         set({ status: 'completed' })
@@ -738,6 +761,39 @@ export const useDebateStore = create<DebateState>((set, get) => ({
 
       eventSource?.close()
       eventSource = null
+
+      // Fetch semantic data after a delay to allow background task to finish
+      // Semantic analysis runs as a background task and may complete after the
+      // main debate flow emits "complete"
+      setTimeout(async () => {
+        try {
+          const semantic = await apiClient.getSemanticAnalysis(sessionId)
+          if (semantic && semantic.comparisons && semantic.comparisons.length > 0) {
+            const newComparisons = new Map(get().semanticComparisons)
+            // Group by phase_id
+            for (const comp of semantic.comparisons) {
+              if (comp.round_number && comp.phase) {
+                const phaseId = `${comp.round_number}:${comp.phase}`
+                if (!newComparisons.has(phaseId)) {
+                  newComparisons.set(phaseId, [])
+                }
+                const existing = newComparisons.get(phaseId)!
+                const existingIds = new Set(existing.map((c: TopicComparison) => c.topic_id))
+                if (!existingIds.has(comp.topic_id)) {
+                  existing.push(comp)
+                }
+              }
+            }
+            set({
+              semanticComparisons: newComparisons,
+              questionIntent: semantic.question_intent || get().questionIntent,
+            })
+            console.log('[SSE] Fetched semantic data after completion:', newComparisons.size, 'phases')
+          }
+        } catch (err) {
+          console.log('[SSE] No semantic data available after completion (normal if analysis was skipped)')
+        }
+      }, 4000)  // Wait 4 seconds for background semantic task to finish
     })
 
     eventSource.addEventListener('debate_error', (e: MessageEvent) => {

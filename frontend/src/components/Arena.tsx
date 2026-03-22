@@ -407,10 +407,14 @@ export default function Arena() {
                     className="w-full bg-bg-secondary border border-border rounded-xl px-4 py-3 flex items-center justify-between hover:border-accent-blue transition-colors text-left"
                   >
                     <span className="text-text-primary truncate">{session.question}</span>
-                    {session.consensus_confidence && (
-                      <span className="text-accent-green text-sm ml-2">
-                        {Math.round(session.consensus_confidence * 100)}% 共识
-                      </span>
+                    {session.status === 'completed' && (
+                      session.consensus_confidence != null ? (
+                        <span className="text-accent-green text-sm ml-2">
+                          {Math.round(session.consensus_confidence * 100)}% 共识
+                        </span>
+                      ) : (
+                        <span className="text-text-tertiary text-sm ml-2">已完成</span>
+                      )
                     )}
                   </button>
                 ))

@@ -274,115 +274,87 @@ export default function MiniMagiMonitor({
           </g>
 
           {/* Connection lines between MAGI center and bottom nodes (thick, like START.HTML) */}
-          <g stroke="#f26600" strokeWidth="15">
-            {/* Center to bottom-left */}
-            <line x1="388" y1="258" x2="363" y2="338" />
-            {/* Center to bottom-right */}
-            <line x1="573" y1="258" x2="598" y2="338" />
-            {/* Bottom horizontal */}
-            <line x1="425" y1="430" x2="535" y2="430" />
-          </g>
+          {/* === Layout depends on number of debate actors === */}
+          {!actorC ? (
+            /* ===== 2-ACTOR MODE: Judge top, A bottom-left, B bottom-right ===== */
+            <>
+              <g stroke="#f26600" strokeWidth="15">
+                <line x1="388" y1="258" x2="363" y2="338" />
+                <line x1="573" y1="258" x2="598" y2="338" />
+                <line x1="425" y1="430" x2="535" y2="430" />
+              </g>
 
-          {/* MAGI text (center) */}
-          <text x="480" y="350" textAnchor="middle" className="magi-text" fontSize="24">MAGI</text>
+              <text x="480" y="350" textAnchor="middle" className="magi-text" fontSize="24">MAGI</text>
 
-          {/* ===== JUDGE NODE (top center) ===== */}
-          {/* Hexagonal shape from START.HTML, scaled down */}
-          <g className={`state-${judgeState}`}>
-            <polygon
-              className="node-fill node-fill-base"
-              points="355,70 605,70 605,225 540,290 420,290 355,225"
-            />
-            <polygon
-              fill="url(#mini-scanline)"
-              points="355,70 605,70 605,225 540,290 420,290 355,225"
-            />
-            <polygon
-              className="node-stroke"
-              points="355,70 605,70 605,225 540,290 420,290 355,225"
-            />
-            <text
-              x="480"
-              y="195"
-              textAnchor="middle"
-              className="node-text node-text-base"
-              fontSize="28"
-            >
-              {judgeLabel}
-            </text>
-          </g>
+              {/* JUDGE NODE (top center hex) */}
+              <g className={`state-${judgeState}`}>
+                <polygon className="node-fill node-fill-base" points="355,70 605,70 605,225 540,290 420,290 355,225" />
+                <polygon fill="url(#mini-scanline)" points="355,70 605,70 605,225 540,290 420,290 355,225" />
+                <polygon className="node-stroke" points="355,70 605,70 605,225 540,290 420,290 355,225" />
+                <text x="480" y="195" textAnchor="middle" className="node-text node-text-base" fontSize="28">{judgeLabel}</text>
+              </g>
 
-          {/* ===== ACTOR A NODE (bottom left) ===== */}
-          <g className={`state-${actorAState}`}>
-            <polygon
-              className="node-fill node-fill-base"
-              points="125,275 300,275 425,400 425,470 125,470"
-            />
-            <polygon
-              fill="url(#mini-scanline)"
-              points="125,275 300,275 425,400 425,470 125,470"
-            />
-            <polygon
-              className="node-stroke"
-              points="125,275 300,275 425,400 425,470 125,470"
-            />
-            <text
-              x="250"
-              y="395"
-              textAnchor="middle"
-              className="node-text node-text-base"
-              fontSize="24"
-            >
-              {actorALabel}
-            </text>
-          </g>
+              {/* ACTOR A (bottom left trapezoid) */}
+              <g className={`state-${actorAState}`}>
+                <polygon className="node-fill node-fill-base" points="125,275 300,275 425,400 425,470 125,470" />
+                <polygon fill="url(#mini-scanline)" points="125,275 300,275 425,400 425,470 125,470" />
+                <polygon className="node-stroke" points="125,275 300,275 425,400 425,470 125,470" />
+                <text x="250" y="395" textAnchor="middle" className="node-text node-text-base" fontSize="24">{actorALabel}</text>
+              </g>
 
-          {/* ===== ACTOR B NODE (bottom right) ===== */}
-          <g className={`state-${actorBState}`}>
-            <polygon
-              className="node-fill node-fill-base"
-              points="835,275 660,275 535,400 535,470 835,470"
-            />
-            <polygon
-              fill="url(#mini-scanline)"
-              points="835,275 660,275 535,400 535,470 835,470"
-            />
-            <polygon
-              className="node-stroke"
-              points="835,275 660,275 535,400 535,470 835,470"
-            />
-            <text
-              x="685"
-              y="395"
-              textAnchor="middle"
-              className="node-text node-text-base"
-              fontSize="24"
-            >
-              {actorBLabel}
-            </text>
-          </g>
+              {/* ACTOR B (bottom right trapezoid) */}
+              <g className={`state-${actorBState}`}>
+                <polygon className="node-fill node-fill-base" points="835,275 660,275 535,400 535,470 835,470" />
+                <polygon fill="url(#mini-scanline)" points="835,275 660,275 535,400 535,470 835,470" />
+                <polygon className="node-stroke" points="835,275 660,275 535,400 535,470 835,470" />
+                <text x="685" y="395" textAnchor="middle" className="node-text node-text-base" fontSize="24">{actorBLabel}</text>
+              </g>
+            </>
+          ) : (
+            /* ===== 3-ACTOR MODE: Classic EVA triangle - A top, B bottom-left, C bottom-right, Judge label ===== */
+            <>
+              <g stroke="#f26600" strokeWidth="15">
+                {/* A(top) to B(bottom-left) */}
+                <line x1="388" y1="258" x2="363" y2="338" />
+                {/* A(top) to C(bottom-right) */}
+                <line x1="573" y1="258" x2="598" y2="338" />
+                {/* B(bottom-left) to C(bottom-right) */}
+                <line x1="425" y1="430" x2="535" y2="430" />
+              </g>
 
-          {/* ===== ACTOR C NODE (optional, bottom center) ===== */}
-          {actorC && (
-            <g className={`state-${actorCState}`}>
-              <polygon
-                className="node-fill node-fill-base"
-                points="380,455 580,455 580,510 380,510"
-              />
-              <polygon
-                className="node-stroke"
-                points="380,455 580,455 580,510 380,510"
-              />
-              <text
-                x="480"
-                y="492"
-                textAnchor="middle"
-                className="node-text node-text-base"
-                fontSize="18"
-              >
-                {actorCLabel}
-              </text>
-            </g>
+              <text x="480" y="350" textAnchor="middle" className="magi-text" fontSize="24">MAGI</text>
+
+              {/* ACTOR A (top center hex - BALTHASAR position) */}
+              <g className={`state-${actorAState}`}>
+                <polygon className="node-fill node-fill-base" points="355,70 605,70 605,225 540,290 420,290 355,225" />
+                <polygon fill="url(#mini-scanline)" points="355,70 605,70 605,225 540,290 420,290 355,225" />
+                <polygon className="node-stroke" points="355,70 605,70 605,225 540,290 420,290 355,225" />
+                <text x="480" y="195" textAnchor="middle" className="node-text node-text-base" fontSize="28">{actorALabel}</text>
+              </g>
+
+              {/* ACTOR B (bottom left - CASPER position) */}
+              <g className={`state-${actorBState}`}>
+                <polygon className="node-fill node-fill-base" points="125,275 300,275 425,400 425,470 125,470" />
+                <polygon fill="url(#mini-scanline)" points="125,275 300,275 425,400 425,470 125,470" />
+                <polygon className="node-stroke" points="125,275 300,275 425,400 425,470 125,470" />
+                <text x="250" y="395" textAnchor="middle" className="node-text node-text-base" fontSize="24">{actorBLabel}</text>
+              </g>
+
+              {/* ACTOR C (bottom right - MELCHIOR position) */}
+              <g className={`state-${actorCState}`}>
+                <polygon className="node-fill node-fill-base" points="835,275 660,275 535,400 535,470 835,470" />
+                <polygon fill="url(#mini-scanline)" points="835,275 660,275 535,400 535,470 835,470" />
+                <polygon className="node-stroke" points="835,275 660,275 535,400 535,470 835,470" />
+                <text x="685" y="395" textAnchor="middle" className="node-text node-text-base" fontSize="24">{actorCLabel}</text>
+              </g>
+
+              {/* JUDGE label next to 審議中 box */}
+              <g className={`state-${judgeState}`}>
+                <rect x="710" y="255" width="120" height="30" rx="4" className="node-fill node-fill-base" />
+                <rect x="710" y="255" width="120" height="30" rx="4" fill="none" stroke="#f26600" strokeWidth="2" />
+                <text x="770" y="275" textAnchor="middle" className="node-text node-text-base" fontSize="14">{judgeLabel}</text>
+              </g>
+            </>
           )}
         </svg>
       </div>

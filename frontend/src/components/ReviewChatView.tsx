@@ -2,6 +2,7 @@
 
 import { memo, useMemo, useRef, useEffect, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
+import { ChevronDown, ChevronRight } from 'lucide-react'
 import { Actor, LivePhaseRecord, LiveMessage, ConvergenceData, Consensus } from '@/types'
 import ConsensusView from './ConsensusView'
 import MarkdownBlock from './MarkdownBlock'
@@ -10,6 +11,7 @@ interface ReviewChatViewProps {
   question: string
   actors: Actor[]
   phaseHistory: LivePhaseRecord[]
+  currentPhaseRecord?: LivePhaseRecord | null
   status: string
   onMessageClick?: (actorId: string, phase: string) => void
   consensus?: Consensus | null  // Add consensus prop
@@ -161,6 +163,7 @@ export default function ReviewChatView({
   question,
   actors,
   phaseHistory,
+  currentPhaseRecord = null,
   status,
   onMessageClick,
   consensus,
@@ -168,6 +171,41 @@ export default function ReviewChatView({
   const scrollRef = useRef<HTMLDivElement>(null)
   const [userHasScrolledUp, setUserHasScrolledUp] = useState(false)
   const lastScrollTop = useRef(0)
+
+  // Track which phases are expanded (for collapse/expand after completion)
+  const [expandedPhases, setExpandedPhases] = useState<Set<string>>(new Set())
+
+  // Extract the final answer message for pinning at top
+  const finalAnswerPhase = useMemo(() => {
+    if (status !== 'completed') return null
+    for (let i = phaseHistory.length - 1; i >= 0; i--) {
+      const record = phaseHistory[i]
+      if (record.phase === 'final_answer') {
+        const messages = Object.values(record.messages) as LiveMessage[]
+        if (messages.length > 0) {
+          return messages[0]  // Judge's final answer
+        }
+      }
+    }
+    return null
+  }, [phaseHistory, status])
+
+  const togglePhaseExpand = (phaseId: string) => {
+    setExpandedPhases(prev => {
+      const next = new Set(prev)
+      if (next.has(phaseId)) {
+        next.delete(phaseId)
+      } else {
+        next.add(phaseId)
+      }
+      return next
+    })
+  }
+
+  // Intermediate phases (initial, review, revision) - collapsed by default when completed
+  const isIntermediatePhase = (phase: string) => {
+    return ['initial', 'review', 'revision'].includes(phase)
+  }
 
   // Track user scroll intent
   useEffect(() => {
@@ -177,12 +215,9 @@ export default function ReviewChatView({
     const handleScroll = () => {
       const { scrollTop, scrollHeight, clientHeight } = el
       const distanceFromBottom = scrollHeight - scrollTop - clientHeight
-      // If user scrolled up more than 80px from bottom, respect their intent
-      if (distanceFromBottom > 80) {
-        setUserHasScrolledUp(true)
-      } else {
-        setUserHasScrolledUp(false)
-      }
+      const shouldBeScrolledUp = distanceFromBottom > 80
+      // Only update state when value actually changes to avoid unnecessary re-renders
+      setUserHasScrolledUp(prev => prev === shouldBeScrolledUp ? prev : shouldBeScrolledUp)
       lastScrollTop.current = scrollTop
     }
 
@@ -205,13 +240,24 @@ export default function ReviewChatView({
   }, [status])
 
   // Build ordered messages from phase history
+  // Merge phaseHistory (stable, updated on phase_end/actor_end) with
+  // currentPhaseRecord (live, updated every 100ms during streaming)
+  // This avoids re-computing the full list every token flush
   // Filter out summary phase - it should only show via ConsensusView, not in chat stream
   const phases = useMemo(() => {
-    return phaseHistory
-      .filter((record) => record.phase !== 'summary') // Don't show summary in chat
+    // Build list: use phaseHistory for completed phases, overlay currentPhaseRecord for active phase
+    let allRecords: LivePhaseRecord[]
+    if (currentPhaseRecord) {
+      const historicalRecords = phaseHistory.filter(r => r.id !== currentPhaseRecord.id)
+      allRecords = [...historicalRecords, currentPhaseRecord]
+    } else {
+      allRecords = phaseHistory
+    }
+
+    return allRecords
+      .filter((record) => record.phase !== 'summary')
       .map((record) => {
         const messages = Object.values(record.messages) as LiveMessage[]
-        // Sort messages by actor order
         const sortedMessages = messages.sort((a, b) => {
           const aIndex = actors.findIndex((act) => act.id === a.actorId)
           const bIndex = actors.findIndex((act) => act.id === b.actorId)
@@ -223,7 +269,7 @@ export default function ReviewChatView({
           messages: sortedMessages,
         }
       })
-  }, [phaseHistory, actors])
+  }, [phaseHistory, currentPhaseRecord, actors])
 
   return (
     <div ref={scrollRef} className="space-y-6 overflow-y-auto h-full pb-8 pr-2">
@@ -233,39 +279,77 @@ export default function ReviewChatView({
         <div className="text-text-primary font-medium">{question}</div>
       </div>
 
+      {/* Final Answer - pinned at top when completed */}
+      {status === 'completed' && finalAnswerPhase && (
+        <motion.div
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="bg-accent-blue/5 border-2 border-accent-blue/30 rounded-2xl overflow-hidden"
+        >
+          <div className="px-5 py-3 flex items-center gap-3 border-b border-accent-blue/20 bg-accent-blue/10">
+            <span className="text-lg">📋</span>
+            <span className="font-semibold text-accent-blue">最终回答</span>
+            <span className="text-xs text-text-tertiary ml-auto">
+              by {finalAnswerPhase.actorName}
+            </span>
+          </div>
+          <div className="px-5 py-4">
+            <MarkdownBlock content={finalAnswerPhase.content} />
+          </div>
+        </motion.div>
+      )}
+
       {/* All phases (summary is filtered out - shows via ConsensusView instead) */}
       <AnimatePresence mode="popLayout">
-        {phases.map(({ record, messages }) => (
-          <motion.div
-            key={record.id}
-            layout
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            className="space-y-3"
-          >
-            {/* Phase separator */}
-            <div className="flex items-center gap-4 py-2 sticky top-0 bg-bg-primary z-10">
-              <div className="text-text-secondary text-sm font-medium">
-                {getPhaseTitle(record)}
+        {phases.map(({ record, messages }) => {
+          // When completed, intermediate phases are collapsed by default
+          const isCollapsible = status === 'completed' && isIntermediatePhase(record.phase)
+          const isExpanded = !isCollapsible || expandedPhases.has(record.id)
+
+          return (
+            <motion.div
+              key={record.id}
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              className="space-y-3"
+            >
+              {/* Phase separator - clickable when collapsible */}
+              <div
+                className={`flex items-center gap-4 py-2 sticky top-0 bg-bg-primary z-10 ${isCollapsible ? 'cursor-pointer hover:bg-bg-secondary/50 rounded-lg px-2 -mx-2 transition-colors' : ''}`}
+                onClick={isCollapsible ? () => togglePhaseExpand(record.id) : undefined}
+              >
+                {isCollapsible && (
+                  isExpanded
+                    ? <ChevronDown className="w-4 h-4 text-text-tertiary shrink-0" />
+                    : <ChevronRight className="w-4 h-4 text-text-tertiary shrink-0" />
+                )}
+                <div className="text-text-secondary text-sm font-medium">
+                  {getPhaseTitle(record)}
+                </div>
+                {isCollapsible && !isExpanded && (
+                  <span className="text-text-tertiary text-xs">
+                    {messages.length} 条消息
+                  </span>
+                )}
+                <div className="flex-1 h-px bg-border" />
               </div>
-              <div className="flex-1 h-px bg-border" />
-            </div>
 
-            {/* Messages */}
-            {messages.map((msg) => (
-              <MessageCard
-                key={msg.actorId}
-                message={msg}
-                onMessageClick={onMessageClick}
-              />
-            ))}
+              {/* Messages - hidden when collapsed */}
+              {isExpanded && messages.map((msg) => (
+                <MessageCard
+                  key={msg.actorId}
+                  message={msg}
+                  onMessageClick={onMessageClick}
+                />
+              ))}
 
-            {/* Convergence result for revision phases */}
-            {record.phase === 'revision' && record.convergence && (
-              <ConvergenceCard convergence={record.convergence} />
-            )}
-          </motion.div>
-        ))}
+              {/* Convergence result for revision phases */}
+              {isExpanded && record.phase === 'revision' && record.convergence && (
+                <ConvergenceCard convergence={record.convergence} />
+              )}
+            </motion.div>
+          )
+        })}
       </AnimatePresence>
 
       {/* Waiting state */}

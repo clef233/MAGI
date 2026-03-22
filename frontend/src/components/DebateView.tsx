@@ -72,6 +72,13 @@ export default function DebateView({
     return semanticComparisons.size > 0
   }, [semanticComparisons])
 
+  // Auto-switch to semantic tab when debate completes and semantic data is available
+  useEffect(() => {
+    if (status === 'completed' && hasSemanticData && sidebarTab === 'monitor') {
+      setSidebarTab('semantic')
+    }
+  }, [status, hasSemanticData, sidebarTab])
+
   return (
     <div className="flex h-full min-h-0">
       {/* Main chat area (left ~2/3) - scrolls independently */}
@@ -80,6 +87,7 @@ export default function DebateView({
           question={question}
           actors={debateActors}
           phaseHistory={phaseHistory}
+          currentPhaseRecord={currentPhaseRecord}
           status={status}
           onMessageClick={(actorId) => {
             // On click, set this actor as base for diff

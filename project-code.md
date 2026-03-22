@@ -1,6 +1,6 @@
 # Project: MAGI
 
-Generated: 2026-03-22 13:24:04
+Generated: 2026-03-22 14:16:13
 Root: D:\Projects\MAGI
 Files: 63
 
@@ -3409,9 +3409,10 @@ class DebateEngine:
                         })()
 
                 # Step 2: Extract semantic topics from each actor's latest response (parallel)
+                # Make a shallow copy to avoid concurrent modification from main flow
                 latest_answers = {}
                 for actor in self.actors:
-                    responses = self.actor_responses.get(actor.id, [])
+                    responses = list(self.actor_responses.get(actor.id, []))  # copy list
                     for r in reversed(responses):
                         if r.get("role") in ["answer", "revision"]:
                             latest_answers[actor.id] = r["content"]
@@ -3821,17 +3822,22 @@ The previous response could not be parsed. Please provide ONLY a valid JSON obje
             except json.JSONDecodeError:
                 pass
 
-        # If still failed, return with confidence: null to indicate unavailable
+        # If still failed, use convergence_result score as fallback confidence
         if not parse_success or consensus is None:
+            fallback_confidence = None
+            if convergence_result and convergence_result.score > 0:
+                fallback_confidence = convergence_result.score
+                logger.info(f"Using convergence score {fallback_confidence} as fallback confidence")
+
             consensus = {
                 "summary": full_response,
-                "agreements": [],
-                "disagreements": [],
-                "confidence": None,  # null indicates unavailable, not fake 0.5
+                "agreements": convergence_result.agreements if convergence_result else [],
+                "disagreements": convergence_result.disagreements if convergence_result else [],
+                "confidence": fallback_confidence,
                 "recommendation": full_response,
-                "confidence_unavailable": True,  # Explicit flag for frontend
+                "confidence_unavailable": fallback_confidence is None,
             }
-            logger.warning("Summary JSON parse failed after retry, confidence marked as unavailable")
+            logger.warning(f"Summary JSON parse failed after retry, fallback confidence: {fallback_confidence}")
 
         # Store message
         message = Message(
@@ -6547,10 +6553,14 @@ export default function Arena() {
                     className="w-full bg-bg-secondary border border-border rounded-xl px-4 py-3 flex items-center justify-between hover:border-accent-blue transition-colors text-left"
                   >
                     <span className="text-text-primary truncate">{session.question}</span>
-                    {session.consensus_confidence && (
-                      <span className="text-accent-green text-sm ml-2">
-                        {Math.round(session.consensus_confidence * 100)}% 共识
-                      </span>
+                    {session.status === 'completed' && (
+                      session.consensus_confidence != null ? (
+                        <span className="text-accent-green text-sm ml-2">
+                          {Math.round(session.consensus_confidence * 100)}% 共识
+                        </span>
+                      ) : (
+                        <span className="text-text-tertiary text-sm ml-2">已完成</span>
+                      )
                     )}
                   </button>
                 ))
@@ -6751,6 +6761,13 @@ export default function DebateView({
     return semanticComparisons.size > 0
   }, [semanticComparisons])
 
+  // Auto-switch to semantic tab when debate completes and semantic data is available
+  useEffect(() => {
+    if (status === 'completed' && hasSemanticData && sidebarTab === 'monitor') {
+      setSidebarTab('semantic')
+    }
+  }, [status, hasSemanticData, sidebarTab])
+
   return (
     <div className="flex h-full min-h-0">
       {/* Main chat area (left ~2/3) - scrolls independently */}
@@ -6759,6 +6776,7 @@ export default function DebateView({
           question={question}
           actors={debateActors}
           phaseHistory={phaseHistory}
+          currentPhaseRecord={currentPhaseRecord}
           status={status}
           onMessageClick={(actorId) => {
             // On click, set this actor as base for diff
@@ -6898,6 +6916,14 @@ function getCachedDiff(key: string): DiffLine[] | null {
 }
 
 function setCachedDiff(key: string, result: DiffLine[]) {
+  // Prevent unbounded cache growth
+  if (diffCache.size > 50) {
+    // Delete oldest entry
+    const firstKey = diffCache.keys().next().value
+    if (firstKey !== undefined) {
+      diffCache.delete(firstKey)
+    }
+  }
   diffCache.set(key, { result, timestamp: Date.now() })
 }
 
@@ -7612,115 +7638,87 @@ export default function MiniMagiMonitor({
           </g>
 
           {/* Connection lines between MAGI center and bottom nodes (thick, like START.HTML) */}
-          <g stroke="#f26600" strokeWidth="15">
-            {/* Center to bottom-left */}
-            <line x1="388" y1="258" x2="363" y2="338" />
-            {/* Center to bottom-right */}
-            <line x1="573" y1="258" x2="598" y2="338" />
-            {/* Bottom horizontal */}
-            <line x1="425" y1="430" x2="535" y2="430" />
-          </g>
+          {/* === Layout depends on number of debate actors === */}
+          {!actorC ? (
+            /* ===== 2-ACTOR MODE: Judge top, A bottom-left, B bottom-right ===== */
+            <>
+              <g stroke="#f26600" strokeWidth="15">
+                <line x1="388" y1="258" x2="363" y2="338" />
+                <line x1="573" y1="258" x2="598" y2="338" />
+                <line x1="425" y1="430" x2="535" y2="430" />
+              </g>
 
-          {/* MAGI text (center) */}
-          <text x="480" y="350" textAnchor="middle" className="magi-text" fontSize="24">MAGI</text>
+              <text x="480" y="350" textAnchor="middle" className="magi-text" fontSize="24">MAGI</text>
 
-          {/* ===== JUDGE NODE (top center) ===== */}
-          {/* Hexagonal shape from START.HTML, scaled down */}
-          <g className={`state-${judgeState}`}>
-            <polygon
-              className="node-fill node-fill-base"
-              points="355,70 605,70 605,225 540,290 420,290 355,225"
-            />
-            <polygon
-              fill="url(#mini-scanline)"
-              points="355,70 605,70 605,225 540,290 420,290 355,225"
-            />
-            <polygon
-              className="node-stroke"
-              points="355,70 605,70 605,225 540,290 420,290 355,225"
-            />
-            <text
-              x="480"
-              y="195"
-              textAnchor="middle"
-              className="node-text node-text-base"
-              fontSize="28"
-            >
-              {judgeLabel}
-            </text>
-          </g>
+              {/* JUDGE NODE (top center hex) */}
+              <g className={`state-${judgeState}`}>
+                <polygon className="node-fill node-fill-base" points="355,70 605,70 605,225 540,290 420,290 355,225" />
+                <polygon fill="url(#mini-scanline)" points="355,70 605,70 605,225 540,290 420,290 355,225" />
+                <polygon className="node-stroke" points="355,70 605,70 605,225 540,290 420,290 355,225" />
+                <text x="480" y="195" textAnchor="middle" className="node-text node-text-base" fontSize="28">{judgeLabel}</text>
+              </g>
 
-          {/* ===== ACTOR A NODE (bottom left) ===== */}
-          <g className={`state-${actorAState}`}>
-            <polygon
-              className="node-fill node-fill-base"
-              points="125,275 300,275 425,400 425,470 125,470"
-            />
-            <polygon
-              fill="url(#mini-scanline)"
-              points="125,275 300,275 425,400 425,470 125,470"
-            />
-            <polygon
-              className="node-stroke"
-              points="125,275 300,275 425,400 425,470 125,470"
-            />
-            <text
-              x="250"
-              y="395"
-              textAnchor="middle"
-              className="node-text node-text-base"
-              fontSize="24"
-            >
-              {actorALabel}
-            </text>
-          </g>
+              {/* ACTOR A (bottom left trapezoid) */}
+              <g className={`state-${actorAState}`}>
+                <polygon className="node-fill node-fill-base" points="125,275 300,275 425,400 425,470 125,470" />
+                <polygon fill="url(#mini-scanline)" points="125,275 300,275 425,400 425,470 125,470" />
+                <polygon className="node-stroke" points="125,275 300,275 425,400 425,470 125,470" />
+                <text x="250" y="395" textAnchor="middle" className="node-text node-text-base" fontSize="24">{actorALabel}</text>
+              </g>
 
-          {/* ===== ACTOR B NODE (bottom right) ===== */}
-          <g className={`state-${actorBState}`}>
-            <polygon
-              className="node-fill node-fill-base"
-              points="835,275 660,275 535,400 535,470 835,470"
-            />
-            <polygon
-              fill="url(#mini-scanline)"
-              points="835,275 660,275 535,400 535,470 835,470"
-            />
-            <polygon
-              className="node-stroke"
-              points="835,275 660,275 535,400 535,470 835,470"
-            />
-            <text
-              x="685"
-              y="395"
-              textAnchor="middle"
-              className="node-text node-text-base"
-              fontSize="24"
-            >
-              {actorBLabel}
-            </text>
-          </g>
+              {/* ACTOR B (bottom right trapezoid) */}
+              <g className={`state-${actorBState}`}>
+                <polygon className="node-fill node-fill-base" points="835,275 660,275 535,400 535,470 835,470" />
+                <polygon fill="url(#mini-scanline)" points="835,275 660,275 535,400 535,470 835,470" />
+                <polygon className="node-stroke" points="835,275 660,275 535,400 535,470 835,470" />
+                <text x="685" y="395" textAnchor="middle" className="node-text node-text-base" fontSize="24">{actorBLabel}</text>
+              </g>
+            </>
+          ) : (
+            /* ===== 3-ACTOR MODE: Classic EVA triangle - A top, B bottom-left, C bottom-right, Judge label ===== */
+            <>
+              <g stroke="#f26600" strokeWidth="15">
+                {/* A(top) to B(bottom-left) */}
+                <line x1="388" y1="258" x2="363" y2="338" />
+                {/* A(top) to C(bottom-right) */}
+                <line x1="573" y1="258" x2="598" y2="338" />
+                {/* B(bottom-left) to C(bottom-right) */}
+                <line x1="425" y1="430" x2="535" y2="430" />
+              </g>
 
-          {/* ===== ACTOR C NODE (optional, bottom center) ===== */}
-          {actorC && (
-            <g className={`state-${actorCState}`}>
-              <polygon
-                className="node-fill node-fill-base"
-                points="380,455 580,455 580,510 380,510"
-              />
-              <polygon
-                className="node-stroke"
-                points="380,455 580,455 580,510 380,510"
-              />
-              <text
-                x="480"
-                y="492"
-                textAnchor="middle"
-                className="node-text node-text-base"
-                fontSize="18"
-              >
-                {actorCLabel}
-              </text>
-            </g>
+              <text x="480" y="350" textAnchor="middle" className="magi-text" fontSize="24">MAGI</text>
+
+              {/* ACTOR A (top center hex - BALTHASAR position) */}
+              <g className={`state-${actorAState}`}>
+                <polygon className="node-fill node-fill-base" points="355,70 605,70 605,225 540,290 420,290 355,225" />
+                <polygon fill="url(#mini-scanline)" points="355,70 605,70 605,225 540,290 420,290 355,225" />
+                <polygon className="node-stroke" points="355,70 605,70 605,225 540,290 420,290 355,225" />
+                <text x="480" y="195" textAnchor="middle" className="node-text node-text-base" fontSize="28">{actorALabel}</text>
+              </g>
+
+              {/* ACTOR B (bottom left - CASPER position) */}
+              <g className={`state-${actorBState}`}>
+                <polygon className="node-fill node-fill-base" points="125,275 300,275 425,400 425,470 125,470" />
+                <polygon fill="url(#mini-scanline)" points="125,275 300,275 425,400 425,470 125,470" />
+                <polygon className="node-stroke" points="125,275 300,275 425,400 425,470 125,470" />
+                <text x="250" y="395" textAnchor="middle" className="node-text node-text-base" fontSize="24">{actorBLabel}</text>
+              </g>
+
+              {/* ACTOR C (bottom right - MELCHIOR position) */}
+              <g className={`state-${actorCState}`}>
+                <polygon className="node-fill node-fill-base" points="835,275 660,275 535,400 535,470 835,470" />
+                <polygon fill="url(#mini-scanline)" points="835,275 660,275 535,400 535,470 835,470" />
+                <polygon className="node-stroke" points="835,275 660,275 535,400 535,470 835,470" />
+                <text x="685" y="395" textAnchor="middle" className="node-text node-text-base" fontSize="24">{actorCLabel}</text>
+              </g>
+
+              {/* JUDGE label next to 審議中 box */}
+              <g className={`state-${judgeState}`}>
+                <rect x="710" y="255" width="120" height="30" rx="4" className="node-fill node-fill-base" />
+                <rect x="710" y="255" width="120" height="30" rx="4" fill="none" stroke="#f26600" strokeWidth="2" />
+                <text x="770" y="275" textAnchor="middle" className="node-text node-text-base" fontSize="14">{judgeLabel}</text>
+              </g>
+            </>
           )}
         </svg>
       </div>
@@ -8032,6 +8030,7 @@ export default function QuestionBox({
 
 import { memo, useMemo, useRef, useEffect, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
+import { ChevronDown, ChevronRight } from 'lucide-react'
 import { Actor, LivePhaseRecord, LiveMessage, ConvergenceData, Consensus } from '@/types'
 import ConsensusView from './ConsensusView'
 import MarkdownBlock from './MarkdownBlock'
@@ -8040,6 +8039,7 @@ interface ReviewChatViewProps {
   question: string
   actors: Actor[]
   phaseHistory: LivePhaseRecord[]
+  currentPhaseRecord?: LivePhaseRecord | null
   status: string
   onMessageClick?: (actorId: string, phase: string) => void
   consensus?: Consensus | null  // Add consensus prop
@@ -8191,6 +8191,7 @@ export default function ReviewChatView({
   question,
   actors,
   phaseHistory,
+  currentPhaseRecord = null,
   status,
   onMessageClick,
   consensus,
@@ -8198,6 +8199,41 @@ export default function ReviewChatView({
   const scrollRef = useRef<HTMLDivElement>(null)
   const [userHasScrolledUp, setUserHasScrolledUp] = useState(false)
   const lastScrollTop = useRef(0)
+
+  // Track which phases are expanded (for collapse/expand after completion)
+  const [expandedPhases, setExpandedPhases] = useState<Set<string>>(new Set())
+
+  // Extract the final answer message for pinning at top
+  const finalAnswerPhase = useMemo(() => {
+    if (status !== 'completed') return null
+    for (let i = phaseHistory.length - 1; i >= 0; i--) {
+      const record = phaseHistory[i]
+      if (record.phase === 'final_answer') {
+        const messages = Object.values(record.messages) as LiveMessage[]
+        if (messages.length > 0) {
+          return messages[0]  // Judge's final answer
+        }
+      }
+    }
+    return null
+  }, [phaseHistory, status])
+
+  const togglePhaseExpand = (phaseId: string) => {
+    setExpandedPhases(prev => {
+      const next = new Set(prev)
+      if (next.has(phaseId)) {
+        next.delete(phaseId)
+      } else {
+        next.add(phaseId)
+      }
+      return next
+    })
+  }
+
+  // Intermediate phases (initial, review, revision) - collapsed by default when completed
+  const isIntermediatePhase = (phase: string) => {
+    return ['initial', 'review', 'revision'].includes(phase)
+  }
 
   // Track user scroll intent
   useEffect(() => {
@@ -8207,12 +8243,9 @@ export default function ReviewChatView({
     const handleScroll = () => {
       const { scrollTop, scrollHeight, clientHeight } = el
       const distanceFromBottom = scrollHeight - scrollTop - clientHeight
-      // If user scrolled up more than 80px from bottom, respect their intent
-      if (distanceFromBottom > 80) {
-        setUserHasScrolledUp(true)
-      } else {
-        setUserHasScrolledUp(false)
-      }
+      const shouldBeScrolledUp = distanceFromBottom > 80
+      // Only update state when value actually changes to avoid unnecessary re-renders
+      setUserHasScrolledUp(prev => prev === shouldBeScrolledUp ? prev : shouldBeScrolledUp)
       lastScrollTop.current = scrollTop
     }
 
@@ -8235,13 +8268,24 @@ export default function ReviewChatView({
   }, [status])
 
   // Build ordered messages from phase history
+  // Merge phaseHistory (stable, updated on phase_end/actor_end) with
+  // currentPhaseRecord (live, updated every 100ms during streaming)
+  // This avoids re-computing the full list every token flush
   // Filter out summary phase - it should only show via ConsensusView, not in chat stream
   const phases = useMemo(() => {
-    return phaseHistory
-      .filter((record) => record.phase !== 'summary') // Don't show summary in chat
+    // Build list: use phaseHistory for completed phases, overlay currentPhaseRecord for active phase
+    let allRecords: LivePhaseRecord[]
+    if (currentPhaseRecord) {
+      const historicalRecords = phaseHistory.filter(r => r.id !== currentPhaseRecord.id)
+      allRecords = [...historicalRecords, currentPhaseRecord]
+    } else {
+      allRecords = phaseHistory
+    }
+
+    return allRecords
+      .filter((record) => record.phase !== 'summary')
       .map((record) => {
         const messages = Object.values(record.messages) as LiveMessage[]
-        // Sort messages by actor order
         const sortedMessages = messages.sort((a, b) => {
           const aIndex = actors.findIndex((act) => act.id === a.actorId)
           const bIndex = actors.findIndex((act) => act.id === b.actorId)
@@ -8253,7 +8297,7 @@ export default function ReviewChatView({
           messages: sortedMessages,
         }
       })
-  }, [phaseHistory, actors])
+  }, [phaseHistory, currentPhaseRecord, actors])
 
   return (
     <div ref={scrollRef} className="space-y-6 overflow-y-auto h-full pb-8 pr-2">
@@ -8263,39 +8307,77 @@ export default function ReviewChatView({
         <div className="text-text-primary font-medium">{question}</div>
       </div>
 
+      {/* Final Answer - pinned at top when completed */}
+      {status === 'completed' && finalAnswerPhase && (
+        <motion.div
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="bg-accent-blue/5 border-2 border-accent-blue/30 rounded-2xl overflow-hidden"
+        >
+          <div className="px-5 py-3 flex items-center gap-3 border-b border-accent-blue/20 bg-accent-blue/10">
+            <span className="text-lg">📋</span>
+            <span className="font-semibold text-accent-blue">最终回答</span>
+            <span className="text-xs text-text-tertiary ml-auto">
+              by {finalAnswerPhase.actorName}
+            </span>
+          </div>
+          <div className="px-5 py-4">
+            <MarkdownBlock content={finalAnswerPhase.content} />
+          </div>
+        </motion.div>
+      )}
+
       {/* All phases (summary is filtered out - shows via ConsensusView instead) */}
       <AnimatePresence mode="popLayout">
-        {phases.map(({ record, messages }) => (
-          <motion.div
-            key={record.id}
-            layout
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            className="space-y-3"
-          >
-            {/* Phase separator */}
-            <div className="flex items-center gap-4 py-2 sticky top-0 bg-bg-primary z-10">
-              <div className="text-text-secondary text-sm font-medium">
-                {getPhaseTitle(record)}
+        {phases.map(({ record, messages }) => {
+          // When completed, intermediate phases are collapsed by default
+          const isCollapsible = status === 'completed' && isIntermediatePhase(record.phase)
+          const isExpanded = !isCollapsible || expandedPhases.has(record.id)
+
+          return (
+            <motion.div
+              key={record.id}
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              className="space-y-3"
+            >
+              {/* Phase separator - clickable when collapsible */}
+              <div
+                className={`flex items-center gap-4 py-2 sticky top-0 bg-bg-primary z-10 ${isCollapsible ? 'cursor-pointer hover:bg-bg-secondary/50 rounded-lg px-2 -mx-2 transition-colors' : ''}`}
+                onClick={isCollapsible ? () => togglePhaseExpand(record.id) : undefined}
+              >
+                {isCollapsible && (
+                  isExpanded
+                    ? <ChevronDown className="w-4 h-4 text-text-tertiary shrink-0" />
+                    : <ChevronRight className="w-4 h-4 text-text-tertiary shrink-0" />
+                )}
+                <div className="text-text-secondary text-sm font-medium">
+                  {getPhaseTitle(record)}
+                </div>
+                {isCollapsible && !isExpanded && (
+                  <span className="text-text-tertiary text-xs">
+                    {messages.length} 条消息
+                  </span>
+                )}
+                <div className="flex-1 h-px bg-border" />
               </div>
-              <div className="flex-1 h-px bg-border" />
-            </div>
 
-            {/* Messages */}
-            {messages.map((msg) => (
-              <MessageCard
-                key={msg.actorId}
-                message={msg}
-                onMessageClick={onMessageClick}
-              />
-            ))}
+              {/* Messages - hidden when collapsed */}
+              {isExpanded && messages.map((msg) => (
+                <MessageCard
+                  key={msg.actorId}
+                  message={msg}
+                  onMessageClick={onMessageClick}
+                />
+              ))}
 
-            {/* Convergence result for revision phases */}
-            {record.phase === 'revision' && record.convergence && (
-              <ConvergenceCard convergence={record.convergence} />
-            )}
-          </motion.div>
-        ))}
+              {/* Convergence result for revision phases */}
+              {isExpanded && record.phase === 'revision' && record.convergence && (
+                <ConvergenceCard convergence={record.convergence} />
+              )}
+            </motion.div>
+          )
+        })}
       </AnimatePresence>
 
       {/* Waiting state */}
@@ -9016,12 +9098,15 @@ export default function SessionHistory({ onBack, onSelect }: SessionHistoryProps
     })
   }
 
-  const getStatusIcon = (status: string, confidence?: number) => {
-    if (status === 'completed' && confidence && confidence > 0.7) {
+  const getStatusIcon = (status: string, confidence?: number | null) => {
+    if (status === 'completed' && confidence != null && confidence > 0.7) {
       return <Check className="w-4 h-4 text-accent-green" />
     }
     if (status === 'completed') {
-      return <X className="w-4 h-4 text-accent-orange" />
+      return <Check className="w-4 h-4 text-accent-orange" />
+    }
+    if (status === 'stopped') {
+      return <X className="w-4 h-4 text-accent-red" />
     }
     return <Clock className="w-4 h-4 text-text-tertiary" />
   }
@@ -9072,10 +9157,14 @@ export default function SessionHistory({ onBack, onSelect }: SessionHistoryProps
                     </div>
                     <div className="flex items-center gap-2 ml-4">
                       {getStatusIcon(session.status, session.consensus_confidence)}
-                      {session.consensus_confidence && (
-                        <span className="text-sm text-text-secondary">
-                          {Math.round(session.consensus_confidence * 100)}% 共识
-                        </span>
+                      {session.status === 'completed' && (
+                        session.consensus_confidence != null ? (
+                          <span className="text-sm text-accent-green">
+                            {Math.round(session.consensus_confidence * 100)}% 共识
+                          </span>
+                        ) : (
+                          <span className="text-sm text-text-tertiary">已完成</span>
+                        )
                       )}
                     </div>
                   </div>
@@ -10303,7 +10392,7 @@ const BASE_RECONNECT_DELAY = 1000 // 1 second
 // Instead of updating Zustand state on every token, we buffer tokens and flush periodically
 const tokenBuffer = new Map<string, string>()  // actorId -> accumulated tokens
 let flushTimeoutId: ReturnType<typeof setTimeout> | null = null
-const FLUSH_INTERVAL = 50  // ms - flush every 50ms
+const FLUSH_INTERVAL = 100  // ms - flush every 100ms (reduced from 50ms for performance)
 
 // Helper to clear token buffer and flush timeout
 function clearTokenBufferState() {
@@ -10477,19 +10566,40 @@ export const useDebateStore = create<DebateState>((set, get) => ({
           const sid = get().currentSessionId
           if (sid && get().status !== 'completed' && get().status !== 'idle') {
             console.log(`[SSE] Reconnecting to session ${sid}...`)
-            // Re-create EventSource without resetting state
-            // We call streamDebate but need to preserve existing phaseHistory
-            // So we just re-create the EventSource manually
-            const preservedState = {
+            // Directly create a new EventSource without calling streamDebate
+            // (streamDebate resets all state which loses progress)
+            set({ status: 'connecting', error: null })
+
+            if (eventSource) {
+              eventSource.close()
+              eventSource = null
+            }
+
+            // Re-create EventSource - the existing event listeners from
+            // the outer streamDebate call are lost, so we need a fresh call.
+            // But we must preserve accumulated state.
+            // Strategy: save state, call streamDebate, restore state
+            const preserved = {
               phaseHistory: get().phaseHistory,
               currentPhaseRecord: get().currentPhaseRecord,
+              currentPhase: get().currentPhase,
+              currentRound: get().currentRound,
+              currentCycle: get().currentCycle,
+              convergenceResult: get().convergenceResult,
               semanticComparisons: get().semanticComparisons,
               questionIntent: get().questionIntent,
               progress: get().progress,
+              currentSession: get().currentSession,
             }
+
+            // streamDebate will reset and recreate EventSource + listeners
             get().streamDebate(sid)
-            // Restore preserved state after streamDebate resets it
-            set(preservedState)
+
+            // Immediately restore accumulated state
+            // Use queueMicrotask to ensure this runs after streamDebate's synchronous set()
+            queueMicrotask(() => {
+              set(preserved)
+            })
           }
         }, delay)
       } else {
@@ -10630,21 +10740,21 @@ export const useDebateStore = create<DebateState>((set, get) => ({
       if (!flushTimeoutId) {
         flushTimeoutId = setTimeout(() => {
           flushTimeoutId = null
-          // Flush all buffered tokens to state
           const bufferedTokens = new Map(tokenBuffer)
           tokenBuffer.clear()
 
           if (bufferedTokens.size === 0) return
 
           set((state) => {
-            // Update legacy state
             const newMap = new Map(state.streamingContent)
             bufferedTokens.forEach((tokens, actorId) => {
               const existing = newMap.get(actorId) || ''
               newMap.set(actorId, existing + tokens)
             })
 
-            // Update phase history
+            // Only update currentPhaseRecord, NOT phaseHistory
+            // phaseHistory is synced in phase_end and actor_end events
+            // This avoids creating new phaseHistory array refs every 100ms
             const phaseRecord = state.currentPhaseRecord
             if (phaseRecord) {
               const updatedMessages = { ...phaseRecord.messages }
@@ -10665,15 +10775,9 @@ export const useDebateStore = create<DebateState>((set, get) => ({
                   ...phaseRecord,
                   messages: updatedMessages,
                 }
-
-                const updatedHistory = state.phaseHistory.map((r) =>
-                  r.id === updatedRecord.id ? updatedRecord : r
-                )
-
                 return {
                   streamingContent: newMap,
                   currentPhaseRecord: updatedRecord,
-                  phaseHistory: updatedHistory,
                 }
               }
             }
@@ -10753,17 +10857,26 @@ export const useDebateStore = create<DebateState>((set, get) => ({
 
     eventSource.addEventListener('phase_end', (e: MessageEvent) => {
       console.log('[SSE] phase_end:', e.data)
-      // Phase ended, update progress
-      set((state) => ({
-        progress: {
-          ...state.progress,
-          completedSteps: state.progress.completedSteps + 1,
-          currentStepProgress: 1,
-          // Reset actor counts for next phase
-          totalActorsInPhase: 0,
-          completedActorsInPhase: 0,
+      set((state) => {
+        // Sync currentPhaseRecord to phaseHistory as final snapshot
+        let updatedHistory = state.phaseHistory
+        if (state.currentPhaseRecord) {
+          updatedHistory = state.phaseHistory.map((r) =>
+            r.id === state.currentPhaseRecord!.id ? state.currentPhaseRecord! : r
+          )
         }
-      }))
+
+        return {
+          phaseHistory: updatedHistory,
+          progress: {
+            ...state.progress,
+            completedSteps: state.progress.completedSteps + 1,
+            currentStepProgress: 1,
+            totalActorsInPhase: 0,
+            completedActorsInPhase: 0,
+          },
+        }
+      })
     })
 
     // Convergence result - attach to latest revision phase
@@ -10956,12 +11069,11 @@ export const useDebateStore = create<DebateState>((set, get) => ({
 
     eventSource.addEventListener('complete', async (e: MessageEvent) => {
       console.log('[SSE] complete:', e.data)
-      expectedClose = true  // Mark as expected close
-      clearTokenBufferState()  // Clear token buffer
+      expectedClose = true
+      clearTokenBufferState()
 
       try {
         const session = await apiClient.getDebate(sessionId)
-        // Keep phaseHistory intact, just update the session
         set({ currentSession: session, status: 'completed' })
       } catch {
         set({ status: 'completed' })
@@ -10969,6 +11081,39 @@ export const useDebateStore = create<DebateState>((set, get) => ({
 
       eventSource?.close()
       eventSource = null
+
+      // Fetch semantic data after a delay to allow background task to finish
+      // Semantic analysis runs as a background task and may complete after the
+      // main debate flow emits "complete"
+      setTimeout(async () => {
+        try {
+          const semantic = await apiClient.getSemanticAnalysis(sessionId)
+          if (semantic && semantic.comparisons && semantic.comparisons.length > 0) {
+            const newComparisons = new Map(get().semanticComparisons)
+            // Group by phase_id
+            for (const comp of semantic.comparisons) {
+              if (comp.round_number && comp.phase) {
+                const phaseId = `${comp.round_number}:${comp.phase}`
+                if (!newComparisons.has(phaseId)) {
+                  newComparisons.set(phaseId, [])
+                }
+                const existing = newComparisons.get(phaseId)!
+                const existingIds = new Set(existing.map((c: TopicComparison) => c.topic_id))
+                if (!existingIds.has(comp.topic_id)) {
+                  existing.push(comp)
+                }
+              }
+            }
+            set({
+              semanticComparisons: newComparisons,
+              questionIntent: semantic.question_intent || get().questionIntent,
+            })
+            console.log('[SSE] Fetched semantic data after completion:', newComparisons.size, 'phases')
+          }
+        } catch (err) {
+          console.log('[SSE] No semantic data available after completion (normal if analysis was skipped)')
+        }
+      }, 4000)  // Wait 4 seconds for background semantic task to finish
     })
 
     eventSource.addEventListener('debate_error', (e: MessageEvent) => {

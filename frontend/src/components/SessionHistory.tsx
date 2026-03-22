@@ -29,12 +29,15 @@ export default function SessionHistory({ onBack, onSelect }: SessionHistoryProps
     })
   }
 
-  const getStatusIcon = (status: string, confidence?: number) => {
-    if (status === 'completed' && confidence && confidence > 0.7) {
+  const getStatusIcon = (status: string, confidence?: number | null) => {
+    if (status === 'completed' && confidence != null && confidence > 0.7) {
       return <Check className="w-4 h-4 text-accent-green" />
     }
     if (status === 'completed') {
-      return <X className="w-4 h-4 text-accent-orange" />
+      return <Check className="w-4 h-4 text-accent-orange" />
+    }
+    if (status === 'stopped') {
+      return <X className="w-4 h-4 text-accent-red" />
     }
     return <Clock className="w-4 h-4 text-text-tertiary" />
   }
@@ -85,10 +88,14 @@ export default function SessionHistory({ onBack, onSelect }: SessionHistoryProps
                     </div>
                     <div className="flex items-center gap-2 ml-4">
                       {getStatusIcon(session.status, session.consensus_confidence)}
-                      {session.consensus_confidence && (
-                        <span className="text-sm text-text-secondary">
-                          {Math.round(session.consensus_confidence * 100)}% 共识
-                        </span>
+                      {session.status === 'completed' && (
+                        session.consensus_confidence != null ? (
+                          <span className="text-sm text-accent-green">
+                            {Math.round(session.consensus_confidence * 100)}% 共识
+                          </span>
+                        ) : (
+                          <span className="text-sm text-text-tertiary">已完成</span>
+                        )
                       )}
                     </div>
                   </div>

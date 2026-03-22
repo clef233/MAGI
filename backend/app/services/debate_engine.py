@@ -794,9 +794,10 @@ class DebateEngine:
                         })()
 
                 # Step 2: Extract semantic topics from each actor's latest response (parallel)
+                # Make a shallow copy to avoid concurrent modification from main flow
                 latest_answers = {}
                 for actor in self.actors:
-                    responses = self.actor_responses.get(actor.id, [])
+                    responses = list(self.actor_responses.get(actor.id, []))  # copy list
                     for r in reversed(responses):
                         if r.get("role") in ["answer", "revision"]:
                             latest_answers[actor.id] = r["content"]
@@ -1206,17 +1207,22 @@ The previous response could not be parsed. Please provide ONLY a valid JSON obje
             except json.JSONDecodeError:
                 pass
 
-        # If still failed, return with confidence: null to indicate unavailable
+        # If still failed, use convergence_result score as fallback confidence
         if not parse_success or consensus is None:
+            fallback_confidence = None
+            if convergence_result and convergence_result.score > 0:
+                fallback_confidence = convergence_result.score
+                logger.info(f"Using convergence score {fallback_confidence} as fallback confidence")
+
             consensus = {
                 "summary": full_response,
-                "agreements": [],
-                "disagreements": [],
-                "confidence": None,  # null indicates unavailable, not fake 0.5
+                "agreements": convergence_result.agreements if convergence_result else [],
+                "disagreements": convergence_result.disagreements if convergence_result else [],
+                "confidence": fallback_confidence,
                 "recommendation": full_response,
-                "confidence_unavailable": True,  # Explicit flag for frontend
+                "confidence_unavailable": fallback_confidence is None,
             }
-            logger.warning("Summary JSON parse failed after retry, confidence marked as unavailable")
+            logger.warning(f"Summary JSON parse failed after retry, fallback confidence: {fallback_confidence}")
 
         # Store message
         message = Message(

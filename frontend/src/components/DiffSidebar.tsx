@@ -44,6 +44,14 @@ function getCachedDiff(key: string): DiffLine[] | null {
 }
 
 function setCachedDiff(key: string, result: DiffLine[]) {
+  // Prevent unbounded cache growth
+  if (diffCache.size > 50) {
+    // Delete oldest entry
+    const firstKey = diffCache.keys().next().value
+    if (firstKey !== undefined) {
+      diffCache.delete(firstKey)
+    }
+  }
   diffCache.set(key, { result, timestamp: Date.now() })
 }
 
