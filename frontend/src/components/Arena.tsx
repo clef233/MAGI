@@ -12,6 +12,7 @@ import SessionHistory from './SessionHistory'
 import SettingsView from './SettingsView'
 import SessionDetailView from './SessionDetailView'
 import ProgressBar from './ProgressBar'
+import QuestionBox from './QuestionBox'
 import { apiClient } from '@/lib/apiClient'
 
 type View = 'arena' | 'debate' | 'actors' | 'history' | 'settings' | 'sessionDetail'
@@ -144,11 +145,8 @@ export default function Arena() {
         {/* Debate content - main area with fixed height */}
         <main className="flex-1 overflow-hidden">
           <div className="h-full max-w-[1600px] mx-auto px-6 py-4 flex flex-col">
-            {/* Question - fixed at top */}
-            <div className="mb-4 shrink-0">
-              <h2 className="text-lg text-text-secondary mb-1">问题</h2>
-              <p className="text-xl font-medium">{question}</p>
-            </div>
+            {/* Question - collapsible for long questions */}
+            <QuestionBox question={question} />
 
             {/* Status - fixed */}
             <div className="mb-4 flex items-center gap-4 shrink-0">

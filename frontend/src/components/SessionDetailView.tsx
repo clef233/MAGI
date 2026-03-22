@@ -11,6 +11,7 @@ import {
   hydrateConsensus,
 } from '@/lib/sessionHydrator'
 import DebateView from './DebateView'
+import QuestionBox from './QuestionBox'
 
 interface SessionDetailViewProps {
   sessionId: string
@@ -151,9 +152,8 @@ export default function SessionDetailView({ sessionId, onBack }: SessionDetailVi
         <div className="h-full max-w-[1600px] mx-auto px-6 py-4 flex flex-col">
           {/* Question */}
           <div className="mb-4 shrink-0">
-            <h2 className="text-lg text-text-secondary mb-1">问题</h2>
-            <p className="text-xl font-medium">{session.question}</p>
-            <p className="text-text-tertiary text-sm mt-1">{formatDate(session.created_at)}</p>
+            <QuestionBox question={session.question} className="mb-0" />
+            <p className="text-text-tertiary text-sm mt-2">{formatDate(session.created_at)}</p>
           </div>
 
           {/* Status */}
