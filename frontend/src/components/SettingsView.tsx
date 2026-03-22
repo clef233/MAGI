@@ -474,7 +474,7 @@ export default function SettingsView({ onBack }: SettingsViewProps) {
                     )}
                     <button
                       onClick={saveSemanticConfig}
-                      disabled={saving === 'semantic' || !semanticConfig.model || !semanticConfig.api_key}
+                      disabled={saving === 'semantic' || !semanticConfig.model || (!semanticConfig.api_key && !semanticConfig.is_configured)}
                       className="flex items-center gap-2 px-4 py-2 bg-accent-blue text-white rounded-xl hover:bg-blue-600 disabled:opacity-50 transition-colors"
                     >
                       <Save className="w-4 h-4" />
