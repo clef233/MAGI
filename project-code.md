@@ -1,8 +1,8 @@
 # Project: MAGI
 
-Generated: 2026-03-21 00:10:21
+Generated: 2026-03-22 12:29:25
 Root: D:\Projects\MAGI
-Files: 61
+Files: 63
 
 ---
 
@@ -44,6 +44,7 @@ frontend/
       database.py
       debate_engine.py
       llm_adapter.py
+      prompt_serializer.py
       prompt_service.py
       semantic_service.py
       task_manager.py
@@ -63,7 +64,9 @@ frontend/
       DiffSidebar.tsx
       index.ts
       MarkdownBlock.tsx
+      MiniMagiMonitor.tsx
       ProgressBar.tsx
+      QuestionBox.tsx
       ReviewChatView.tsx
       SemanticSidebar.tsx
       SessionDetailView.tsx
@@ -80,7 +83,6 @@ frontend/
       index.ts
   tailwind.config.ts
   tsconfig.json
-  tsconfig.tsbuildinfo
 merge_code.py
 start.bat
 START.HTML
@@ -1920,12 +1922,16 @@ would be beneficial.
 
 import json
 import logging
-from typing import List
+from typing import List, TYPE_CHECKING
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.models.database import Actor, SemanticComparison
 from app.services.llm_adapter import create_adapter
+from app.services.prompt_serializer import serialize_latest_answer_blocks
+
+if TYPE_CHECKING:
+    from app.services.prompt_service import PromptService
 
 logger = logging.getLogger('magi.convergence')
 
@@ -2044,6 +2050,7 @@ async def check_convergence(
     question: str,
     responses: dict[str, str],  # actor_id -> response content
     threshold: float = 0.85,
+    prompt_service: "PromptService" = None,
 ) -> ConvergenceResult:
     """
     Check if responses have converged using the judge model.
@@ -2054,10 +2061,20 @@ async def check_convergence(
         question: The original question
         responses: Map of actor_id to their latest response
         threshold: Convergence threshold (0-1)
+        prompt_service: REQUIRED - PromptService instance for loading templates
 
     Returns:
         ConvergenceResult with convergence status and details
+
+    Raises:
+        ValueError: If prompt_service is not provided
     """
+    if prompt_service is None:
+        raise ValueError(
+            "prompt_service is required — hardcoded prompts are banned in this project. "
+            "See .claude/RULES.md"
+        )
+
     # Get judge actor
     result = await db.execute(
         select(Actor).where(Actor.id == judge_actor_id)
@@ -2072,95 +2089,83 @@ async def check_convergence(
             reason="Judge actor not found",
         )
 
-    # Build the prompt
-    response_list = []
+    # Build structured answer blocks
+    answer_blocks = []
     for actor_id, content in responses.items():
         # Get actor name
         actor_result = await db.execute(
             select(Actor.name).where(Actor.id == actor_id)
         )
         actor_name = actor_result.scalar_one_or_none() or "Unknown"
-        response_list.append(f"**{actor_name}**:\n{content}")
+        answer_blocks.append({
+            "actor_name": actor_name,
+            "content": content,
+        })
 
-    prompt = f"""你是一个收敛判断器，需要判断以下回答是否已经收敛（达成足够共识）。
+    latest_answer_blocks = serialize_latest_answer_blocks(answer_blocks)
 
-原始问题：{question}
-
-各参与者的最新回答：
-
-{chr(10).join(response_list)}
-
-请判断这些回答是否已收敛。收敛的标准是：
-1. 核心观点基本一致
-2. 主要分歧已经缩小到次要细节
-3. 不太可能通过更多轮次获得显著改进
-
-请以 JSON 格式返回：
-{{
-  "converged": true或false,
-  "score": 0.0到1.0之间的数值,
-  "reason": "判断理由",
-  "agreements": ["已达成共识的点"],
-  "disagreements": ["仍存在分歧的点"]
-}}
-"""
+    # Get prompt from PromptService - NO fallback allowed
+    prompt = await prompt_service.get_convergence_prompt(
+        question=question,
+        latest_answer_blocks=latest_answer_blocks,
+    )
 
     try:
-            adapter = create_adapter(
-                provider=judge.provider.value,
-                api_key=judge.api_key,
-                base_url=judge.base_url,
-                model=judge.model,
-            )
+        adapter = create_adapter(
+            provider=judge.provider.value,
+            api_key=judge.api_key,
+            base_url=judge.base_url,
+            model=judge.model,
+        )
 
-            full_response = ""
-            async for token in adapter.stream_completion(
-                messages=[{"role": "user", "content": prompt}],
-                system_prompt="你是一个专业的收敛判断器。请以JSON格式返回判断结果。",
-                max_tokens=judge.max_tokens,
-                temperature=0.3,
-            ):
-                full_response += token
+        full_response = ""
+        async for token in adapter.stream_completion(
+            messages=[{"role": "user", "content": prompt}],
+            system_prompt="你是一个专业的收敛判断器。请以JSON格式返回判断结果。",
+            max_tokens=judge.max_tokens,
+            temperature=0.3,
+        ):
+            full_response += token
 
-            # Parse JSON response
-            json_start = full_response.find("{")
-            json_end = full_response.rfind("}") + 1
+        # Parse JSON response
+        json_start = full_response.find("{")
+        json_end = full_response.rfind("}") + 1
 
-            if json_start >= 0 and json_end > json_start:
-                json_str = full_response[json_start:json_end]
-                data = json.loads(json_str)
+        if json_start >= 0 and json_end > json_start:
+            json_str = full_response[json_start:json_end]
+            data = json.loads(json_str)
 
-                converged = data.get("converged", False)
-                score = data.get("score")
+            converged = data.get("converged", False)
+            score = data.get("score")
 
-                # Validate score - if not provided or invalid, mark as unavailable
-                if score is None:
+            # Validate score - if not provided or invalid, mark as unavailable
+            if score is None:
+                score = None
+                converged = False
+            else:
+                try:
+                    score = float(score)
+                    # Apply threshold
+                    if score >= threshold:
+                        converged = True
+                except (ValueError, TypeError):
                     score = None
                     converged = False
-                else:
-                    try:
-                        score = float(score)
-                        # Apply threshold
-                        if score >= threshold:
-                            converged = True
-                    except (ValueError, TypeError):
-                        score = None
-                        converged = False
 
-                return ConvergenceResult(
-                    converged=converged,
-                    score=score if score is not None else 0.0,
-                    reason=data.get("reason", "") + (" (置信度不可用)" if score is None else ""),
-                    agreements=data.get("agreements", []),
-                    disagreements=data.get("disagreements", []),
-                )
-            else:
-                logger.warning(f"Could not parse convergence response: {full_response}")
-                return ConvergenceResult(
-                    converged=False,
-                    score=0.0,
-                    reason="无法解析收敛判断结果",
-                )
+            return ConvergenceResult(
+                converged=converged,
+                score=score if score is not None else 0.0,
+                reason=data.get("reason", "") + (" (置信度不可用)" if score is None else ""),
+                agreements=data.get("agreements", []),
+                disagreements=data.get("disagreements", []),
+            )
+        else:
+            logger.warning(f"Could not parse convergence response: {full_response}")
+            return ConvergenceResult(
+                converged=False,
+                score=0.0,
+                reason="无法解析收敛判断结果",
+            )
 
     except Exception as e:
         logger.error(f"Convergence check failed: {e}")
@@ -2240,7 +2245,7 @@ async def _seed_default_prompts():
                 key="initial_answer",
                 name="初始回答提示词",
                 description="用于生成初始回答的系统提示词模板",
-                template_text="""你是一名专业的分析者，正在参与一个多模型互评系统。
+                template_text="""你是 {{actor_name}}，一名专业的分析者，正在参与一个多模型互评系统。
 
 请针对以下问题给出你的专业回答。你的回答应该：
 1. 结构清晰，逻辑严谨
@@ -2250,7 +2255,7 @@ async def _seed_default_prompts():
 问题：{{question}}
 
 请给出你的回答：""",
-                required_variables=["question"],
+                required_variables=["question", "actor_name"],
             ),
             WorkflowPromptTemplate(
                 key="peer_review",
@@ -2260,11 +2265,19 @@ async def _seed_default_prompts():
 
 原始问题：{{question}}
 
-你的回答：
-{{own_answer}}
+你是 {{self_actor_name}}，下面是你的回答：
+
+{{self_answer_block}}
 
 其他参与者的回答：
-{{other_answers}}
+
+{{peer_answer_blocks}}
+
+## 重要说明
+
+- 引用自己的回答时，请说"我的回答"或"{{self_actor_name}} 的回答"
+- 引用其他参与者时，请使用他们的 actor_name 属性值
+- 不要把自己的回答称为"你的回答"
 
 请从以下角度进行评审：
 1. 各回答的优点和亮点
@@ -2272,7 +2285,7 @@ async def _seed_default_prompts():
 3. 改进建议
 
 请给出你的评审意见：""",
-                required_variables=["question", "own_answer", "other_answers"],
+                required_variables=["question", "self_actor_name", "self_answer_block", "peer_answer_blocks"],
             ),
             WorkflowPromptTemplate(
                 key="revision",
@@ -2282,11 +2295,19 @@ async def _seed_default_prompts():
 
 原始问题：{{question}}
 
-你的原始回答：
-{{own_answer}}
+你是 {{self_actor_name}}，你的原始回答：
 
-其他参与者的评审意见：
-{{reviews_about_me}}
+{{self_previous_answer_block}}
+
+其他参与者对你的评审意见：
+
+{{peer_review_blocks}}
+
+## 重要说明
+
+- 引用自己的上一轮回答时，请说"我的上一轮回答"或"{{self_actor_name}} 的上一轮回答"
+- 不要把自己的回答称为"你的回答"
+- 引用评审者时，请使用 reviewer_name 属性值
 
 请根据这些意见修订你的回答：
 1. 接纳合理的批评和建议
@@ -2294,13 +2315,13 @@ async def _seed_default_prompts():
 3. 提供更全面准确的答案
 
 请给出修订后的回答：""",
-                required_variables=["question", "own_answer", "reviews_about_me"],
+                required_variables=["question", "self_actor_name", "self_previous_answer_block", "peer_review_blocks"],
             ),
             WorkflowPromptTemplate(
                 key="final_answer",
                 name="最终回答提示词",
                 description="综合各模型回答，生成面向用户的最终回答",
-                template_text="""你是一个综合决策助手，需要基于多轮互评的结果，输出一篇面向用户的最终回答。
+                template_text="""你是 {{self_actor_name}}，一个综合决策助手，需要基于多轮互评的结果，输出一篇面向用户的最终回答。
 
 ## 原始问题
 
@@ -2308,7 +2329,7 @@ async def _seed_default_prompts():
 
 ## 各参与者的最终回答
 
-{{actor_answers}}
+{{actor_answer_blocks}}
 
 ## 收敛分析结果
 
@@ -2322,19 +2343,26 @@ async def _seed_default_prompts():
 3. 如果收敛度较低，给出分情境建议
 4. 使用清晰、自然的语言，不要使用 JSON 格式
 5. 直接给出最终回答，不要解释过程
+6. 引用参与者观点时，使用 actor_name 属性值
 """,
-                required_variables=["question", "actor_answers", "convergence_info"],
+                required_variables=["question", "self_actor_name", "actor_answer_blocks", "convergence_info"],
             ),
             WorkflowPromptTemplate(
                 key="summary",
                 name="总结提示词",
                 description="总结模型生成最终综合结论",
-                template_text="""你是一个公正的综合者，需要根据多轮互评的结果生成最终的综合结论。
+                template_text="""你是 {{self_actor_name}}，一个公正的综合者，需要根据多轮互评的结果生成最终的综合结论。
 
 原始问题：{{question}}
 
 完整的互评历史：
-{{history}}
+
+{{history_blocks}}
+
+## 重要说明
+
+- 引用参与者观点时，请使用 actor_name 属性值
+- 引用自己的分析时，请说"我认为"或"经综合分析"
 
 请根据以上信息，生成一个综合性的最终回答。你的回答应该：
 1. 整合各参与者的核心观点
@@ -2347,10 +2375,10 @@ async def _seed_default_prompts():
   "summary": "综合总结",
   "agreements": ["共识点1", "共识点2"],
   "disagreements": ["分歧点1"],
-  "confidence": 0.85,
+  "confidence": <你对结论的信心程度，0.0-1.0之间的小数，如果不确定则省略此字段>,
   "recommendation": "最终建议"
 }""",
-                required_variables=["question", "history"],
+                required_variables=["question", "self_actor_name", "history_blocks"],
             ),
             WorkflowPromptTemplate(
                 key="convergence_check",
@@ -2361,12 +2389,16 @@ async def _seed_default_prompts():
 原始问题：{{question}}
 
 各参与者的最新回答：
-{{latest_answers}}
+
+{{latest_answer_blocks}}
 
 请判断这些回答是否已收敛。收敛的标准是：
 1. 核心观点基本一致
 2. 主要分歧已经缩小到次要细节
 3. 不太可能通过更多轮次获得显著改进
+
+## 重要说明
+- 引用参与者时，请使用 actor_name 属性值
 
 请以 JSON 格式返回：
 {
@@ -2376,7 +2408,7 @@ async def _seed_default_prompts():
   "agreements": ["已达成共识的点"],
   "disagreements": ["仍存在分歧的点"]
 }""",
-                required_variables=["question", "latest_answers"],
+                required_variables=["question", "latest_answer_blocks"],
             ),
             # Semantic analysis prompts
             WorkflowPromptTemplate(
@@ -2478,13 +2510,34 @@ async def _seed_default_prompts():
             ),
         ]
 
-        # Only add templates that don't exist
+        # Only add templates that don't exist, or update if variables changed
         added_count = 0
         for wp in workflow_prompts:
             if wp.key not in existing_keys:
                 db.add(wp)
                 added_count += 1
                 logger.info(f"Added missing template: {wp.key}")
+            else:
+                # Check if required_variables mismatch - force update if stale
+                result = await db.execute(
+                    select(WorkflowPromptTemplate)
+                    .where(WorkflowPromptTemplate.key == wp.key)
+                )
+                existing = result.scalar_one_or_none()
+                if existing:
+                    existing_vars = set(existing.required_variables or [])
+                    new_vars = set(wp.required_variables or [])
+                    if existing_vars != new_vars:
+                        logger.warning(
+                            f"Template '{wp.key}' has stale variables: "
+                            f"{list(existing_vars)} → {list(new_vars)}. "
+                            f"Force updating template_text and required_variables."
+                        )
+                        existing.required_variables = wp.required_variables
+                        existing.template_text = wp.template_text
+                        existing.name = wp.name
+                        existing.description = wp.description
+                        added_count += 1
 
         # Load existing preset keys
         result = await db.execute(
@@ -2595,6 +2648,7 @@ from app.services.llm_adapter import create_adapter, LLMAdapter
 from app.services.prompt_service import PromptService, PromptError
 from app.services.convergence_service import check_convergence, ConvergenceResult
 from app.services.semantic_service import SemanticService
+from app.services.prompt_serializer import BlockPhase
 
 logger = logging.getLogger('magi.debate_engine')
 logger.setLevel(logging.DEBUG)
@@ -2716,8 +2770,9 @@ class DebateEngine:
                 "data": {"step": self.step_number, "phase": "initial"}
             })
 
-            # Run semantic analysis after initial round
-            await self._run_semantic_analysis(round_number=1, phase="initial")
+            # Run semantic analysis in background - don't block the main flow
+            # Semantic analysis is for UI enrichment, not critical for debate logic
+            asyncio.create_task(self._run_semantic_analysis_safe(round_number=1, phase="initial"))
 
             # ===== REVIEW/REVISION CYCLES =====
             max_cycles = self.session.max_rounds or 3
@@ -2789,12 +2844,12 @@ class DebateEngine:
                     "data": {"step": self.step_number, "phase": "revision", "cycle": cycle}
                 })
 
-                # Run semantic analysis after revision
-                await self._run_semantic_analysis(
+                # Run semantic analysis in background - don't block the main flow
+                asyncio.create_task(self._run_semantic_analysis_safe(
                     round_number=self.step_number,
                     phase="revision",
                     cycle=cycle,
-                )
+                ))
 
                 # --- Convergence Check ---
                 if self.session.auto_stop:
@@ -2913,17 +2968,24 @@ class DebateEngine:
                 adapter = self.get_adapter(actor)
                 logger.info(f"Created adapter: {type(adapter).__name__}")
 
-                # Build system prompt from actor config + template
+                # Build system prompt from actor config
                 system_prompt = actor.system_prompt or f"You are {actor.name}, an AI assistant."
                 if actor.custom_instructions:
                     system_prompt += f"\n\n{actor.custom_instructions}"
+
+                # Get initial answer prompt from PromptService - NO fallback
+                initial_prompt = await self.prompt_service.get_initial_answer_prompt(
+                    question=self.session.question,
+                    actor_name=actor.name,
+                    actor_custom_prompt=None,  # Already included in system_prompt above
+                )
 
                 full_response = ""
                 logger.info(f"Calling stream_completion for {actor.name}...")
 
                 # Real streaming: emit each token
                 async for token in adapter.stream_completion(
-                    messages=[{"role": "user", "content": self.session.question}],
+                    messages=[{"role": "user", "content": initial_prompt}],
                     system_prompt=system_prompt,
                     max_tokens=actor.max_tokens,
                     temperature=actor.temperature,
@@ -2989,6 +3051,7 @@ class DebateEngine:
 
     async def _run_review_round(self, cycle: int, db_round: DBRound):
         """Run review round where each actor critiques others' answers"""
+        phase = BlockPhase.INITIAL if cycle == 1 else BlockPhase.REVISION
 
         # Get latest answers from each actor
         latest_answers = {}
@@ -3016,39 +3079,41 @@ class DebateEngine:
                 }
             })
 
-            # Get other actors' answers
-            other_responses = []
+            # Build self answer block
+            my_answer = latest_answers.get(actor.id, "")
+            self_answer_block = self.prompt_service.build_self_answer_block(
+                actor_name=actor.name,
+                content=my_answer,
+                phase=phase,
+            )
+
+            # Build peer answer blocks
+            peer_answers = []
             for aid, content in latest_answers.items():
                 if aid != actor.id:
                     other_actor = next((a for a in self.actors if a.id == aid), None)
                     if other_actor:
-                        other_responses.append(f"**{other_actor.name}**: {content}")
+                        peer_answers.append({
+                            "actor_name": other_actor.name,
+                            "content": content,
+                        })
 
-            my_answer = latest_answers.get(actor.id, "")
+            peer_answer_blocks = self.prompt_service.build_peer_answer_blocks(
+                answers=peer_answers,
+                phase=phase,
+            )
 
-            # Build review prompt using prompt_service
+            # Build review prompt using prompt_service - NO fallback allowed
             system_prompt = actor.review_prompt or f"You are {actor.name}. Provide a critical review."
             if actor.custom_instructions:
                 system_prompt += f"\n\n{actor.custom_instructions}"
 
-            try:
-                review_prompt = await self.prompt_service.get_review_prompt(
-                    question=self.session.question,
-                    own_answer=my_answer,
-                    other_answers="\n\n".join(other_responses),
-                )
-            except PromptError:
-                # Fallback to hardcoded prompt if template not found
-                review_prompt = f"""Original question: {self.session.question}
-
-Here are the responses from other participants:
-
-{chr(10).join(other_responses)}
-
-Please provide a critical review of these responses. Focus on:
-1. Key points you agree with
-2. Important points that were missed or incorrect
-3. Suggestions for improvement"""
+            review_prompt = await self.prompt_service.get_review_prompt(
+                question=self.session.question,
+                self_actor_name=actor.name,
+                self_answer_block=self_answer_block,
+                peer_answer_blocks=peer_answer_blocks,
+            )
 
             full_response = ""
             async for token in adapter.stream_completion(
@@ -3102,6 +3167,7 @@ Please provide a critical review of these responses. Focus on:
 
     async def _run_revision_round(self, cycle: int, review_round: DBRound, db_round: DBRound):
         """Run revision round where actors improve their answers"""
+        phase = BlockPhase.INITIAL if cycle == 1 else BlockPhase.REVISION
 
         # Get review messages
         result = await self.db.execute(
@@ -3135,42 +3201,42 @@ Please provide a critical review of these responses. Focus on:
                 }
             })
 
-            # Get reviews about this actor's response
-            reviews_about_me = []
+            # Build self previous answer block
+            my_answer = latest_answers.get(actor.id, "")
+            self_previous_answer_block = self.prompt_service.build_self_answer_block(
+                actor_name=actor.name,
+                content=my_answer,
+                phase=phase,
+            )
+
+            # Build peer review blocks (reviews about this actor)
+            peer_reviews = []
             for msg in review_messages:
                 if msg.actor_id != actor.id:
                     other_actor = next((a for a in self.actors if a.id == msg.actor_id), None)
                     if other_actor:
-                        reviews_about_me.append(f"**{other_actor.name}'s review**: {msg.content}")
+                        peer_reviews.append({
+                            "reviewer_name": other_actor.name,
+                            "about_actor_name": actor.name,
+                            "content": msg.content,
+                        })
 
-            my_answer = latest_answers.get(actor.id, "")
+            peer_review_blocks = self.prompt_service.build_peer_review_blocks(
+                reviews=peer_reviews,
+                phase=phase,
+            )
 
-            # Build revision prompt using prompt_service
+            # Build revision prompt using prompt_service - NO fallback allowed
             system_prompt = actor.revision_prompt or f"You are {actor.name}. Revise based on feedback."
             if actor.custom_instructions:
                 system_prompt += f"\n\n{actor.custom_instructions}"
 
-            try:
-                revision_prompt = await self.prompt_service.get_revision_prompt(
-                    question=self.session.question,
-                    own_answer=my_answer,
-                    reviews_about_me="\n\n".join(reviews_about_me),
-                )
-            except PromptError:
-                # Fallback to hardcoded prompt if template not found
-                revision_prompt = f"""Original question: {self.session.question}
-
-Your current response:
-{my_answer}
-
-Reviews from other participants:
-{chr(10).join(reviews_about_me)}
-
-Please revise your response to:
-1. Address valid critiques from the reviews
-2. Incorporate useful suggestions
-3. Maintain your unique perspective where appropriate
-4. Provide a more comprehensive and accurate answer"""
+            revision_prompt = await self.prompt_service.get_revision_prompt(
+                question=self.session.question,
+                self_actor_name=actor.name,
+                self_previous_answer_block=self_previous_answer_block,
+                peer_review_blocks=peer_review_blocks,
+            )
 
             full_response = ""
             async for token in adapter.stream_completion(
@@ -3239,7 +3305,24 @@ Please revise your response to:
             question=self.session.question,
             responses=latest_answers,
             threshold=self.session.convergence_threshold or 0.85,
+            prompt_service=self.prompt_service,  # REQUIRED - no hardcoded prompts
         )
+
+    async def _run_semantic_analysis_safe(self, round_number: int, phase: str, cycle: int = 0):
+        """
+        Safe wrapper for semantic analysis that runs in background.
+
+        This method catches all exceptions to prevent background task failures
+        from affecting the main debate flow. Semantic analysis is optional
+        enrichment for the UI and should not block or crash the debate.
+        """
+        try:
+            await self._run_semantic_analysis(round_number, phase, cycle)
+        except asyncio.CancelledError:
+            logger.info(f"Semantic analysis cancelled for round {round_number}, phase {phase}")
+        except Exception as e:
+            # Log but don't propagate - semantic analysis is optional
+            logger.error(f"Semantic analysis failed (non-blocking): {e}", exc_info=True)
 
     async def _run_semantic_analysis(self, round_number: int, phase: str, cycle: int = 0):
         """
@@ -3485,11 +3568,16 @@ Please revise your response to:
                     latest_answers[actor.id] = r["content"]
                     break
 
-        # Build answer list
-        answer_list = []
+        # Build actor answer blocks
+        actor_answers = []
         for actor in self.actors:
             content = latest_answers.get(actor.id, "")
-            answer_list.append(f"**{actor.name}**:\n{content}")
+            actor_answers.append({
+                "actor_name": actor.name,
+                "content": content,
+            })
+
+        actor_answer_blocks = self.prompt_service.build_latest_answer_blocks(actor_answers)
 
         # Build convergence info
         convergence_info = ""
@@ -3519,37 +3607,15 @@ Please revise your response to:
         await self.db.commit()
         await self.db.refresh(final_round)
 
-        # Build final answer prompt using prompt_service
+        # Build final answer prompt using prompt_service - NO fallback allowed
         system_prompt = judge.system_prompt or "你是一个专业的综合决策助手，输出简洁明了的最终回答。"
 
-        try:
-            final_answer_prompt = await self.prompt_service.get_final_answer_prompt(
-                question=self.session.question,
-                actor_answers="\n\n".join(answer_list),
-                convergence_info=convergence_info,
-            )
-        except PromptError:
-            # Fallback to hardcoded prompt if template not found
-            final_answer_prompt = f"""你是一个综合决策助手，需要基于多轮互评的结果，输出一篇面向用户的最终回答。
-
-## 原始问题
-
-{self.session.question}
-
-## 各参与者的最终回答
-
-{chr(10).join(answer_list)}
-{convergence_info}
-
-## 要求
-
-请直接回答用户的问题，要求：
-1. 优先采用已达成共识的观点
-2. 对仍有分歧的地方说明条件与不确定性
-3. 如果收敛度较低，给出分情境建议
-4. 使用清晰、自然的语言，不要使用 JSON 格式
-5. 直接给出最终回答，不要解释过程
-"""
+        final_answer_prompt = await self.prompt_service.get_final_answer_prompt(
+            question=self.session.question,
+            self_actor_name=judge.name,
+            actor_answer_blocks=actor_answer_blocks,
+            convergence_info=convergence_info,
+        )
 
         # Emit actor_start with judge's info
         await self._emit({
@@ -3609,8 +3675,11 @@ Please revise your response to:
         })
 
     async def _run_summary_phase(self, convergence_result: Optional[ConvergenceResult] = None):
-        """Run summary phase to synthesize final conclusion"""
+        """Run summary phase to synthesize final conclusion
 
+        Note: convergence_result is currently unused but kept for potential
+        future integration with summary templates.
+        """
         # Get judge actor
         result = await self.db.execute(
             select(Actor).where(Actor.id == self.session.judge_actor_id)
@@ -3623,38 +3692,23 @@ Please revise your response to:
 
         adapter = self.get_adapter(judge)
 
-        # Compile all history
-        history = f"**Original Question**: {self.session.question}\n\n"
-
+        # Build history blocks with actor attribution
+        history_items = []
         for actor in self.actors:
             responses = self.actor_responses.get(actor.id, [])
-            history += f"## {actor.name}\n\n"
             for r in responses:
-                role_label = {
-                    "answer": "Initial Answer",
-                    "review": "Review",
-                    "revision": "Revision",
-                    "final_answer": "Final Answer",
-                }.get(r.get("role"), r.get("role", "Response"))
-                cycle = r.get("cycle", 0)
-                history += f"### {role_label}" + (f" (Cycle {cycle})" if cycle > 0 else "") + "\n"
-                history += f"{r.get('content', '')}\n\n"
+                role = r.get("role", "response")
+                history_items.append({
+                    "actor_name": actor.name,
+                    "role": role,
+                    "cycle": r.get("cycle", 0),
+                    "content": r.get("content", ""),
+                })
 
-        # Add convergence info if available
-        convergence_info = ""
-        if convergence_result:
-            convergence_info = f"""
-## 收敛分析
-
-共识度: {round(convergence_result.score * 100)}%
-是否已收敛: {"是" if convergence_result.converged else "否"}
-
-已达成共识的观点:
-{chr(10).join(f"- {a}" for a in convergence_result.agreements) if convergence_result.agreements else "- 无"}
-
-仍存在分歧的观点:
-{chr(10).join(f"- {d}" for d in convergence_result.disagreements) if convergence_result.disagreements else "- 无"}
-"""
+        history_blocks = self.prompt_service.build_history_blocks(
+            history_items=history_items,
+            self_actor_name=judge.name,
+        )
 
         system_prompt = judge.system_prompt or "You are an impartial Meta Judge synthesizing multi-agent reviews. Always respond with valid JSON."
 
@@ -3668,32 +3722,12 @@ Please revise your response to:
         await self.db.commit()
         await self.db.refresh(summary_round)
 
-        # Build summary prompt using prompt_service
-        try:
-            summary_prompt = await self.prompt_service.get_summary_prompt(
-                question=self.session.question,
-                history=history,
-            )
-        except PromptError:
-            # Fallback to hardcoded prompt if template not found
-            summary_prompt = f"""Based on the following multi-agent review, please provide a comprehensive summary.
-{history}
-{convergence_info}
-Please provide:
-1. A concise summary of the key conclusions
-2. Points where all participants agreed
-3. Points where participants disagreed
-4. Your confidence level (0-1) in the consensus - only provide a number if you can make a confident assessment
-5. A final recommendation
-
-Format your response as JSON:
-{{
-  "summary": "...",
-  "agreements": ["point 1", "point 2"],
-  "disagreements": ["point 1"],
-  "confidence": <0.0-1.0 or omit if uncertain>,
-  "recommendation": "..."
-}}"""
+        # Build summary prompt using prompt_service - NO fallback allowed
+        summary_prompt = await self.prompt_service.get_summary_prompt(
+            question=self.session.question,
+            self_actor_name=judge.name,
+            history_blocks=history_blocks,
+        )
 
         # Emit judge start with judge's actual id
         await self._emit({
@@ -4047,6 +4081,231 @@ def create_adapter(
 ```
 
 
+### backend\app\services\prompt_serializer.py
+
+```python
+"""
+Prompt Serializer - Unified block serialization for self/peer disambiguation.
+
+This module provides structured XML-like blocks for LLM context, ensuring:
+1. All answers/reviews have explicit actor attribution
+2. Self vs peer materials are structurally symmetric
+3. No hardcoded model names in templates
+"""
+
+from typing import Optional
+from enum import Enum
+
+
+class BlockPhase(str, Enum):
+    """Phase of the debate."""
+    INITIAL = "initial"
+    REVISION = "revision"
+    FINAL = "final"
+
+
+class BlockRole(str, Enum):
+    """Role of the actor relative to the block content."""
+    SELF = "self"       # The current actor's own content
+    PEER = "peer"       # Another actor's content
+
+
+def serialize_answer_block(
+    actor_name: str,
+    phase: BlockPhase,
+    role: BlockRole,
+    content: str,
+) -> str:
+    """
+    Serialize an answer block with full actor attribution.
+
+    Args:
+        actor_name: The name of the actor who produced this answer
+        phase: The debate phase (initial, revision, final)
+        role: Whether this is self (current actor) or peer (other actor)
+        content: The answer text
+
+    Returns:
+        XML-like block string with actor attribution
+
+    Example output:
+        <answer actor_name="GLM" phase="initial" role="self">
+        ...content...
+        </answer>
+    """
+    return f'''<answer actor_name="{actor_name}" phase="{phase.value}" role="{role.value}">
+{content}
+</answer>'''
+
+
+def serialize_review_block(
+    reviewer_name: str,
+    about_actor_name: str,
+    phase: BlockPhase,
+    content: str,
+) -> str:
+    """
+    Serialize a review block with full attribution.
+
+    Args:
+        reviewer_name: The name of the actor who wrote the review
+        about_actor_name: The name of the actor being reviewed
+        phase: The debate phase
+        content: The review text
+
+    Returns:
+        XML-like block string with full attribution
+
+    Example output:
+        <review reviewer_name="DeepSeek" about_actor="GLM" phase="initial">
+        ...content...
+        </review>
+    """
+    return f'''<review reviewer_name="{reviewer_name}" about_actor="{about_actor_name}" phase="{phase.value}">
+{content}
+</review>'''
+
+
+def serialize_answer_blocks(
+    answers: list[dict],
+    self_actor_name: str,
+    phase: BlockPhase,
+) -> str:
+    """
+    Serialize multiple answer blocks, distinguishing self from peer.
+
+    Args:
+        answers: List of dicts with keys: actor_name, content
+        self_actor_name: The name of the current actor (to determine role)
+        phase: The debate phase
+
+    Returns:
+        Combined block strings separated by newlines
+    """
+    blocks = []
+    for ans in answers:
+        role = BlockRole.SELF if ans["actor_name"] == self_actor_name else BlockRole.PEER
+        blocks.append(serialize_answer_block(
+            actor_name=ans["actor_name"],
+            phase=phase,
+            role=role,
+            content=ans["content"],
+        ))
+    return "\n\n".join(blocks)
+
+
+def serialize_peer_answer_blocks(
+    answers: list[dict],
+    phase: BlockPhase,
+) -> str:
+    """
+    Serialize peer answer blocks (all marked as peer role).
+
+    Args:
+        answers: List of dicts with keys: actor_name, content
+        phase: The debate phase
+
+    Returns:
+        Combined block strings
+    """
+    blocks = []
+    for ans in answers:
+        blocks.append(serialize_answer_block(
+            actor_name=ans["actor_name"],
+            phase=phase,
+            role=BlockRole.PEER,
+            content=ans["content"],
+        ))
+    return "\n\n".join(blocks)
+
+
+def serialize_peer_review_blocks(
+    reviews: list[dict],
+    phase: BlockPhase,
+) -> str:
+    """
+    Serialize peer review blocks.
+
+    Args:
+        reviews: List of dicts with keys: reviewer_name, about_actor_name, content
+        phase: The debate phase
+
+    Returns:
+        Combined block strings
+    """
+    blocks = []
+    for rev in reviews:
+        blocks.append(serialize_review_block(
+            reviewer_name=rev["reviewer_name"],
+            about_actor_name=rev["about_actor_name"],
+            phase=phase,
+            content=rev["content"],
+        ))
+    return "\n\n".join(blocks)
+
+
+def serialize_history_blocks(
+    history_items: list[dict],
+    self_actor_name: str,
+) -> str:
+    """
+    Serialize history blocks for summary phase.
+
+    Args:
+        history_items: List of dicts with keys: actor_name, role, cycle, content
+        self_actor_name: The name of the current actor viewing history
+
+    Returns:
+        Combined block strings
+    """
+    blocks = []
+    for item in history_items:
+        role = BlockRole.SELF if item["actor_name"] == self_actor_name else BlockRole.PEER
+        phase = BlockPhase.INITIAL if item.get("cycle", 0) == 0 else BlockPhase.REVISION
+
+        if item.get("role") == "review":
+            # Review block
+            blocks.append(serialize_review_block(
+                reviewer_name=item["actor_name"],
+                about_actor_name=item.get("about_actor_name", "unknown"),
+                phase=phase,
+                content=item["content"],
+            ))
+        else:
+            # Answer block
+            blocks.append(serialize_answer_block(
+                actor_name=item["actor_name"],
+                phase=phase,
+                role=role,
+                content=item["content"],
+            ))
+    return "\n\n".join(blocks)
+
+
+def serialize_latest_answer_blocks(
+    answers: list[dict],
+) -> str:
+    """
+    Serialize latest answer blocks for convergence check.
+
+    Args:
+        answers: List of dicts with keys: actor_name, content
+
+    Returns:
+        Combined block strings (all as peer role for neutrality)
+    """
+    blocks = []
+    for ans in answers:
+        blocks.append(serialize_answer_block(
+            actor_name=ans["actor_name"],
+            phase=BlockPhase.FINAL,
+            role=BlockRole.PEER,  # Neutral for convergence check
+            content=ans["content"],
+        ))
+    return "\n\n".join(blocks)
+```
+
+
 ### backend\app\services\prompt_service.py
 
 ```python
@@ -4063,6 +4322,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.models.database import WorkflowPromptTemplate, PromptPreset
+from app.services.prompt_serializer import (
+    BlockPhase,
+    serialize_answer_block,
+    serialize_peer_answer_blocks,
+    serialize_peer_review_blocks,
+    serialize_latest_answer_blocks,
+    serialize_history_blocks,
+    BlockRole,
+)
 
 logger = logging.getLogger('magi.prompts')
 
@@ -4195,65 +4463,169 @@ class PromptService:
     async def get_review_prompt(
         self,
         question: str,
-        own_answer: str,
-        other_answers: str,
-        actor_custom_prompt: Optional[str] = None,
+        self_actor_name: str,
+        self_answer_block: str,
+        peer_answer_blocks: str,
     ) -> str:
-        """Get the prompt for peer review phase."""
+        """Get the prompt for peer review phase.
+
+        Args:
+            question: The original question
+            self_actor_name: Name of the current actor
+            self_answer_block: Serialized block of the actor's own answer
+            peer_answer_blocks: Serialized blocks of peer answers
+        """
         return await self.render_template("peer_review", {
             "question": question,
-            "own_answer": own_answer,
-            "other_answers": other_answers,
+            "self_actor_name": self_actor_name,
+            "self_answer_block": self_answer_block,
+            "peer_answer_blocks": peer_answer_blocks,
         })
 
     async def get_revision_prompt(
         self,
         question: str,
-        own_answer: str,
-        reviews_about_me: str,
-        actor_custom_prompt: Optional[str] = None,
+        self_actor_name: str,
+        self_previous_answer_block: str,
+        peer_review_blocks: str,
     ) -> str:
-        """Get the prompt for revision phase."""
+        """Get the prompt for revision phase.
+
+        Args:
+            question: The original question
+            self_actor_name: Name of the current actor
+            self_previous_answer_block: Serialized block of the actor's previous answer
+            peer_review_blocks: Serialized blocks of peer reviews about this actor
+        """
         return await self.render_template("revision", {
             "question": question,
-            "own_answer": own_answer,
-            "reviews_about_me": reviews_about_me,
+            "self_actor_name": self_actor_name,
+            "self_previous_answer_block": self_previous_answer_block,
+            "peer_review_blocks": peer_review_blocks,
         })
 
     async def get_summary_prompt(
         self,
         question: str,
-        history: str,
+        self_actor_name: str,
+        history_blocks: str,
     ) -> str:
-        """Get the prompt for summary phase."""
+        """Get the prompt for summary phase.
+
+        Args:
+            question: The original question
+            self_actor_name: Name of the judge actor
+            history_blocks: Serialized blocks of all history
+        """
         return await self.render_template("summary", {
             "question": question,
-            "history": history,
+            "self_actor_name": self_actor_name,
+            "history_blocks": history_blocks,
         })
 
     async def get_convergence_prompt(
         self,
         question: str,
-        latest_answers: str,
+        latest_answer_blocks: str,
     ) -> str:
-        """Get the prompt for convergence check."""
+        """Get the prompt for convergence check.
+
+        Args:
+            question: The original question
+            latest_answer_blocks: Serialized blocks of all latest answers
+        """
         return await self.render_template("convergence_check", {
             "question": question,
-            "latest_answers": latest_answers,
+            "latest_answer_blocks": latest_answer_blocks,
         })
 
     async def get_final_answer_prompt(
         self,
         question: str,
-        actor_answers: str,
+        self_actor_name: str,
+        actor_answer_blocks: str,
         convergence_info: str = "",
     ) -> str:
-        """Get the prompt for final answer phase."""
+        """Get the prompt for final answer phase.
+
+        Args:
+            question: The original question
+            self_actor_name: Name of the judge actor
+            actor_answer_blocks: Serialized blocks of all actor answers
+            convergence_info: Convergence analysis results
+        """
         return await self.render_template("final_answer", {
             "question": question,
-            "actor_answers": actor_answers,
+            "self_actor_name": self_actor_name,
+            "actor_answer_blocks": actor_answer_blocks,
             "convergence_info": convergence_info,
         })
+
+    # === Helper methods for serialization ===
+
+    def build_self_answer_block(
+        self,
+        actor_name: str,
+        content: str,
+        phase: BlockPhase = BlockPhase.INITIAL,
+    ) -> str:
+        """Build a self answer block for the current actor."""
+        return serialize_answer_block(
+            actor_name=actor_name,
+            phase=phase,
+            role=BlockRole.SELF,
+            content=content,
+        )
+
+    def build_peer_answer_blocks(
+        self,
+        answers: list[dict],
+        phase: BlockPhase = BlockPhase.INITIAL,
+    ) -> str:
+        """Build peer answer blocks from a list of answers.
+
+        Args:
+            answers: List of dicts with keys: actor_name, content
+            phase: The debate phase
+        """
+        return serialize_peer_answer_blocks(answers, phase)
+
+    def build_peer_review_blocks(
+        self,
+        reviews: list[dict],
+        phase: BlockPhase = BlockPhase.INITIAL,
+    ) -> str:
+        """Build peer review blocks from a list of reviews.
+
+        Args:
+            reviews: List of dicts with keys: reviewer_name, about_actor_name, content
+            phase: The debate phase
+        """
+        return serialize_peer_review_blocks(reviews, phase)
+
+    def build_latest_answer_blocks(
+        self,
+        answers: list[dict],
+    ) -> str:
+        """Build latest answer blocks for convergence check.
+
+        Args:
+            answers: List of dicts with keys: actor_name, content
+        """
+        return serialize_latest_answer_blocks(answers)
+
+    def build_history_blocks(
+        self,
+        history_items: list[dict],
+        self_actor_name: str,
+    ) -> str:
+        """Build history blocks for summary phase.
+
+        Args:
+            history_items: List of dicts with keys: actor_name, role, cycle, content
+            self_actor_name: Name of the actor viewing the history
+        """
+        return serialize_history_blocks(history_items, self_actor_name)
 ```
 
 
@@ -4281,9 +4653,8 @@ from app.models.database import (
     QuestionIntent,
     SemanticTopic,
     SemanticComparison,
-    WorkflowPromptTemplate,
 )
-from app.services.llm_adapter import create_adapter, LLMAdapter
+from app.services.llm_adapter import LLMAdapter
 from app.services.prompt_service import PromptService
 
 logger = logging.getLogger('magi.semantic')
@@ -4372,105 +4743,16 @@ class SemanticService:
     def __init__(self, db: AsyncSession, prompt_service: PromptService):
         self.db = db
         self.prompt_service = prompt_service
-        self._intent_template: Optional[WorkflowPromptTemplate] = None
-        self._extraction_template: Optional[WorkflowPromptTemplate] = None
-        self._compare_template: Optional[WorkflowPromptTemplate] = None
+        # Templates are loaded via PromptService, no direct template storage needed
 
     async def _load_templates(self):
-        """Load prompt templates from database."""
-        if not self._intent_template:
-            try:
-                self._intent_template = await self.prompt_service.get_template("question_intent_analysis")
-            except:
-                logger.warning("question_intent_analysis template not found, using fallback")
+        """Load prompt templates from database via PromptService.
 
-        if not self._extraction_template:
-            try:
-                self._extraction_template = await self.prompt_service.get_template("semantic_extraction")
-            except:
-                logger.warning("semantic_extraction template not found, using fallback")
-
-        if not self._compare_template:
-            try:
-                self._compare_template = await self.prompt_service.get_template("cross_actor_compare")
-            except:
-                logger.warning("cross_actor_compare template not found, using fallback")
-
-    def _get_fallback_intent_prompt(self, question: str) -> str:
-        """Fallback prompt for question intent analysis."""
-        return f"""你是一个问题分析专家。请分析以下问题，提取其核心意图和比较维度。
-
-问题：{question}
-
-请以 JSON 格式返回：
-{{
-  "question_type": "问题类型（如 investment_decision, analysis, comparison 等）",
-  "user_goal": "用户的核心目标",
-  "time_horizons": ["短期", "中期", "长期"],
-  "comparison_axes": [
-    {{"axis_id": "维度ID", "label": "维度名称"}}
-  ]
-}}
-
-只返回 JSON，不要其他文字。"""
-
-    def _get_fallback_extraction_prompt(self, question: str, answer: str, axes: list[dict]) -> str:
-        """Fallback prompt for semantic extraction."""
-        axes_text = "\n".join([f"- {a.get('axis_id', a.get('label', ''))}: {a.get('label', '')}" for a in axes])
-
-        return f"""你是一个语义分析专家。请分析以下回答，提取其核心主题和立场。
-
-问题：{question}
-
-回答：{answer}
-
-可用的比较维度（axis_id必须从以下列表中选择）：
-{axes_text}
-
-请以 JSON 格式返回该回答的主题：
-{{
-  "topics": [
-    {{
-      "topic_id": "主题标识（唯一ID）",
-      "axis_id": "必须从上面的比较维度列表中选择一个axis_id",
-      "label": "主题名称",
-      "summary": "观点摘要（一句话）",
-      "stance": "立场标签（如：保守、激进、中立）",
-      "time_horizon": "时间维度（short/medium/long）",
-      "risk_level": "风险偏好（low/medium/high）",
-      "novelty": "观点新颖度（low/medium/high）",
-      "quotes": ["原文中支持该观点的引用"]
-    }}
-  ]
-}}
-
-重要：axis_id 必须严格从给定的比较维度列表中选择，不能自己编造。只返回 JSON，不要其他文字。"""
-
-    def _get_fallback_compare_prompt(self, topic_label: str, positions: list[dict]) -> str:
-        """Fallback prompt for cross-actor comparison."""
-        positions_text = "\n\n".join([
-            f"**{p.get('actor_name', 'Unknown')}**: {p.get('summary', '')}"
-            for p in positions
-        ])
-
-        return f"""你是一个观点比较专家。请比较以下多个回答在同一主题上的差异。
-
-主题：{topic_label}
-
-各回答的观点：
-{positions_text}
-
-请以 JSON 格式返回：
-{{
-  "salience": "<0.0-1.0之间的小数，表示该主题的重要性>",
-  "disagreement_score": "<0.0-1.0之间的小数，0表示完全一致，1表示完全分歧>",
-  "status": "converged/divergent/partial",
-  "difference_types": ["solution_class", "time_horizon", "risk_preference"],
-  "agreement_summary": "一致点",
-  "disagreement_summary": "分歧点"
-}}
-
-只返回 JSON，不要其他文字。"""
+        Raises PromptError if templates are missing - NO fallback allowed.
+        """
+        # Templates are loaded on-demand via prompt_service.get_template()
+        # This method exists for compatibility but doesn't store templates locally
+        pass
 
     async def analyze_question_intent(
         self,
@@ -4487,15 +4769,10 @@ class SemanticService:
         Returns:
             QuestionIntentResult with comparison axes
         """
-        await self._load_templates()
-
-        # Build prompt
-        if self._intent_template:
-            prompt = self.prompt_service.render(self._intent_template.template_text, {
-                "question": question,
-            })
-        else:
-            prompt = self._get_fallback_intent_prompt(question)
+        # Get prompt from PromptService - NO fallback allowed
+        prompt = await self.prompt_service.render_template("question_intent_analysis", {
+            "question": question,
+        })
 
         # Call LLM
         full_response = ""
@@ -4553,23 +4830,18 @@ class SemanticService:
         Returns:
             List of TopicResult
         """
-        await self._load_templates()
-
         if not comparison_axes:
             comparison_axes = [
                 {"axis_id": "main_topic", "label": "核心观点"},
                 {"axis_id": "approach", "label": "解决思路"},
             ]
 
-        # Build prompt
-        if self._extraction_template:
-            prompt = self.prompt_service.render(self._extraction_template.template_text, {
-                "question": question,
-                "answer": answer,
-                "comparison_axes": json.dumps(comparison_axes, ensure_ascii=False),
-            })
-        else:
-            prompt = self._get_fallback_extraction_prompt(question, answer, comparison_axes)
+        # Get prompt from PromptService - NO fallback allowed
+        prompt = await self.prompt_service.render_template("semantic_extraction", {
+            "question": question,
+            "answer": answer,
+            "comparison_axes": json.dumps(comparison_axes, ensure_ascii=False),
+        })
 
         # Call LLM
         full_response = ""
@@ -4623,7 +4895,7 @@ class SemanticService:
 
     async def compare_actors(
         self,
-        question: str,
+        question: str,  # noqa: ARG002 - kept for potential future use
         topics_by_actor: dict[str, list[TopicResult]],
         actors: list[Actor],
         adapter: LLMAdapter,
@@ -4644,8 +4916,6 @@ class SemanticService:
         axis_id comes from the comparison_axes extracted from question intent,
         providing a stable cross-actor alignment coordinate.
         """
-        await self._load_templates()
-
         # Build actor lookup
         actor_map = {a.id: a for a in actors}
 
@@ -4687,14 +4957,11 @@ class SemanticService:
                     "quotes": topic.quotes[:2] if topic.quotes else [],
                 })
 
-            # Call LLM for comparison
-            if self._compare_template:
-                prompt = self.prompt_service.render(self._compare_template.template_text, {
-                    "topic_label": label,
-                    "actor_positions": json.dumps(positions, ensure_ascii=False),
-                })
-            else:
-                prompt = self._get_fallback_compare_prompt(label, positions)
+            # Call LLM for comparison - NO fallback allowed
+            prompt = await self.prompt_service.render_template("cross_actor_compare", {
+                "topic_label": label,
+                "actor_positions": json.dumps(positions, ensure_ascii=False),
+            })
 
             try:
                 full_response = ""
@@ -4793,7 +5060,7 @@ class SemanticService:
         phase: str,
         actor_id: str,
         topics: list[TopicResult],
-        cycle: int = 0,
+        cycle: int = 0,  # noqa: ARG002 - kept for API consistency
     ) -> list[SemanticTopic]:
         """Save semantic topics to database."""
         db_topics = []
@@ -4825,7 +5092,7 @@ class SemanticService:
         round_number: int,
         phase: str,
         comparisons: list[TopicComparisonResult],
-        cycle: int = 0,
+        cycle: int = 0,  # noqa: ARG002 - kept for API consistency
     ) -> list[SemanticComparison]:
         """Save semantic comparisons to database."""
         db_comparisons = []
@@ -5873,6 +6140,7 @@ import SessionHistory from './SessionHistory'
 import SettingsView from './SettingsView'
 import SessionDetailView from './SessionDetailView'
 import ProgressBar from './ProgressBar'
+import QuestionBox from './QuestionBox'
 import { apiClient } from '@/lib/apiClient'
 
 type View = 'arena' | 'debate' | 'actors' | 'history' | 'settings' | 'sessionDetail'
@@ -5884,33 +6152,44 @@ export default function Arena() {
   const [recentSessions, setRecentSessions] = useState<SessionListItem[]>([])
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null)
 
-  const {
-    actors,
-    selectedActors,
-    judgeActorId,
-    fetchActors,
-    selectActor,
-    deselectActor,
-    setJudgeActor,
-  } = useActorStore()
+  // Actor store - separate selectors for different data
+  const actors = useActorStore((state) => state.actors)
+  const selectedActors = useActorStore((state) => state.selectedActors)
+  const judgeActorId = useActorStore((state) => state.judgeActorId)
+  const fetchActors = useActorStore((state) => state.fetchActors)
+  const selectActor = useActorStore((state) => state.selectActor)
+  const deselectActor = useActorStore((state) => state.deselectActor)
+  const setJudgeActor = useActorStore((state) => state.setJudgeActor)
 
-  const {
-    status,
-    currentPhase,
-    currentSession,
-    currentSessionId,
-    phaseHistory,
-    selectedDiffPhaseId,
-    selectDiffPhase,
-    semanticComparisons,
-    selectedTopicId,
-    selectTopic,
-    startDebate,
-    stopDebate,
-    reset,
-    error,
-    progress,
-  } = useDebateStore()
+  // Debate store - use individual selectors to minimize re-renders
+  // Status and error are frequently checked but change less often during streaming
+  const status = useDebateStore((state) => state.status)
+  const error = useDebateStore((state) => state.error)
+  const currentPhase = useDebateStore((state) => state.currentPhase)
+
+  // Session-related state - only changes at start/end
+  const currentSession = useDebateStore((state) => state.currentSession)
+
+  // Phase history - changes frequently during streaming
+  const phaseHistory = useDebateStore((state) => state.phaseHistory)
+  const currentPhaseRecord = useDebateStore((state) => state.currentPhaseRecord)
+
+  // Diff selection - changes when user interacts with diff sidebar
+  const selectedDiffPhaseId = useDebateStore((state) => state.selectedDiffPhaseId)
+  const selectDiffPhase = useDebateStore((state) => state.selectDiffPhase)
+
+  // Semantic state
+  const semanticComparisons = useDebateStore((state) => state.semanticComparisons)
+  const selectedTopicId = useDebateStore((state) => state.selectedTopicId)
+  const selectTopic = useDebateStore((state) => state.selectTopic)
+
+  // Progress state
+  const progress = useDebateStore((state) => state.progress)
+
+  // Actions - stable references
+  const startDebate = useDebateStore((state) => state.startDebate)
+  const stopDebate = useDebateStore((state) => state.stopDebate)
+  const reset = useDebateStore((state) => state.reset)
 
   const inputRef = useRef<HTMLTextAreaElement>(null)
 
@@ -5995,11 +6274,8 @@ export default function Arena() {
         {/* Debate content - main area with fixed height */}
         <main className="flex-1 overflow-hidden">
           <div className="h-full max-w-[1600px] mx-auto px-6 py-4 flex flex-col">
-            {/* Question - fixed at top */}
-            <div className="mb-4 shrink-0">
-              <h2 className="text-lg text-text-secondary mb-1">问题</h2>
-              <p className="text-xl font-medium">{question}</p>
-            </div>
+            {/* Question - collapsible for long questions */}
+            <QuestionBox question={question} />
 
             {/* Status - fixed */}
             <div className="mb-4 flex items-center gap-4 shrink-0">
@@ -6038,9 +6314,11 @@ export default function Arena() {
                   actors={selectedActorObjects}
                   judgeActor={judgeActor}
                   phaseHistory={phaseHistory}
+                  currentPhaseRecord={currentPhaseRecord}
                   selectedDiffPhaseId={selectedDiffPhaseId}
                   onSelectDiffPhase={selectDiffPhase}
                   status={status}
+                  currentPhase={currentPhase}
                   question={question}
                   semanticComparisons={semanticComparisons}
                   selectedTopicId={selectedTopicId}
@@ -6373,14 +6651,17 @@ import { Actor, LivePhaseRecord, TopicComparison, Consensus } from '@/types'
 import ReviewChatView from './ReviewChatView'
 import SemanticSidebar from './SemanticSidebar'
 import DiffSidebar from './DiffSidebar'
+import MiniMagiMonitor from './MiniMagiMonitor'
 
 interface DebateViewProps {
   actors: Actor[]
   judgeActor?: Actor
   phaseHistory: LivePhaseRecord[]
+  currentPhaseRecord?: LivePhaseRecord | null
   selectedDiffPhaseId: string | null
   onSelectDiffPhase: (phaseId: string | null) => void
   status: string
+  currentPhase: string
   question?: string
   semanticComparisons?: Map<string, TopicComparison[]>
   selectedTopicId?: string | null
@@ -6394,9 +6675,11 @@ export default function DebateView({
   actors,
   judgeActor,
   phaseHistory,
+  currentPhaseRecord,
   selectedDiffPhaseId,
   onSelectDiffPhase,
   status,
+  currentPhase,
   question = '',
   semanticComparisons = new Map(),
   selectedTopicId = null,
@@ -6452,7 +6735,18 @@ export default function DebateView({
       </div>
 
       {/* Right sidebar with tabs - scrolls independently */}
-      <div className="w-80 lg:w-[420px] shrink-0 border-l border-border">
+      <div className="w-80 lg:w-[420px] shrink-0 border-l border-border flex flex-col">
+        {/* Mini MAGI Monitor - always visible at top */}
+        <MiniMagiMonitor
+          status={status as 'idle' | 'connecting' | 'streaming' | 'completed' | 'error'}
+          currentPhase={currentPhase}
+          currentPhaseRecord={currentPhaseRecord || null}
+          phaseHistory={phaseHistory}
+          actors={actors}
+          judgeActor={judgeActor}
+          semanticComparisons={semanticComparisons}
+        />
+
         {/* Tab header */}
         <div className="flex border-b border-border bg-bg-secondary shrink-0">
           <button
@@ -6478,7 +6772,7 @@ export default function DebateView({
         </div>
 
         {/* Tab content */}
-        <div className="h-[calc(100%-40px)] overflow-hidden">
+        <div className="flex-1 overflow-hidden min-h-0">
           {sidebarTab === 'semantic' ? (
             <SemanticSidebar
               phaseHistory={phaseHistory}
@@ -6488,6 +6782,9 @@ export default function DebateView({
               selectedTopicId={selectedTopicId}
               onSelectTopic={onSelectTopic || (() => {})}
               onSwitchToDiffTab={() => setSidebarTab('diff')}
+              status={status}
+              currentPhase={currentPhase}
+              currentPhaseRecord={currentPhaseRecord}
             />
           ) : (
             <DiffSidebar
@@ -6514,7 +6811,7 @@ export default function DebateView({
 ```tsx
 'use client'
 
-import { useMemo } from 'react'
+import { useMemo, useRef, useEffect, useState } from 'react'
 import { Actor, LivePhaseRecord, LivePhaseType } from '@/types'
 import { computeDiff, computeDiffStats, canShowDiff, DiffLine } from '@/lib/reviewDiff'
 
@@ -6545,6 +6842,22 @@ function getPhaseLabel(record: LivePhaseRecord): string {
   return base
 }
 
+// Simple diff cache to avoid recomputing on every render
+const diffCache = new Map<string, { result: DiffLine[], timestamp: number }>()
+const CACHE_TTL = 30000 // 30 seconds
+
+function getCachedDiff(key: string): DiffLine[] | null {
+  const cached = diffCache.get(key)
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+    return cached.result
+  }
+  return null
+}
+
+function setCachedDiff(key: string, result: DiffLine[]) {
+  diffCache.set(key, { result, timestamp: Date.now() })
+}
+
 export default function DiffSidebar({
   actors,
   phaseHistory,
@@ -6555,6 +6868,13 @@ export default function DiffSidebar({
   onSelectBase,
   onSelectCompare,
 }: DiffSidebarProps) {
+  // Debounce state for diff computation
+  const [debouncedContent, setDebouncedContent] = useState<{ base: string | null; compare: string | null }>({
+    base: null,
+    compare: null,
+  })
+  const debounceTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
   // Get comparable phases (phases with at least 2 actors with content)
   const comparablePhases = useMemo(() => {
     return phaseHistory.filter((record) => {
@@ -6587,22 +6907,62 @@ export default function DiffSidebar({
     return selectedPhase.messages[selectedCompareId]?.content || null
   }, [selectedPhase, selectedCompareId])
 
-  // Check if streaming
-  const isBaseStreaming = useMemo(() => {
-    if (!selectedPhase || !selectedBaseId) return false
-    return selectedPhase.messages[selectedBaseId]?.status === 'streaming'
-  }, [selectedPhase, selectedBaseId])
+  // Check if streaming - if any actor in the selected phase is streaming
+  const isStreaming = useMemo(() => {
+    if (!selectedPhase) return false
+    return Object.values(selectedPhase.messages).some((msg) => msg.status === 'streaming')
+  }, [selectedPhase])
 
-  const isCompareStreaming = useMemo(() => {
-    if (!selectedPhase || !selectedCompareId) return false
-    return selectedPhase.messages[selectedCompareId]?.status === 'streaming'
-  }, [selectedPhase, selectedCompareId])
+  // Debounce content updates during streaming to avoid excessive diff recomputation
+  useEffect(() => {
+    // Clear existing timeout
+    if (debounceTimeoutRef.current) {
+      clearTimeout(debounceTimeoutRef.current)
+    }
 
-  // Compute diff
+    // During streaming, debounce more aggressively
+    const delay = isStreaming ? 300 : 100
+
+    debounceTimeoutRef.current = setTimeout(() => {
+      setDebouncedContent({ base: baseContent, compare: compareContent })
+    }, delay)
+
+    return () => {
+      if (debounceTimeoutRef.current) {
+        clearTimeout(debounceTimeoutRef.current)
+      }
+    }
+  }, [baseContent, compareContent, isStreaming])
+
+  // Compute diff with caching
   const diffResult = useMemo(() => {
-    if (!canShowDiff(baseContent, compareContent)) return null
-    return computeDiff(baseContent!, compareContent!)
-  }, [baseContent, compareContent])
+    // Don't compute diff while streaming (unless we have cached result)
+    if (isStreaming) {
+      // Try to get cached result
+      if (selectedPhase && selectedBaseId && selectedCompareId) {
+        const cacheKey = `${selectedPhase.id}:${selectedBaseId}:${selectedCompareId}`
+        const cached = getCachedDiff(cacheKey)
+        if (cached) return cached
+      }
+      return null
+    }
+
+    if (!canShowDiff(debouncedContent.base, debouncedContent.compare)) return null
+
+    // Check cache first
+    if (selectedPhase && selectedBaseId && selectedCompareId) {
+      const cacheKey = `${selectedPhase.id}:${selectedBaseId}:${selectedCompareId}`
+      const cached = getCachedDiff(cacheKey)
+      if (cached) return cached
+
+      // Compute and cache
+      const result = computeDiff(debouncedContent.base!, debouncedContent.compare!)
+      setCachedDiff(cacheKey, result)
+      return result
+    }
+
+    return computeDiff(debouncedContent.base!, debouncedContent.compare!)
+  }, [debouncedContent.base, debouncedContent.compare, isStreaming, selectedPhase, selectedBaseId, selectedCompareId])
 
   // Compute stats
   const stats = useMemo(() => {
@@ -6703,22 +7063,16 @@ export default function DiffSidebar({
           <div className="text-text-tertiary text-xs text-center py-8">
             选中的 Actor 在该阶段暂无内容
           </div>
-        ) : isBaseStreaming || isCompareStreaming ? (
+        ) : isStreaming ? (
+          // During streaming, show a simple message instead of computing diff
+          // This significantly improves performance and prevents UI freezes
           <div className="space-y-3">
-            {/* Show partial diff while streaming */}
-            <div className="text-text-tertiary text-xs text-center">
-              正在生成内容...
-            </div>
-            {diffResult && diffResult.length > 0 && (
-              <div className="font-mono text-xs space-y-0.5">
-                {diffResult.slice(0, 20).map((item, idx) => (
-                  <DiffLineComponent key={idx} item={item} />
-                ))}
-                {diffResult.length > 20 && (
-                  <div className="text-text-tertiary text-center">...</div>
-                )}
+            <div className="text-text-tertiary text-xs text-center py-4">
+              <div className="animate-pulse mb-2">⏳ 正在生成内容...</div>
+              <div className="text-text-tertiary/60">
+                内容稳定后将显示差异对比
               </div>
-            )}
+            </div>
           </div>
         ) : diffResult && diffResult.length > 0 ? (
           <div className="font-mono text-xs space-y-0.5">
@@ -6777,6 +7131,8 @@ export { default as SessionDetailView } from './SessionDetailView'
 export { default as ReviewChatView } from './ReviewChatView'
 export { default as DiffSidebar } from './DiffSidebar'
 export { default as MarkdownBlock } from './MarkdownBlock'
+export { default as MiniMagiMonitor } from './MiniMagiMonitor'
+export { default as ProgressBar } from './ProgressBar'
 ```
 
 
@@ -6926,6 +7282,391 @@ export default function MarkdownBlock({ content, className = '' }: MarkdownBlock
 ```
 
 
+### frontend\src\components\MiniMagiMonitor.tsx
+
+```tsx
+'use client'
+
+import { useMemo } from 'react'
+import { Actor, LivePhaseRecord } from '@/types'
+
+// Phase labels and explanations
+const phaseInfo: Record<string, { label: string; explanation: string }> = {
+  connecting: {
+    label: '提訴受理',
+    explanation: '系统正在初始化本次评审流程',
+  },
+  initial: {
+    label: '初始回答中',
+    explanation: '每个模型先独立回答问题',
+  },
+  review: {
+    label: '交叉互评中',
+    explanation: '模型之间正在指出彼此的盲点与漏洞',
+  },
+  revision: {
+    label: '修订整合中',
+    explanation: '模型正在根据批评修正观点',
+  },
+  semantic_pending: {
+    label: '语义图谱构建中',
+    explanation: '系统正在提炼核心共识与分歧维度',
+  },
+  final_answer: {
+    label: '最终回答生成中',
+    explanation: '总结模型正在整合多方观点',
+  },
+  summary: {
+    label: '共识裁决中',
+    explanation: '系统正在生成结构化共识报告',
+  },
+  completed: {
+    label: '决议完成',
+    explanation: '本次互评已完成',
+  },
+  error: {
+    label: '系统异常',
+    explanation: '本次流程发生错误',
+  },
+}
+
+type NodeState = 'idle' | 'thinking' | 'done' | 'error' | 'judge_active'
+
+interface MiniMagiMonitorProps {
+  status: 'idle' | 'connecting' | 'streaming' | 'completed' | 'error'
+  currentPhase: string
+  currentPhaseRecord: LivePhaseRecord | null
+  phaseHistory: LivePhaseRecord[]
+  actors: Actor[]
+  judgeActor?: Actor
+  semanticComparisons?: Map<string, unknown[]>
+}
+
+// Derive node state from real data
+function getNodeState(
+  actorId: string,
+  phaseRecord: LivePhaseRecord | null,
+  isJudge: boolean,
+  currentPhase: string,
+  status: string
+): NodeState {
+  // If error state
+  if (status === 'error') {
+    return 'error'
+  }
+
+  // If completed
+  if (status === 'completed') {
+    return 'done'
+  }
+
+  // If connecting
+  if (status === 'connecting') {
+    return 'idle'
+  }
+
+  // If not streaming or no phase record
+  if (status !== 'streaming' || !phaseRecord) {
+    return 'idle'
+  }
+
+  // For judge in final_answer or summary phase
+  if (isJudge && (currentPhase === 'final_answer' || currentPhase === 'summary')) {
+    const judgeMessage = phaseRecord.messages[actorId]
+    if (judgeMessage) {
+      return judgeMessage.status === 'streaming' ? 'judge_active' : 'done'
+    }
+    // Judge hasn't started yet but we're in its phase
+    return 'judge_active'
+  }
+
+  // For non-judge actors
+  const message = phaseRecord.messages[actorId]
+  if (!message) {
+    return 'idle'
+  }
+
+  return message.status === 'streaming' ? 'thinking' : 'done'
+}
+
+export default function MiniMagiMonitor({
+  status,
+  currentPhase,
+  currentPhaseRecord,
+  phaseHistory,
+  actors,
+  judgeActor,
+}: MiniMagiMonitorProps) {
+  // Get non-judge actors
+  const debateActors = useMemo(() => {
+    return actors.filter(a => !a.is_meta_judge)
+  }, [actors])
+
+  // Determine current phase info
+  const phaseData = useMemo(() => {
+    // Check if we should show semantic pending state
+    // This happens when:
+    // 1. Current phase is initial or revision
+    // 2. Phase has ended (no actors streaming)
+    // 3. No semantic data yet
+    // 4. Status is still streaming
+
+    const isWaitingForSemantic =
+      status === 'streaming' &&
+      ['initial', 'revision'].includes(currentPhase) &&
+      currentPhaseRecord &&
+      Object.values(currentPhaseRecord.messages).every(m => m.status === 'done')
+
+    if (isWaitingForSemantic) {
+      return phaseInfo['semantic_pending']
+    }
+
+    if (status === 'connecting') {
+      return phaseInfo['connecting']
+    }
+
+    if (status === 'error') {
+      return phaseInfo['error']
+    }
+
+    if (status === 'completed') {
+      return phaseInfo['completed']
+    }
+
+    return phaseInfo[currentPhase] || { label: currentPhase, explanation: '' }
+  }, [status, currentPhase, currentPhaseRecord])
+
+  // Get actor names for display
+  const actorA = debateActors[0]
+  const actorB = debateActors[1]
+
+  // Calculate node states
+  const actorAState = useMemo(() => {
+    if (!actorA) return 'idle'
+    return getNodeState(actorA.id, currentPhaseRecord, false, currentPhase, status)
+  }, [actorA, currentPhaseRecord, currentPhase, status])
+
+  const actorBState = useMemo(() => {
+    if (!actorB) return 'idle'
+    return getNodeState(actorB.id, currentPhaseRecord, false, currentPhase, status)
+  }, [actorB, currentPhaseRecord, currentPhase, status])
+
+  const judgeState = useMemo(() => {
+    if (!judgeActor) return 'idle'
+    return getNodeState(judgeActor.id, currentPhaseRecord, true, currentPhase, status)
+  }, [judgeActor, currentPhaseRecord, currentPhase, status])
+
+  // Count completed actors in current phase
+  const completedCount = useMemo(() => {
+    if (!currentPhaseRecord) return 0
+    return Object.values(currentPhaseRecord.messages).filter(m => m.status === 'done').length
+  }, [currentPhaseRecord])
+
+  const totalActors = useMemo(() => {
+    if (!currentPhaseRecord) return 0
+    return Object.keys(currentPhaseRecord.messages).length
+  }, [currentPhaseRecord])
+
+  return (
+    <div className="w-full bg-bg-secondary border-b border-border shrink-0">
+      <style jsx>{`
+        .monitor-svg {
+          font-family: 'Noto Serif JP', serif;
+        }
+        .monitor-svg text {
+          font-weight: 900;
+          user-select: none;
+        }
+        .node-stroke {
+          fill: transparent;
+          stroke: var(--c-orange, #f26600);
+          stroke-width: 3;
+          stroke-linejoin: miter;
+        }
+        @keyframes pulse-blue {
+          0%, 100% { fill: rgba(84, 165, 217, 0.3); }
+          50% { fill: rgba(84, 165, 217, 0.6); }
+        }
+        @keyframes pulse-purple {
+          0%, 100% { fill: rgba(147, 51, 234, 0.3); }
+          50% { fill: rgba(147, 51, 234, 0.6); }
+        }
+        .state-thinking .node-fill {
+          fill: rgba(84, 165, 217, 0.5);
+          animation: pulse-blue 1.5s ease-in-out infinite;
+        }
+        .state-thinking .node-text {
+          fill: #0a1f2e;
+        }
+        .state-done .node-fill {
+          fill: rgba(103, 255, 140, 0.5);
+        }
+        .state-done .node-text {
+          fill: #0a1f2e;
+        }
+        .state-error .node-fill {
+          fill: rgba(227, 0, 0, 0.5);
+        }
+        .state-error .node-text {
+          fill: #0a1f2e;
+        }
+        .state-judge_active .node-fill {
+          fill: rgba(147, 51, 234, 0.5);
+          animation: pulse-purple 1.5s ease-in-out infinite;
+        }
+        .state-judge_active .node-text {
+          fill: #0a1f2e;
+        }
+        @keyframes flash-status {
+          0%, 49.9% { fill: #fec200; stroke: #fec200; }
+          50%, 100% { fill: rgba(254, 194, 0, 0.3); stroke: rgba(254, 194, 0, 0.3); }
+        }
+        .status-active rect {
+          animation: flash-status 1s steps(1, end) infinite;
+        }
+        .status-active text {
+          animation: flash-status 1s steps(1, end) infinite;
+          stroke: none;
+        }
+      `}</style>
+
+      {/* Header with phase label */}
+      <div className="px-3 py-2 border-b border-border flex items-center justify-between">
+        <span className="text-xs text-accent-orange font-medium tracking-wider">MAGI</span>
+        <span className="text-xs text-text-secondary">{phaseData.label}</span>
+      </div>
+
+      {/* SVG Monitor */}
+      <div className="px-2 py-2">
+        <svg
+          className="monitor-svg w-full"
+          viewBox="0 0 300 140"
+          preserveAspectRatio="xMidYMid meet"
+        >
+          {/* Connection lines */}
+          <g stroke="#f26600" strokeWidth="4" opacity="0.6">
+            <line x1="150" y1="85" x2="185" y2="110" />
+            <line x1="150" y1="85" x2="115" y2="110" />
+          </g>
+
+          {/* Center MAGI label */}
+          <text x="150" y="65" textAnchor="middle" fill="#f26600" fontSize="14" letterSpacing="0.15em">
+            MAGI
+          </text>
+
+          {/* Judge node (top) */}
+          <g className={`state-${judgeState}`} transform="translate(100, 10)">
+            <polygon
+              className="node-fill"
+              points="50,0 100,0 100,35 85,50 65,50 50,35"
+              fill="transparent"
+            />
+            <polygon
+              className="node-stroke"
+              points="50,0 100,0 100,35 85,50 65,50 50,35"
+            />
+            <text
+              x="75"
+              y="30"
+              textAnchor="middle"
+              className="node-text"
+              fontSize="10"
+              fill="transparent"
+            >
+              {judgeActor ? judgeActor.name.slice(0, 6).toUpperCase() : 'JUDGE'}
+            </text>
+          </g>
+
+          {/* Actor A node (bottom left) */}
+          <g className={`state-${actorAState}`} transform="translate(20, 85)">
+            <polygon
+              className="node-fill"
+              points="0,0 80,0 80,30 70,45 10,45 0,30"
+              fill="transparent"
+            />
+            <polygon
+              className="node-stroke"
+              points="0,0 80,0 80,30 70,45 10,45 0,30"
+            />
+            <text
+              x="40"
+              y="28"
+              textAnchor="middle"
+              className="node-text"
+              fontSize="9"
+              fill="transparent"
+            >
+              {actorA ? actorA.name.slice(0, 8).toUpperCase() : 'ACTOR A'}
+            </text>
+          </g>
+
+          {/* Actor B node (bottom right) */}
+          <g className={`state-${actorBState}`} transform="translate(200, 85)">
+            <polygon
+              className="node-fill"
+              points="0,0 80,0 80,30 70,45 10,45 0,30"
+              fill="transparent"
+            />
+            <polygon
+              className="node-stroke"
+              points="0,0 80,0 80,30 70,45 10,45 0,30"
+            />
+            <text
+              x="40"
+              y="28"
+              textAnchor="middle"
+              className="node-text"
+              fontSize="9"
+              fill="transparent"
+            >
+              {actorB ? actorB.name.slice(0, 8).toUpperCase() : 'ACTOR B'}
+            </text>
+          </g>
+
+          {/* Status box */}
+          <g
+            className={`status-active`}
+            transform="translate(190, 10)"
+            style={{ opacity: status === 'streaming' || status === 'connecting' ? 1 : 0.7 }}
+          >
+            <rect
+              x="0"
+              y="0"
+              width="100"
+              height="28"
+              strokeWidth="2"
+              fill="none"
+              stroke="#fec200"
+            />
+            <text
+              x="50"
+              y="18"
+              fontSize="11"
+              textAnchor="middle"
+              fill="#fec200"
+              letterSpacing="0.05em"
+            >
+              {status === 'completed' ? '完了' : status === 'error' ? '異常' : '処理中'}
+            </text>
+          </g>
+        </svg>
+      </div>
+
+      {/* Phase explanation */}
+      <div className="px-3 pb-2">
+        <p className="text-xs text-text-tertiary text-center">{phaseData.explanation}</p>
+        {status === 'streaming' && totalActors > 0 && (
+          <p className="text-xs text-text-tertiary text-center mt-1">
+            {completedCount}/{totalActors} 模型完成
+          </p>
+        )}
+      </div>
+    </div>
+  )
+}
+```
+
+
 ### frontend\src\components\ProgressBar.tsx
 
 ```tsx
@@ -6943,12 +7684,27 @@ interface ProgressProps {
   status: string
 }
 
-const phaseLabels: Record<string, string> = {
-  initial: '初始回答',
-  review: '互评',
-  revision: '修订',
-  final_answer: '最终回答',
-  summary: '总结',
+const phaseInfo: Record<string, { label: string; explanation: string }> = {
+  initial: {
+    label: '初始回答',
+    explanation: '每个模型先独立回答问题',
+  },
+  review: {
+    label: '互评',
+    explanation: '模型之间正在指出彼此的盲点与漏洞',
+  },
+  revision: {
+    label: '修订',
+    explanation: '模型正在根据批评修正观点',
+  },
+  final_answer: {
+    label: '最终回答',
+    explanation: '总结模型正在整合多方观点，输出面向用户的最终回答',
+  },
+  summary: {
+    label: '总结',
+    explanation: '系统正在生成结构化共识报告',
+  },
 }
 
 function formatDuration(ms: number): string {
@@ -6996,7 +7752,7 @@ export default function ProgressBar({
 
   if (status === 'idle' || status === 'completed') return null
 
-  const phaseLabel = phaseLabels[currentPhase] || currentPhase
+  const phaseData = phaseInfo[currentPhase] || { label: currentPhase, explanation: '' }
 
   return (
     <div className="flex items-center gap-4 text-sm">
@@ -7013,7 +7769,7 @@ export default function ProgressBar({
       {/* Progress text */}
       <div className="flex items-center gap-3 text-text-secondary">
         <span className="text-xs">{progress.percent}%</span>
-        <span className="text-xs">{phaseLabel}</span>
+        <span className="text-xs">{phaseData.label}</span>
         <span className="text-xs text-text-tertiary">
           {formatDuration(progress.elapsed)}
         </span>
@@ -7021,6 +7777,172 @@ export default function ProgressBar({
           <span className="text-xs text-text-tertiary">
             预计 {formatETA(progress.eta)}
           </span>
+        )}
+      </div>
+
+      {/* Phase explanation - shown on a new line below the progress */}
+      {phaseData.explanation && (
+        <span className="text-xs text-text-tertiary hidden lg:inline">
+          {phaseData.explanation}
+        </span>
+      )}
+    </div>
+  )
+}
+```
+
+
+### frontend\src\components\QuestionBox.tsx
+
+```tsx
+'use client'
+
+import { useState, useEffect, useRef } from 'react'
+import { ChevronDown } from 'lucide-react'
+
+interface QuestionBoxProps {
+  question: string
+  label?: string
+  className?: string
+  maxLines?: number
+}
+
+export default function QuestionBox({
+  question,
+  label = '问题',
+  className = '',
+  maxLines = 3,
+}: QuestionBoxProps) {
+  const [isExpanded, setIsExpanded] = useState(false)
+  const questionRef = useRef<HTMLDivElement>(null)
+  const [needsTruncation, setNeedsTruncation] = useState(false)
+
+  useEffect(() => {
+    const el = questionRef.current
+    if (!el) return
+
+    const measure = () => {
+      const computed = getComputedStyle(el)
+      const lineHeight = parseFloat(computed.lineHeight)
+      const fontSize = parseFloat(computed.fontSize)
+
+      const effectiveLineHeight =
+        Number.isFinite(lineHeight) && lineHeight > 0
+          ? lineHeight
+          : fontSize * 1.5
+
+      const maxHeight = effectiveLineHeight * maxLines
+      setNeedsTruncation(el.scrollHeight > maxHeight + 2)
+    }
+
+    measure()
+
+    const observer = new ResizeObserver(() => {
+      measure()
+    })
+    observer.observe(el)
+
+    window.addEventListener('resize', measure)
+
+    return () => {
+      observer.disconnect()
+      window.removeEventListener('resize', measure)
+    }
+  }, [question, maxLines])
+
+  // 折叠状态变化时，如果重新缩回，也重新测一次
+  useEffect(() => {
+    const el = questionRef.current
+    if (!el) return
+
+    const computed = getComputedStyle(el)
+    const lineHeight = parseFloat(computed.lineHeight)
+    const fontSize = parseFloat(computed.fontSize)
+    const effectiveLineHeight =
+      Number.isFinite(lineHeight) && lineHeight > 0
+        ? lineHeight
+        : fontSize * 1.5
+
+    const maxHeight = effectiveLineHeight * maxLines
+    setNeedsTruncation(el.scrollHeight > maxHeight + 2)
+  }, [isExpanded, maxLines])
+
+  const collapsedMaxHeight = `${28 * maxLines}px` // 对应 leading-7 ≈ 28px
+
+  return (
+    <div className={`shrink-0 ${className}`}>
+      {/* Header with label and expand/collapse button */}
+      <div className="flex items-center justify-between gap-3 mb-2">
+        <h2 className="text-lg text-text-secondary">{label}</h2>
+
+        {needsTruncation && (
+          <button
+            type="button"
+            aria-expanded={isExpanded}
+            onClick={() => setIsExpanded((v) => !v)}
+            className={`
+              inline-flex items-center gap-1.5
+              h-8 px-3 rounded-full
+              border text-sm font-medium
+              transition-all duration-200
+              ${
+                isExpanded
+                  ? 'bg-accent-blue/10 border-accent-blue/30 text-accent-blue'
+                  : 'bg-bg-tertiary/80 border-white/10 text-text-secondary hover:text-text-primary hover:border-accent-blue/40 hover:bg-accent-blue/10'
+              }
+            `}
+          >
+            {isExpanded ? '收起问题' : '展开问题'}
+            <ChevronDown
+              className={`w-4 h-4 transition-transform duration-200 ${
+                isExpanded ? 'rotate-180' : ''
+              }`}
+            />
+          </button>
+        )}
+      </div>
+
+      {/* Question content with gradient overlay and bottom CTA */}
+      <div className="relative">
+        <div
+          ref={questionRef}
+          className="text-xl font-medium leading-7 overflow-hidden transition-all duration-200"
+          style={!isExpanded && needsTruncation ? { maxHeight: collapsedMaxHeight } : undefined}
+        >
+          {question}
+        </div>
+
+        {/* Gradient overlay + bottom CTA when collapsed */}
+        {!isExpanded && needsTruncation && (
+          <>
+            {/* Gradient mask */}
+            <div
+              className="absolute inset-x-0 bottom-0 h-14 bg-gradient-to-t from-bg-primary via-bg-primary/80 to-transparent cursor-pointer"
+              onClick={() => setIsExpanded(true)}
+            />
+
+            {/* Bottom CTA button */}
+            <div className="absolute bottom-2 right-2">
+              <button
+                type="button"
+                onClick={() => setIsExpanded(true)}
+                className="
+                  inline-flex items-center gap-1.5
+                  h-8 px-3 rounded-full
+                  bg-black/50 backdrop-blur-md
+                  border border-white/10
+                  text-sm font-medium text-white
+                  hover:bg-accent-blue/20
+                  hover:border-accent-blue/40
+                  transition-all duration-200
+                  shadow-lg
+                "
+              >
+                展开完整问题
+                <ChevronDown className="w-4 h-4" />
+              </button>
+            </div>
+          </>
         )}
       </div>
     </div>
@@ -7034,7 +7956,7 @@ export default function ProgressBar({
 ```tsx
 'use client'
 
-import { useMemo, useRef, useEffect } from 'react'
+import { memo, useMemo, useRef, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Actor, LivePhaseRecord, LiveMessage, ConvergenceData, Consensus } from '@/types'
 import ConsensusView from './ConsensusView'
@@ -7066,13 +7988,17 @@ function getPhaseTitle(record: LivePhaseRecord): string {
   return `第 ${record.step} 步 · ${base}`
 }
 
-function MessageCard({
+// Memoized MessageCard to prevent re-renders when unrelated state changes
+const MessageCard = memo(function MessageCard({
   message,
   onMessageClick,
 }: {
   message: LiveMessage
   onMessageClick?: (actorId: string, phase: string) => void
 }) {
+  // Don't render Markdown during streaming - use plain text for performance
+  const isStreaming = message.status === 'streaming'
+
   return (
     <motion.div
       key={`${message.actorId}`}
@@ -7093,23 +8019,30 @@ function MessageCard({
         <span className="px-2 py-0.5 bg-text-tertiary/20 text-text-tertiary text-xs rounded">
           {phaseLabels[message.phase] || message.phase}
         </span>
-        {message.status === 'streaming' && (
+        {isStreaming && (
           <span className="text-xs text-accent-blue animate-pulse">streaming...</span>
         )}
       </div>
 
-      {/* Content */}
+      {/* Content - plain text during streaming, Markdown when done */}
       <div className="px-4 py-4">
-        <MarkdownBlock content={message.content} />
-        {message.status === 'streaming' && (
-          <span className="inline-block w-2 h-4 bg-text-primary animate-pulse ml-1" />
+        {isStreaming ? (
+          // Plain text during streaming for performance
+          <div className="whitespace-pre-wrap break-words text-text-primary">
+            {message.content}
+            <span className="inline-block w-2 h-4 bg-text-primary animate-pulse ml-1" />
+          </div>
+        ) : (
+          // Full Markdown rendering only when message is complete
+          <MarkdownBlock content={message.content} />
         )}
       </div>
     </motion.div>
   )
-}
+})
 
-function ConvergenceCard({ convergence }: { convergence: ConvergenceData }) {
+// Memoized ConvergenceCard
+const ConvergenceCard = memo(function ConvergenceCard({ convergence }: { convergence: ConvergenceData }) {
   const scorePercent = Math.round(convergence.score * 100)
 
   return (
@@ -7178,7 +8111,7 @@ function ConvergenceCard({ convergence }: { convergence: ConvergenceData }) {
       </div>
     </motion.div>
   )
-}
+})
 
 export default function ReviewChatView({
   question,
@@ -7217,11 +8150,6 @@ export default function ReviewChatView({
         }
       })
   }, [phaseHistory, actors])
-
-  // Find if there's a final consensus in summary phase (for reference, not displayed)
-  const summaryPhase = useMemo(() => {
-    return phaseHistory.find((r) => r.phase === 'summary')
-  }, [phaseHistory])
 
   return (
     <div ref={scrollRef} className="space-y-6 overflow-y-auto h-full pb-8 pr-2">
@@ -7301,6 +8229,9 @@ interface SemanticSidebarProps {
   onSelectTopic: (topicId: string | null) => void
   onShowRawDiff?: () => void
   onSwitchToDiffTab?: () => void  // Callback to switch to diff tab
+  status?: string
+  currentPhase?: string
+  currentPhaseRecord?: LivePhaseRecord | null
 }
 
 const phaseLabels: Record<string, string> = {
@@ -7348,6 +8279,9 @@ export default function SemanticSidebar({
   onSelectTopic,
   onShowRawDiff,
   onSwitchToDiffTab,
+  status = 'idle',
+  currentPhase = '',
+  currentPhaseRecord = null,
 }: SemanticSidebarProps) {
   const [showRawDiff, setShowRawDiff] = useState(false)
   const [hasUserSelectedPhase, setHasUserSelectedPhase] = useState(false)
@@ -7424,6 +8358,23 @@ export default function SemanticSidebar({
     }
   }, [selectedComparisons])
 
+  // Check if we're in a live session waiting for semantic data
+  const isLiveWaiting = useMemo(() => {
+    // Live session is streaming and current phase is one that should have semantic data
+    const isRelevantPhase = ['initial', 'revision'].includes(currentPhase)
+    const isStreaming = status === 'streaming'
+    const hasPhaseData = currentPhaseRecord && Object.keys(currentPhaseRecord.messages).length > 0
+    const allActorsDone = hasPhaseData && Object.values(currentPhaseRecord.messages).every(m => m.status === 'done')
+    const noSemanticData = comparablePhases.length === 0 || !semanticComparisons.has(selectedDiffPhaseId || '')
+
+    return isStreaming && isRelevantPhase && allActorsDone && noSemanticData
+  }, [status, currentPhase, currentPhaseRecord, comparablePhases, semanticComparisons, selectedDiffPhaseId])
+
+  // Check if this is a completed session with no semantic data
+  const isCompletedNoData = useMemo(() => {
+    return (status === 'completed' || status === 'idle') && comparablePhases.length === 0
+  }, [status, comparablePhases])
+
   // Handle phase selection
   const handlePhaseSelect = (phaseId: string) => {
     setHasUserSelectedPhase(true)
@@ -7479,14 +8430,56 @@ export default function SemanticSidebar({
       <div className="flex-1 overflow-y-auto p-3 min-h-0">
         {!selectedComparisons.length ? (
           <div className="text-text-tertiary text-xs text-center py-8 space-y-4">
-            {comparablePhases.length === 0 ? (
+            {isLiveWaiting ? (
               <>
-                <div className="text-text-secondary">当前阶段的语义图谱尚未生成</div>
-                <div>语义分析会在本轮回答完成后自动生成</div>
+                {/* Live waiting state - show skeleton */}
+                <div className="text-text-secondary">语义图谱构建中...</div>
+                <div className="text-text-tertiary text-xs">系统会在本轮回答完成后提炼共识与分歧维度</div>
+
+                {/* Skeleton placeholder */}
+                <div className="space-y-2 mt-4">
+                  {[1, 2, 3].map((i) => (
+                    <div
+                      key={i}
+                      className="h-10 bg-bg-tertiary rounded-lg animate-pulse"
+                      style={{ animationDelay: `${i * 0.15}s` }}
+                    />
+                  ))}
+                </div>
+
+                {/* CTA to switch to diff */}
                 {phaseHistory.some(r => ['initial', 'review', 'revision'].includes(r.phase) && Object.keys(r.messages).length >= 2) && onSwitchToDiffTab && (
                   <button
                     onClick={onSwitchToDiffTab}
-                    className="px-4 py-2 bg-accent-blue/20 text-accent-blue rounded-lg hover:bg-accent-blue/30 transition-colors"
+                    className="px-4 py-2 bg-accent-blue/20 text-accent-blue rounded-lg hover:bg-accent-blue/30 transition-colors mt-4"
+                  >
+                    先查看原文差异对比
+                  </button>
+                )}
+              </>
+            ) : isCompletedNoData ? (
+              <>
+                {/* Completed session with no data */}
+                <div className="text-text-secondary">本次记录没有可用的语义图谱数据</div>
+                <div className="text-text-tertiary text-xs">可能是会话未能正常完成</div>
+                {onSwitchToDiffTab && (
+                  <button
+                    onClick={onSwitchToDiffTab}
+                    className="px-4 py-2 bg-accent-blue/20 text-accent-blue rounded-lg hover:bg-accent-blue/30 transition-colors mt-4"
+                  >
+                    查看原文差异对比
+                  </button>
+                )}
+              </>
+            ) : comparablePhases.length === 0 ? (
+              <>
+                {/* No comparable phases yet */}
+                <div className="text-text-secondary">当前阶段的语义图谱尚未生成</div>
+                <div className="text-text-tertiary text-xs">语义分析会在本轮回答完成后自动生成</div>
+                {phaseHistory.some(r => ['initial', 'review', 'revision'].includes(r.phase) && Object.keys(r.messages).length >= 2) && onSwitchToDiffTab && (
+                  <button
+                    onClick={onSwitchToDiffTab}
+                    className="px-4 py-2 bg-accent-blue/20 text-accent-blue rounded-lg hover:bg-accent-blue/30 transition-colors mt-4"
                   >
                     查看原文差异对比
                   </button>
@@ -7494,6 +8487,7 @@ export default function SemanticSidebar({
               </>
             ) : (
               <>
+                {/* Selected phase has no data */}
                 <div>该阶段暂无语义分析结果</div>
                 {onSwitchToDiffTab && (
                   <button
@@ -7685,6 +8679,7 @@ import {
   hydrateConsensus,
 } from '@/lib/sessionHydrator'
 import DebateView from './DebateView'
+import QuestionBox from './QuestionBox'
 
 interface SessionDetailViewProps {
   sessionId: string
@@ -7825,9 +8820,8 @@ export default function SessionDetailView({ sessionId, onBack }: SessionDetailVi
         <div className="h-full max-w-[1600px] mx-auto px-6 py-4 flex flex-col">
           {/* Question */}
           <div className="mb-4 shrink-0">
-            <h2 className="text-lg text-text-secondary mb-1">问题</h2>
-            <p className="text-xl font-medium">{session.question}</p>
-            <p className="text-text-tertiary text-sm mt-1">{formatDate(session.created_at)}</p>
+            <QuestionBox question={session.question} className="mb-0" />
+            <p className="text-text-tertiary text-sm mt-2">{formatDate(session.created_at)}</p>
           </div>
 
           {/* Status */}
@@ -7847,9 +8841,11 @@ export default function SessionDetailView({ sessionId, onBack }: SessionDetailVi
               actors={debateActors}
               judgeActor={judgeActor}
               phaseHistory={phaseHistory}
+              currentPhaseRecord={null}
               selectedDiffPhaseId={selectedDiffPhaseId}
               onSelectDiffPhase={setSelectedDiffPhaseId}
               status="completed"
+              currentPhase="completed"
               question={session.question}
               semanticComparisons={semanticComparisons}
               selectedTopicId={selectedTopicId}
@@ -9121,8 +10117,11 @@ interface ProgressState {
   currentPhaseStartedAt: number | null
   completedSteps: number
   estimatedTotalSteps: number
-  currentStepProgress: number  // 0-1 for current phase
+  currentStepProgress: number  // 0-1 for current phase (based on actors completed)
   phaseTimings: Map<string, number>  // phase_id -> duration in ms
+  // Actor-level progress tracking
+  totalActorsInPhase: number
+  completedActorsInPhase: number
 }
 
 interface DebateState {
@@ -9174,6 +10173,21 @@ interface DebateState {
 let eventSource: EventSource | null = null
 let expectedClose = false  // Flag to track expected connection close
 
+// Token batching for performance optimization
+// Instead of updating Zustand state on every token, we buffer tokens and flush periodically
+const tokenBuffer = new Map<string, string>()  // actorId -> accumulated tokens
+let flushTimeoutId: ReturnType<typeof setTimeout> | null = null
+const FLUSH_INTERVAL = 50  // ms - flush every 50ms
+
+// Helper to clear token buffer and flush timeout
+function clearTokenBufferState() {
+  if (flushTimeoutId) {
+    clearTimeout(flushTimeoutId)
+    flushTimeoutId = null
+  }
+  tokenBuffer.clear()
+}
+
 // Helper to create a phase record ID
 function makePhaseId(step: number, phase: LivePhaseType, cycle?: number): string {
   return `${step}:${phase}${cycle !== undefined ? `:${cycle}` : ''}`
@@ -9202,6 +10216,8 @@ export const useDebateStore = create<DebateState>((set, get) => ({
     estimatedTotalSteps: 9,  // Default: 1 initial + 2*3 review/revision + 1 final + 1 summary
     currentStepProgress: 0,
     phaseTimings: new Map(),
+    totalActorsInPhase: 0,
+    completedActorsInPhase: 0,
   },
   status: 'idle',
   error: null,
@@ -9253,6 +10269,8 @@ export const useDebateStore = create<DebateState>((set, get) => ({
         estimatedTotalSteps,
         currentStepProgress: 0,
         phaseTimings: new Map(),
+        totalActorsInPhase: 0,
+        completedActorsInPhase: 0,
       },
     })
 
@@ -9287,6 +10305,8 @@ export const useDebateStore = create<DebateState>((set, get) => ({
         estimatedTotalSteps: 9,
         currentStepProgress: 0,
         phaseTimings: new Map(),
+        totalActorsInPhase: 0,
+        completedActorsInPhase: 0,
       },
     })
 
@@ -9365,6 +10385,9 @@ export const useDebateStore = create<DebateState>((set, get) => ({
             currentPhaseStartedAt: Date.now(),
             currentStepProgress: 0,
             phaseTimings: newPhaseTimings,
+            // Reset actor counts for new phase
+            totalActorsInPhase: 0,
+            completedActorsInPhase: 0,
           },
         }
       })
@@ -9415,11 +10438,20 @@ export const useDebateStore = create<DebateState>((set, get) => ({
             r.id === updatedRecord.id ? updatedRecord : r
           )
 
+          // Track total actors - increment when we see a new actor for this phase
+          const currentActorCount = Object.keys(phaseRecord.messages).length
+          const newActorCount = currentActorCount + 1
+
           return {
             streamingContent: newMap,
             activeActors: newActive,
             currentPhaseRecord: updatedRecord,
             phaseHistory: updatedHistory,
+            progress: {
+              ...state.progress,
+              totalActorsInPhase: newActorCount,
+              currentStepProgress: state.progress.completedActorsInPhase / Math.max(newActorCount, 1),
+            },
           }
         }
 
@@ -9432,41 +10464,66 @@ export const useDebateStore = create<DebateState>((set, get) => ({
       const actorId = data.actor_id as string
       const token = data.content as string
 
-      set((state) => {
-        // Update legacy state
-        const newMap = new Map(state.streamingContent)
-        const existing = newMap.get(actorId) || ''
-        newMap.set(actorId, existing + token)
+      // Buffer the token instead of immediately updating state
+      const existing = tokenBuffer.get(actorId) || ''
+      tokenBuffer.set(actorId, existing + token)
 
-        // Update phase history
-        const phaseRecord = state.currentPhaseRecord
-        if (phaseRecord && phaseRecord.messages[actorId]) {
-          const updatedMessage: LiveMessage = {
-            ...phaseRecord.messages[actorId],
-            content: phaseRecord.messages[actorId].content + token,
-          }
+      // Schedule a flush if not already scheduled
+      if (!flushTimeoutId) {
+        flushTimeoutId = setTimeout(() => {
+          flushTimeoutId = null
+          // Flush all buffered tokens to state
+          const bufferedTokens = new Map(tokenBuffer)
+          tokenBuffer.clear()
 
-          const updatedRecord: LivePhaseRecord = {
-            ...phaseRecord,
-            messages: {
-              ...phaseRecord.messages,
-              [actorId]: updatedMessage,
-            },
-          }
+          if (bufferedTokens.size === 0) return
 
-          const updatedHistory = state.phaseHistory.map((r) =>
-            r.id === updatedRecord.id ? updatedRecord : r
-          )
+          set((state) => {
+            // Update legacy state
+            const newMap = new Map(state.streamingContent)
+            bufferedTokens.forEach((tokens, actorId) => {
+              const existing = newMap.get(actorId) || ''
+              newMap.set(actorId, existing + tokens)
+            })
 
-          return {
-            streamingContent: newMap,
-            currentPhaseRecord: updatedRecord,
-            phaseHistory: updatedHistory,
-          }
-        }
+            // Update phase history
+            const phaseRecord = state.currentPhaseRecord
+            if (phaseRecord) {
+              const updatedMessages = { ...phaseRecord.messages }
+              let hasUpdates = false
 
-        return { streamingContent: newMap }
-      })
+              bufferedTokens.forEach((tokens, actorId) => {
+                if (updatedMessages[actorId]) {
+                  updatedMessages[actorId] = {
+                    ...updatedMessages[actorId],
+                    content: updatedMessages[actorId].content + tokens,
+                  }
+                  hasUpdates = true
+                }
+              })
+
+              if (hasUpdates) {
+                const updatedRecord: LivePhaseRecord = {
+                  ...phaseRecord,
+                  messages: updatedMessages,
+                }
+
+                const updatedHistory = state.phaseHistory.map((r) =>
+                  r.id === updatedRecord.id ? updatedRecord : r
+                )
+
+                return {
+                  streamingContent: newMap,
+                  currentPhaseRecord: updatedRecord,
+                  phaseHistory: updatedHistory,
+                }
+              }
+            }
+
+            return { streamingContent: newMap }
+          })
+        }, FLUSH_INTERVAL)
+      }
     })
 
     eventSource.addEventListener('actor_end', (e: MessageEvent) => {
@@ -9474,10 +10531,23 @@ export const useDebateStore = create<DebateState>((set, get) => ({
       const data = JSON.parse(e.data)
       const actorId = data.actor_id as string
 
+      // Flush any remaining tokens for this actor before marking as done
+      const remainingTokens = tokenBuffer.get(actorId)
+      if (remainingTokens) {
+        tokenBuffer.delete(actorId)
+      }
+
       set((state) => {
-        // Update legacy state
+        // Update legacy state - include any remaining buffered tokens
         const newActive = new Set(state.activeActors)
         newActive.delete(actorId)
+
+        // Update legacy streaming content with remaining tokens
+        const newMap = new Map(state.streamingContent)
+        if (remainingTokens) {
+          const existing = newMap.get(actorId) || ''
+          newMap.set(actorId, existing + remainingTokens)
+        }
 
         // Update phase history
         const phaseRecord = state.currentPhaseRecord
@@ -9485,6 +10555,8 @@ export const useDebateStore = create<DebateState>((set, get) => ({
           const updatedMessage: LiveMessage = {
             ...phaseRecord.messages[actorId],
             status: 'done',
+            // Include remaining buffered tokens
+            content: phaseRecord.messages[actorId].content + (remainingTokens || ''),
           }
 
           const updatedRecord: LivePhaseRecord = {
@@ -9499,14 +10571,25 @@ export const useDebateStore = create<DebateState>((set, get) => ({
             r.id === updatedRecord.id ? updatedRecord : r
           )
 
+          // Update progress - increment completed actors and calculate progress
+          const newCompletedActors = state.progress.completedActorsInPhase + 1
+          const totalActors = Math.max(state.progress.totalActorsInPhase, newCompletedActors)
+          const newProgress = totalActors > 0 ? newCompletedActors / totalActors : 0
+
           return {
             activeActors: newActive,
+            streamingContent: newMap,
             currentPhaseRecord: updatedRecord,
             phaseHistory: updatedHistory,
+            progress: {
+              ...state.progress,
+              completedActorsInPhase: newCompletedActors,
+              currentStepProgress: newProgress,
+            },
           }
         }
 
-        return { activeActors: newActive }
+        return { activeActors: newActive, streamingContent: newMap }
       })
     })
 
@@ -9518,6 +10601,9 @@ export const useDebateStore = create<DebateState>((set, get) => ({
           ...state.progress,
           completedSteps: state.progress.completedSteps + 1,
           currentStepProgress: 1,
+          // Reset actor counts for next phase
+          totalActorsInPhase: 0,
+          completedActorsInPhase: 0,
         }
       }))
     })
@@ -9713,6 +10799,7 @@ export const useDebateStore = create<DebateState>((set, get) => ({
     eventSource.addEventListener('complete', async (e: MessageEvent) => {
       console.log('[SSE] complete:', e.data)
       expectedClose = true  // Mark as expected close
+      clearTokenBufferState()  // Clear token buffer
 
       try {
         const session = await apiClient.getDebate(sessionId)
@@ -9729,6 +10816,7 @@ export const useDebateStore = create<DebateState>((set, get) => ({
     eventSource.addEventListener('debate_error', (e: MessageEvent) => {
       console.error('[SSE] debate_error:', e.data)
       const data = JSON.parse(e.data)
+      clearTokenBufferState()  // Clear token buffer
       set({ status: 'error', error: data.message })
       eventSource?.close()
       eventSource = null
@@ -9737,6 +10825,7 @@ export const useDebateStore = create<DebateState>((set, get) => ({
     eventSource.addEventListener('cancelled', () => {
       console.log('[SSE] cancelled')
       expectedClose = true  // Mark as expected close
+      clearTokenBufferState()  // Clear token buffer
       set({ status: 'idle', error: 'Review was cancelled' })
       eventSource?.close()
       eventSource = null
@@ -9745,6 +10834,7 @@ export const useDebateStore = create<DebateState>((set, get) => ({
 
   stopDebate: async () => {
     expectedClose = true  // Mark as expected close
+    clearTokenBufferState()  // Clear token buffer
     if (eventSource) {
       eventSource.close()
       eventSource = null
@@ -9794,6 +10884,7 @@ export const useDebateStore = create<DebateState>((set, get) => ({
   selectTopic: (topicId) => set({ selectedTopicId: topicId }),
   reset: () => {
     expectedClose = true  // Mark as expected close
+    clearTokenBufferState()  // Clear token buffer and timeout
     if (eventSource) {
       eventSource.close()
       eventSource = null
@@ -9822,6 +10913,8 @@ export const useDebateStore = create<DebateState>((set, get) => ({
         estimatedTotalSteps: 9,
         currentStepProgress: 0,
         phaseTimings: new Map(),
+        totalActorsInPhase: 0,
+        completedActorsInPhase: 0,
       },
     })
   },
@@ -10161,13 +11254,6 @@ export default config
   "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
   "exclude": ["node_modules"]
 }
-```
-
-
-### frontend\tsconfig.tsbuildinfo
-
-```
-{"fileNames":["./node_modules/typescript/lib/lib.es5.d.ts","./node_modules/typescript/lib/lib.es2015.d.ts","./node_modules/typescript/lib/lib.es2016.d.ts","./node_modules/typescript/lib/lib.es2017.d.ts","./node_modules/typescript/lib/lib.es2018.d.ts","./node_modules/typescript/lib/lib.es2019.d.ts","./node_modules/typescript/lib/lib.es2020.d.ts","./node_modules/typescript/lib/lib.es2021.d.ts","./node_modules/typescript/lib/lib.es2022.d.ts","./node_modules/typescript/lib/lib.es2023.d.ts","./node_modules/typescript/lib/lib.es2024.d.ts","./node_modules/typescript/lib/lib.esnext.d.ts","./node_modules/typescript/lib/lib.dom.d.ts","./node_modules/typescript/lib/lib.dom.iterable.d.ts","./node_modules/typescript/lib/lib.es2015.core.d.ts","./node_modules/typescript/lib/lib.es2015.collection.d.ts","./node_modules/typescript/lib/lib.es2015.generator.d.ts","./node_modules/typescript/lib/lib.es2015.iterable.d.ts","./node_modules/typescript/lib/lib.es2015.promise.d.ts","./node_modules/typescript/lib/lib.es2015.proxy.d.ts","./node_modules/typescript/lib/lib.es2015.reflect.d.ts","./node_modules/typescript/lib/lib.es2015.symbol.d.ts","./node_modules/typescript/lib/lib.es2015.symbol.wellknown.d.ts","./node_modules/typescript/lib/lib.es2016.array.include.d.ts","./node_modules/typescript/lib/lib.es2016.intl.d.ts","./node_modules/typescript/lib/lib.es2017.arraybuffer.d.ts","./node_modules/typescript/lib/lib.es2017.date.d.ts","./node_modules/typescript/lib/lib.es2017.object.d.ts","./node_modules/typescript/lib/lib.es2017.sharedmemory.d.ts","./node_modules/typescript/lib/lib.es2017.string.d.ts","./node_modules/typescript/lib/lib.es2017.intl.d.ts","./node_modules/typescript/lib/lib.es2017.typedarrays.d.ts","./node_modules/typescript/lib/lib.es2018.asyncgenerator.d.ts","./node_modules/typescript/lib/lib.es2018.asynciterable.d.ts","./node_modules/typescript/lib/lib.es2018.intl.d.ts","./node_modules/typescript/lib/lib.es2018.promise.d.ts","./node_modules/typescript/lib/lib.es2018.regexp.d.ts","./node_modules/typescript/lib/lib.es2019.array.d.ts","./node_modules/typescript/lib/lib.es2019.object.d.ts","./node_modules/typescript/lib/lib.es2019.string.d.ts","./node_modules/typescript/lib/lib.es2019.symbol.d.ts","./node_modules/typescript/lib/lib.es2019.intl.d.ts","./node_modules/typescript/lib/lib.es2020.bigint.d.ts","./node_modules/typescript/lib/lib.es2020.date.d.ts","./node_modules/typescript/lib/lib.es2020.promise.d.ts","./node_modules/typescript/lib/lib.es2020.sharedmemory.d.ts","./node_modules/typescript/lib/lib.es2020.string.d.ts","./node_modules/typescript/lib/lib.es2020.symbol.wellknown.d.ts","./node_modules/typescript/lib/lib.es2020.intl.d.ts","./node_modules/typescript/lib/lib.es2020.number.d.ts","./node_modules/typescript/lib/lib.es2021.promise.d.ts","./node_modules/typescript/lib/lib.es2021.string.d.ts","./node_modules/typescript/lib/lib.es2021.weakref.d.ts","./node_modules/typescript/lib/lib.es2021.intl.d.ts","./node_modules/typescript/lib/lib.es2022.array.d.ts","./node_modules/typescript/lib/lib.es2022.error.d.ts","./node_modules/typescript/lib/lib.es2022.intl.d.ts","./node_modules/typescript/lib/lib.es2022.object.d.ts","./node_modules/typescript/lib/lib.es2022.string.d.ts","./node_modules/typescript/lib/lib.es2022.regexp.d.ts","./node_modules/typescript/lib/lib.es2023.array.d.ts","./node_modules/typescript/lib/lib.es2023.collection.d.ts","./node_modules/typescript/lib/lib.es2023.intl.d.ts","./node_modules/typescript/lib/lib.es2024.arraybuffer.d.ts","./node_modules/typescript/lib/lib.es2024.collection.d.ts","./node_modules/typescript/lib/lib.es2024.object.d.ts","./node_modules/typescript/lib/lib.es2024.promise.d.ts","./node_modules/typescript/lib/lib.es2024.regexp.d.ts","./node_modules/typescript/lib/lib.es2024.sharedmemory.d.ts","./node_modules/typescript/lib/lib.es2024.string.d.ts","./node_modules/typescript/lib/lib.esnext.array.d.ts","./node_modules/typescript/lib/lib.esnext.collection.d.ts","./node_modules/typescript/lib/lib.esnext.intl.d.ts","./node_modules/typescript/lib/lib.esnext.disposable.d.ts","./node_modules/typescript/lib/lib.esnext.promise.d.ts","./node_modules/typescript/lib/lib.esnext.decorators.d.ts","./node_modules/typescript/lib/lib.esnext.iterator.d.ts","./node_modules/typescript/lib/lib.esnext.float16.d.ts","./node_modules/typescript/lib/lib.esnext.error.d.ts","./node_modules/typescript/lib/lib.esnext.sharedmemory.d.ts","./node_modules/typescript/lib/lib.decorators.d.ts","./node_modules/typescript/lib/lib.decorators.legacy.d.ts","./node_modules/next/dist/styled-jsx/types/css.d.ts","./node_modules/@types/react/global.d.ts","./node_modules/csstype/index.d.ts","./node_modules/@types/prop-types/index.d.ts","./node_modules/@types/react/index.d.ts","./node_modules/next/dist/styled-jsx/types/index.d.ts","./node_modules/next/dist/styled-jsx/types/macro.d.ts","./node_modules/next/dist/styled-jsx/types/style.d.ts","./node_modules/next/dist/styled-jsx/types/global.d.ts","./node_modules/next/dist/shared/lib/amp.d.ts","./node_modules/next/amp.d.ts","./node_modules/@types/node/compatibility/disposable.d.ts","./node_modules/@types/node/compatibility/indexable.d.ts","./node_modules/@types/node/compatibility/iterators.d.ts","./node_modules/@types/node/compatibility/index.d.ts","./node_modules/@types/node/globals.typedarray.d.ts","./node_modules/@types/node/buffer.buffer.d.ts","./node_modules/@types/node/globals.d.ts","./node_modules/@types/node/web-globals/abortcontroller.d.ts","./node_modules/@types/node/web-globals/domexception.d.ts","./node_modules/@types/node/web-globals/events.d.ts","./node_modules/undici-types/header.d.ts","./node_modules/undici-types/readable.d.ts","./node_modules/undici-types/file.d.ts","./node_modules/undici-types/fetch.d.ts","./node_modules/undici-types/formdata.d.ts","./node_modules/undici-types/connector.d.ts","./node_modules/undici-types/client.d.ts","./node_modules/undici-types/errors.d.ts","./node_modules/undici-types/dispatcher.d.ts","./node_modules/undici-types/global-dispatcher.d.ts","./node_modules/undici-types/global-origin.d.ts","./node_modules/undici-types/pool-stats.d.ts","./node_modules/undici-types/pool.d.ts","./node_modules/undici-types/handlers.d.ts","./node_modules/undici-types/balanced-pool.d.ts","./node_modules/undici-types/agent.d.ts","./node_modules/undici-types/mock-interceptor.d.ts","./node_modules/undici-types/mock-agent.d.ts","./node_modules/undici-types/mock-client.d.ts","./node_modules/undici-types/mock-pool.d.ts","./node_modules/undici-types/mock-errors.d.ts","./node_modules/undici-types/proxy-agent.d.ts","./node_modules/undici-types/env-http-proxy-agent.d.ts","./node_modules/undici-types/retry-handler.d.ts","./node_modules/undici-types/retry-agent.d.ts","./node_modules/undici-types/api.d.ts","./node_modules/undici-types/interceptors.d.ts","./node_modules/undici-types/util.d.ts","./node_modules/undici-types/cookies.d.ts","./node_modules/undici-types/patch.d.ts","./node_modules/undici-types/websocket.d.ts","./node_modules/undici-types/eventsource.d.ts","./node_modules/undici-types/filereader.d.ts","./node_modules/undici-types/diagnostics-channel.d.ts","./node_modules/undici-types/content-type.d.ts","./node_modules/undici-types/cache.d.ts","./node_modules/undici-types/index.d.ts","./node_modules/@types/node/web-globals/fetch.d.ts","./node_modules/@types/node/assert.d.ts","./node_modules/@types/node/assert/strict.d.ts","./node_modules/@types/node/async_hooks.d.ts","./node_modules/@types/node/buffer.d.ts","./node_modules/@types/node/child_process.d.ts","./node_modules/@types/node/cluster.d.ts","./node_modules/@types/node/console.d.ts","./node_modules/@types/node/constants.d.ts","./node_modules/@types/node/crypto.d.ts","./node_modules/@types/node/dgram.d.ts","./node_modules/@types/node/diagnostics_channel.d.ts","./node_modules/@types/node/dns.d.ts","./node_modules/@types/node/dns/promises.d.ts","./node_modules/@types/node/domain.d.ts","./node_modules/@types/node/events.d.ts","./node_modules/@types/node/fs.d.ts","./node_modules/@types/node/fs/promises.d.ts","./node_modules/@types/node/http.d.ts","./node_modules/@types/node/http2.d.ts","./node_modules/@types/node/https.d.ts","./node_modules/@types/node/inspector.generated.d.ts","./node_modules/@types/node/module.d.ts","./node_modules/@types/node/net.d.ts","./node_modules/@types/node/os.d.ts","./node_modules/@types/node/path.d.ts","./node_modules/@types/node/perf_hooks.d.ts","./node_modules/@types/node/process.d.ts","./node_modules/@types/node/punycode.d.ts","./node_modules/@types/node/querystring.d.ts","./node_modules/@types/node/readline.d.ts","./node_modules/@types/node/readline/promises.d.ts","./node_modules/@types/node/repl.d.ts","./node_modules/@types/node/sea.d.ts","./node_modules/@types/node/stream.d.ts","./node_modules/@types/node/stream/promises.d.ts","./node_modules/@types/node/stream/consumers.d.ts","./node_modules/@types/node/stream/web.d.ts","./node_modules/@types/node/string_decoder.d.ts","./node_modules/@types/node/test.d.ts","./node_modules/@types/node/timers.d.ts","./node_modules/@types/node/timers/promises.d.ts","./node_modules/@types/node/tls.d.ts","./node_modules/@types/node/trace_events.d.ts","./node_modules/@types/node/tty.d.ts","./node_modules/@types/node/url.d.ts","./node_modules/@types/node/util.d.ts","./node_modules/@types/node/v8.d.ts","./node_modules/@types/node/vm.d.ts","./node_modules/@types/node/wasi.d.ts","./node_modules/@types/node/worker_threads.d.ts","./node_modules/@types/node/zlib.d.ts","./node_modules/@types/node/index.d.ts","./node_modules/next/dist/server/get-page-files.d.ts","./node_modules/@types/react/canary.d.ts","./node_modules/@types/react/experimental.d.ts","./node_modules/@types/react-dom/index.d.ts","./node_modules/@types/react-dom/canary.d.ts","./node_modules/@types/react-dom/experimental.d.ts","./node_modules/next/dist/compiled/webpack/webpack.d.ts","./node_modules/next/dist/server/config.d.ts","./node_modules/next/dist/lib/load-custom-routes.d.ts","./node_modules/next/dist/shared/lib/image-config.d.ts","./node_modules/next/dist/build/webpack/plugins/subresource-integrity-plugin.d.ts","./node_modules/next/dist/server/body-streams.d.ts","./node_modules/next/dist/server/future/route-kind.d.ts","./node_modules/next/dist/server/future/route-definitions/route-definition.d.ts","./node_modules/next/dist/server/future/route-matches/route-match.d.ts","./node_modules/next/dist/client/components/app-router-headers.d.ts","./node_modules/next/dist/server/request-meta.d.ts","./node_modules/next/dist/server/lib/revalidate.d.ts","./node_modules/next/dist/server/config-shared.d.ts","./node_modules/next/dist/server/base-http/index.d.ts","./node_modules/next/dist/server/api-utils/index.d.ts","./node_modules/next/dist/server/node-environment.d.ts","./node_modules/next/dist/server/require-hook.d.ts","./node_modules/next/dist/server/node-polyfill-crypto.d.ts","./node_modules/next/dist/lib/page-types.d.ts","./node_modules/next/dist/build/analysis/get-page-static-info.d.ts","./node_modules/next/dist/build/webpack/loaders/get-module-build-info.d.ts","./node_modules/next/dist/build/webpack/plugins/middleware-plugin.d.ts","./node_modules/next/dist/server/render-result.d.ts","./node_modules/next/dist/server/future/helpers/i18n-provider.d.ts","./node_modules/next/dist/server/web/next-url.d.ts","./node_modules/next/dist/compiled/@edge-runtime/cookies/index.d.ts","./node_modules/next/dist/server/web/spec-extension/cookies.d.ts","./node_modules/next/dist/server/web/spec-extension/request.d.ts","./node_modules/next/dist/server/web/spec-extension/fetch-event.d.ts","./node_modules/next/dist/server/web/spec-extension/response.d.ts","./node_modules/next/dist/server/web/types.d.ts","./node_modules/next/dist/lib/setup-exception-listeners.d.ts","./node_modules/next/dist/lib/constants.d.ts","./node_modules/next/dist/build/index.d.ts","./node_modules/next/dist/build/webpack/plugins/pages-manifest-plugin.d.ts","./node_modules/next/dist/shared/lib/router/utils/route-regex.d.ts","./node_modules/next/dist/shared/lib/router/utils/route-matcher.d.ts","./node_modules/next/dist/shared/lib/router/utils/parse-url.d.ts","./node_modules/next/dist/server/base-http/node.d.ts","./node_modules/next/dist/server/font-utils.d.ts","./node_modules/next/dist/build/webpack/plugins/flight-manifest-plugin.d.ts","./node_modules/next/dist/server/future/route-modules/route-module.d.ts","./node_modules/next/dist/server/load-components.d.ts","./node_modules/next/dist/shared/lib/router/utils/middleware-route-matcher.d.ts","./node_modules/next/dist/build/webpack/plugins/next-font-manifest-plugin.d.ts","./node_modules/next/dist/server/future/route-definitions/locale-route-definition.d.ts","./node_modules/next/dist/server/future/route-definitions/pages-route-definition.d.ts","./node_modules/next/dist/shared/lib/mitt.d.ts","./node_modules/next/dist/client/with-router.d.ts","./node_modules/next/dist/client/router.d.ts","./node_modules/next/dist/client/route-loader.d.ts","./node_modules/next/dist/client/page-loader.d.ts","./node_modules/next/dist/shared/lib/bloom-filter.d.ts","./node_modules/next/dist/shared/lib/router/router.d.ts","./node_modules/next/dist/shared/lib/router-context.shared-runtime.d.ts","./node_modules/next/dist/shared/lib/loadable-context.shared-runtime.d.ts","./node_modules/next/dist/shared/lib/loadable.shared-runtime.d.ts","./node_modules/next/dist/shared/lib/image-config-context.shared-runtime.d.ts","./node_modules/next/dist/shared/lib/hooks-client-context.shared-runtime.d.ts","./node_modules/next/dist/shared/lib/head-manager-context.shared-runtime.d.ts","./node_modules/next/dist/server/future/route-definitions/app-page-route-definition.d.ts","./node_modules/next/dist/shared/lib/modern-browserslist-target.d.ts","./node_modules/next/dist/shared/lib/constants.d.ts","./node_modules/next/dist/build/webpack/loaders/metadata/types.d.ts","./node_modules/next/dist/build/page-extensions-type.d.ts","./node_modules/next/dist/build/webpack/loaders/next-app-loader.d.ts","./node_modules/next/dist/server/lib/app-dir-module.d.ts","./node_modules/next/dist/server/response-cache/types.d.ts","./node_modules/next/dist/server/response-cache/index.d.ts","./node_modules/next/dist/server/lib/incremental-cache/index.d.ts","./node_modules/next/dist/client/components/hooks-server-context.d.ts","./node_modules/next/dist/server/app-render/dynamic-rendering.d.ts","./node_modules/next/dist/client/components/static-generation-async-storage-instance.d.ts","./node_modules/next/dist/client/components/static-generation-async-storage.external.d.ts","./node_modules/next/dist/server/web/spec-extension/adapters/request-cookies.d.ts","./node_modules/next/dist/server/async-storage/draft-mode-provider.d.ts","./node_modules/next/dist/server/web/spec-extension/adapters/headers.d.ts","./node_modules/next/dist/client/components/request-async-storage-instance.d.ts","./node_modules/next/dist/client/components/request-async-storage.external.d.ts","./node_modules/next/dist/server/app-render/create-error-handler.d.ts","./node_modules/next/dist/server/app-render/app-render.d.ts","./node_modules/next/dist/shared/lib/server-inserted-html.shared-runtime.d.ts","./node_modules/next/dist/shared/lib/amp-context.shared-runtime.d.ts","./node_modules/next/dist/server/future/route-modules/app-page/vendored/contexts/entrypoints.d.ts","./node_modules/next/dist/server/future/route-modules/app-page/module.compiled.d.ts","./node_modules/@types/react/jsx-runtime.d.ts","./node_modules/next/dist/client/components/error-boundary.d.ts","./node_modules/next/dist/client/components/router-reducer/create-initial-router-state.d.ts","./node_modules/next/dist/client/components/app-router.d.ts","./node_modules/next/dist/client/components/layout-router.d.ts","./node_modules/next/dist/client/components/render-from-template-context.d.ts","./node_modules/next/dist/client/components/action-async-storage-instance.d.ts","./node_modules/next/dist/client/components/action-async-storage.external.d.ts","./node_modules/next/dist/client/components/client-page.d.ts","./node_modules/next/dist/client/components/search-params.d.ts","./node_modules/next/dist/client/components/not-found-boundary.d.ts","./node_modules/next/dist/server/app-render/rsc/preloads.d.ts","./node_modules/next/dist/server/app-render/rsc/postpone.d.ts","./node_modules/next/dist/server/app-render/rsc/taint.d.ts","./node_modules/next/dist/server/app-render/entry-base.d.ts","./node_modules/next/dist/build/templates/app-page.d.ts","./node_modules/next/dist/server/future/route-modules/app-page/module.d.ts","./node_modules/next/dist/server/app-render/types.d.ts","./node_modules/next/dist/client/components/router-reducer/fetch-server-response.d.ts","./node_modules/next/dist/client/components/router-reducer/router-reducer-types.d.ts","./node_modules/next/dist/shared/lib/app-router-context.shared-runtime.d.ts","./node_modules/next/dist/server/future/route-modules/pages/vendored/contexts/entrypoints.d.ts","./node_modules/next/dist/server/future/route-modules/pages/module.compiled.d.ts","./node_modules/next/dist/build/templates/pages.d.ts","./node_modules/next/dist/server/future/route-modules/pages/module.d.ts","./node_modules/next/dist/server/render.d.ts","./node_modules/next/dist/server/future/route-definitions/pages-api-route-definition.d.ts","./node_modules/next/dist/server/future/route-matches/pages-api-route-match.d.ts","./node_modules/next/dist/server/future/route-matchers/route-matcher.d.ts","./node_modules/next/dist/server/future/route-matcher-providers/route-matcher-provider.d.ts","./node_modules/next/dist/server/future/route-matcher-managers/route-matcher-manager.d.ts","./node_modules/next/dist/server/future/normalizers/normalizer.d.ts","./node_modules/next/dist/server/future/normalizers/locale-route-normalizer.d.ts","./node_modules/next/dist/server/future/normalizers/request/pathname-normalizer.d.ts","./node_modules/next/dist/server/future/normalizers/request/suffix.d.ts","./node_modules/next/dist/server/future/normalizers/request/rsc.d.ts","./node_modules/next/dist/server/future/normalizers/request/prefix.d.ts","./node_modules/next/dist/server/future/normalizers/request/postponed.d.ts","./node_modules/next/dist/server/future/normalizers/request/action.d.ts","./node_modules/next/dist/server/future/normalizers/request/prefetch-rsc.d.ts","./node_modules/next/dist/server/future/normalizers/request/next-data.d.ts","./node_modules/next/dist/server/base-server.d.ts","./node_modules/next/dist/server/image-optimizer.d.ts","./node_modules/next/dist/server/next-server.d.ts","./node_modules/next/dist/lib/coalesced-function.d.ts","./node_modules/next/dist/server/lib/router-utils/types.d.ts","./node_modules/next/dist/trace/types.d.ts","./node_modules/next/dist/trace/trace.d.ts","./node_modules/next/dist/trace/shared.d.ts","./node_modules/next/dist/trace/index.d.ts","./node_modules/next/dist/build/load-jsconfig.d.ts","./node_modules/next/dist/build/webpack-config.d.ts","./node_modules/next/dist/build/webpack/plugins/define-env-plugin.d.ts","./node_modules/next/dist/build/swc/index.d.ts","./node_modules/next/dist/server/dev/parse-version-info.d.ts","./node_modules/next/dist/server/dev/hot-reloader-types.d.ts","./node_modules/next/dist/telemetry/storage.d.ts","./node_modules/next/dist/server/lib/types.d.ts","./node_modules/next/dist/server/lib/render-server.d.ts","./node_modules/next/dist/server/lib/router-server.d.ts","./node_modules/next/dist/shared/lib/router/utils/path-match.d.ts","./node_modules/next/dist/server/lib/router-utils/filesystem.d.ts","./node_modules/next/dist/server/lib/router-utils/setup-dev-bundler.d.ts","./node_modules/next/dist/server/lib/dev-bundler-service.d.ts","./node_modules/next/dist/server/dev/static-paths-worker.d.ts","./node_modules/next/dist/server/dev/next-dev-server.d.ts","./node_modules/next/dist/server/next.d.ts","./node_modules/next/dist/lib/metadata/types/alternative-urls-types.d.ts","./node_modules/next/dist/lib/metadata/types/extra-types.d.ts","./node_modules/next/dist/lib/metadata/types/metadata-types.d.ts","./node_modules/next/dist/lib/metadata/types/manifest-types.d.ts","./node_modules/next/dist/lib/metadata/types/opengraph-types.d.ts","./node_modules/next/dist/lib/metadata/types/twitter-types.d.ts","./node_modules/next/dist/lib/metadata/types/metadata-interface.d.ts","./node_modules/next/types/index.d.ts","./node_modules/next/dist/shared/lib/html-context.shared-runtime.d.ts","./node_modules/@next/env/dist/index.d.ts","./node_modules/next/dist/shared/lib/utils.d.ts","./node_modules/next/dist/pages/_app.d.ts","./node_modules/next/app.d.ts","./node_modules/next/dist/server/web/spec-extension/unstable-cache.d.ts","./node_modules/next/dist/server/web/spec-extension/revalidate.d.ts","./node_modules/next/dist/server/web/spec-extension/unstable-no-store.d.ts","./node_modules/next/cache.d.ts","./node_modules/next/dist/shared/lib/runtime-config.external.d.ts","./node_modules/next/config.d.ts","./node_modules/next/dist/pages/_document.d.ts","./node_modules/next/document.d.ts","./node_modules/next/dist/shared/lib/dynamic.d.ts","./node_modules/next/dynamic.d.ts","./node_modules/next/dist/pages/_error.d.ts","./node_modules/next/error.d.ts","./node_modules/next/dist/shared/lib/head.d.ts","./node_modules/next/head.d.ts","./node_modules/next/dist/client/components/draft-mode.d.ts","./node_modules/next/dist/client/components/headers.d.ts","./node_modules/next/headers.d.ts","./node_modules/next/dist/shared/lib/get-img-props.d.ts","./node_modules/next/dist/client/image-component.d.ts","./node_modules/next/dist/shared/lib/image-external.d.ts","./node_modules/next/image.d.ts","./node_modules/next/dist/client/link.d.ts","./node_modules/next/link.d.ts","./node_modules/next/dist/client/components/redirect-status-code.d.ts","./node_modules/next/dist/client/components/redirect.d.ts","./node_modules/next/dist/client/components/not-found.d.ts","./node_modules/next/dist/client/components/navigation.react-server.d.ts","./node_modules/next/dist/client/components/navigation.d.ts","./node_modules/next/navigation.d.ts","./node_modules/next/router.d.ts","./node_modules/next/dist/client/script.d.ts","./node_modules/next/script.d.ts","./node_modules/next/dist/server/web/spec-extension/user-agent.d.ts","./node_modules/next/dist/compiled/@edge-runtime/primitives/url.d.ts","./node_modules/next/dist/server/web/spec-extension/image-response.d.ts","./node_modules/next/dist/compiled/@vercel/og/satori/index.d.ts","./node_modules/next/dist/compiled/@vercel/og/emoji/index.d.ts","./node_modules/next/dist/compiled/@vercel/og/types.d.ts","./node_modules/next/server.d.ts","./node_modules/next/types/global.d.ts","./node_modules/next/types/compiled.d.ts","./node_modules/next/index.d.ts","./node_modules/next/image-types/global.d.ts","./next-env.d.ts","./node_modules/source-map-js/source-map.d.ts","./node_modules/postcss/lib/previous-map.d.ts","./node_modules/postcss/lib/input.d.ts","./node_modules/postcss/lib/css-syntax-error.d.ts","./node_modules/postcss/lib/declaration.d.ts","./node_modules/postcss/lib/root.d.ts","./node_modules/postcss/lib/warning.d.ts","./node_modules/postcss/lib/lazy-result.d.ts","./node_modules/postcss/lib/no-work-result.d.ts","./node_modules/postcss/lib/processor.d.ts","./node_modules/postcss/lib/result.d.ts","./node_modules/postcss/lib/document.d.ts","./node_modules/postcss/lib/rule.d.ts","./node_modules/postcss/lib/node.d.ts","./node_modules/postcss/lib/comment.d.ts","./node_modules/postcss/lib/container.d.ts","./node_modules/postcss/lib/at-rule.d.ts","./node_modules/postcss/lib/list.d.ts","./node_modules/postcss/lib/postcss.d.ts","./node_modules/postcss/lib/postcss.d.mts","./node_modules/tailwindcss/types/generated/corepluginlist.d.ts","./node_modules/tailwindcss/types/generated/colors.d.ts","./node_modules/tailwindcss/types/config.d.ts","./node_modules/tailwindcss/types/index.d.ts","./tailwind.config.ts","./src/components/splash.tsx","./node_modules/motion-dom/dist/index.d.ts","./node_modules/motion-utils/dist/index.d.ts","./node_modules/framer-motion/dist/index.d.ts","./node_modules/lucide-react/dist/lucide-react.d.ts","./node_modules/zustand/esm/vanilla.d.mts","./node_modules/zustand/esm/react.d.mts","./node_modules/zustand/esm/index.d.mts","./src/types/index.ts","./src/lib/apiclient.ts","./src/stores/actorstore.ts","./src/stores/debatestore.ts","./src/stores/index.ts","./src/components/actorcard.tsx","./src/components/reviewchatview.tsx","./src/lib/reviewdiff.ts","./src/components/diffsidebar.tsx","./src/components/debateview.tsx","./src/components/actormanager.tsx","./src/components/sessionhistory.tsx","./src/components/settingsview.tsx","./src/components/sessiondetailview.tsx","./src/components/consensusview.tsx","./src/components/arena.tsx","./src/components/index.ts","./node_modules/clsx/clsx.d.mts","./node_modules/tailwind-merge/dist/types.d.ts","./src/lib/utils.ts","./src/app/layout.tsx","./src/app/page.tsx","./.next/types/app/layout.ts","./.next/types/app/page.ts","./node_modules/@types/json5/index.d.ts"],"fileIdsList":[[99,145,358,462],[99,145,358,463],[99,145,406,407],[99,145],[99,142,145],[99,144,145],[145],[99,145,150,178],[99,145,146,151,156,164,175,186],[99,145,146,147,156,164],[94,95,96,99,145],[99,145,148,187],[99,145,149,150,157,165],[99,145,150,175,183],[99,145,151,153,156,164],[99,144,145,152],[99,145,153,154],[99,145,155,156],[99,144,145,156],[99,145,156,157,158,175,186],[99,145,156,157,158,171,175,178],[99,145,153,156,159,164,175,186],[99,145,156,157,159,160,164,175,183,186],[99,145,159,161,175,183,186],[97,98,99,100,101,102,103,141,142,143,144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,192],[99,145,156,162],[99,145,163,186,191],[99,145,153,156,164,175],[99,145,165],[99,145,166],[99,144,145,167],[99,142,143,144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,192],[99,145,169],[99,145,170],[99,145,156,171,172],[99,145,171,173,187,189],[99,145,156,175,176,178],[99,145,177,178],[99,145,175,176],[99,145,178],[99,145,179],[99,142,145,175,180],[99,145,156,181,182],[99,145,181,182],[99,145,150,164,175,183],[99,145,184],[99,145,164,185],[99,145,159,170,186],[99,145,150,187],[99,145,175,188],[99,145,163,189],[99,145,190],[99,140,145],[99,140,145,156,158,167,175,178,186,189,191],[99,145,175,192],[87,99,145,197,198,199],[87,99,145,197,198],[87,99,145],[87,91,99,145,196,359,402],[87,91,99,145,195,359,402],[84,85,86,99,145],[87,99,145,285,435,436],[92,99,145],[99,145,363],[99,145,365,366,367],[99,145,369],[99,145,202,212,218,220,359],[99,145,202,209,211,214,232],[99,145,212],[99,145,212,337],[99,145,266,284,299,405],[99,145,307],[99,145,202,212,219,252,262,334,335,405],[99,145,219,405],[99,145,212,262,263,264,405],[99,145,212,219,252,405],[99,145,405],[99,145,202,219,220,405],[99,145,292],[99,144,145,193,291],[87,99,145,285,286,287,304,305],[87,99,145,285],[99,145,275],[99,145,274,276,379],[87,99,145,285,286,302],[99,145,281,305,391],[99,145,389,390],[99,145,226,388],[99,145,278],[99,144,145,193,226,274,275,276,277],[87,99,145,302,304,305],[99,145,302,304],[99,145,302,303,305],[99,145,170,193],[99,145,273],[99,144,145,193,211,213,269,270,271,272],[87,99,145,203,382],[87,99,145,186,193],[87,99,145,219,250],[87,99,145,219],[99,145,248,253],[87,99,145,249,362],[87,91,99,145,159,193,195,196,359,400,401],[99,145,359],[99,145,201],[99,145,352,353,354,355,356,357],[99,145,354],[87,99,145,249,285,362],[87,99,145,285,360,362],[87,99,145,285,362],[99,145,159,193,213,362],[99,145,159,193,210,211,222,240,273,278,279,301,302],[99,145,270,273,278,286,288,289,290,292,293,294,295,296,297,298,405],[99,145,271],[87,99,145,170,193,211,212,240,242,244,269,301,305,359,405],[99,145,159,193,213,214,226,227,274],[99,145,159,193,212,214],[99,145,159,175,193,210,213,214],[99,145,159,170,186,193,210,211,212,213,214,219,222,223,233,234,236,239,240,242,243,244,268,269,302,310,312,315,317,320,322,323,324,325],[99,145,159,175,193],[99,145,202,203,204,210,211,359,362,405],[99,145,159,175,186,193,207,336,338,339,405],[99,145,170,186,193,207,210,213,230,234,236,237,238,242,269,315,326,328,334,348,349],[99,145,212,216,269],[99,145,210,212],[99,145,223,316],[99,145,318,319],[99,145,318],[99,145,316],[99,145,318,321],[99,145,206,207],[99,145,206,245],[99,145,206],[99,145,208,223,314],[99,145,313],[99,145,207,208],[99,145,208,311],[99,145,207],[99,145,301],[99,145,159,193,210,222,241,260,266,280,283,300,302],[99,145,254,255,256,257,258,259,281,282,305,360],[99,145,309],[99,145,159,193,210,222,241,246,306,308,310,359,362],[99,145,159,186,193,203,210,212,268],[99,145,265],[99,145,159,193,342,347],[99,145,233,268,362],[99,145,330,334,348,351],[99,145,159,216,334,342,343,351],[99,145,202,212,233,243,345],[99,145,159,193,212,219,243,329,330,340,341,344,346],[99,145,194,240,241,359,362],[99,145,159,170,186,193,208,210,211,213,216,221,222,230,233,234,236,237,238,239,242,244,268,269,312,326,327,362],[99,145,159,193,210,212,216,328,350],[99,145,159,193,211,213],[87,99,145,159,170,193,201,203,210,211,214,222,239,240,242,244,309,359,362],[99,145,159,170,186,193,205,208,209,213],[99,145,206,267],[99,145,159,193,206,211,222],[99,145,159,193,212,223],[99,145,159,193],[99,145,226],[99,145,225],[99,145,227],[99,145,212,224,226,230],[99,145,212,224,226],[99,145,159,193,205,212,213,219,227,228,229],[87,99,145,302,303,304],[99,145,261],[87,99,145,203],[87,99,145,236],[87,99,145,194,239,244,359,362],[99,145,203,382,383],[87,99,145,253],[87,99,145,170,186,193,201,247,249,251,252,362],[99,145,213,219,236],[99,145,235],[87,99,145,157,159,170,193,201,253,262,359,360,361],[83,87,88,89,90,99,145,195,196,359,402],[99,145,150],[99,145,331,332,333],[99,145,331],[99,145,371],[99,145,373],[99,145,375],[99,145,377],[99,145,380],[99,145,384],[91,93,99,145,359,364,368,370,372,374,376,378,381,385,387,393,394,396,403,404,405],[99,145,386],[99,145,392],[99,145,249],[99,145,395],[99,144,145,227,228,229,230,397,398,399,402],[99,145,193],[87,91,99,145,159,161,170,193,195,196,197,199,201,214,351,358,362,402],[99,145,424],[99,145,422,424],[99,145,413,421,422,423,425,427],[99,145,411],[99,145,414,419,424,427],[99,145,410,427],[99,145,414,415,418,419,420,427],[99,145,414,415,416,418,419,427],[99,145,411,412,413,414,415,419,420,421,423,424,425,427],[99,145,427],[99,145,409,411,412,413,414,415,416,418,419,420,421,422,423,424,425,426],[99,145,409,427],[99,145,414,416,417,419,420,427],[99,145,418,427],[99,145,419,420,424,427],[99,145,412,422],[99,145,429,430],[99,145,428,431],[99,112,116,145,186],[99,112,145,175,186],[99,107,145],[99,109,112,145,183,186],[99,145,164,183],[99,107,145,193],[99,109,112,145,164,186],[99,104,105,108,111,145,156,175,186],[99,112,119,145],[99,104,110,145],[99,112,133,134,145],[99,108,112,145,178,186,193],[99,133,145,193],[99,106,107,145,193],[99,112,145],[99,106,107,108,109,110,111,112,113,114,116,117,118,119,120,121,122,123,124,125,126,127,128,129,130,131,132,134,135,136,137,138,139,145],[99,112,127,145],[99,112,119,120,145],[99,110,112,120,121,145],[99,111,145],[99,104,107,112,145],[99,112,116,120,121,145],[99,116,145],[99,110,112,115,145,186],[99,104,109,112,119,145],[99,145,175],[99,107,112,133,145,191,193],[99,145,439,440],[99,145,439],[99,145,406],[87,99,145,434,457],[99,145,437,438,442],[87,99,145,437,438,442,443,446],[87,99,145,437,438,442,443,446,447,451,452,453,454,455,456],[87,99,145,437,442,448,450],[87,99,145,442,449],[99,145,434,447,448,450,451,452,453,454,455,456,457],[87,99,145,437,442],[87,99,145,437,438,442,443],[87,99,145,437,438,442,446],[87,99,145,437,438,443],[99,145,442],[99,145,459,460],[99,145,441,442,443],[99,145,444,445],[99,145,432]],"fileInfos":[{"version":"c430d44666289dae81f30fa7b2edebf186ecc91a2d4c71266ea6ae76388792e1","affectsGlobalScope":true,"impliedFormat":1},{"version":"45b7ab580deca34ae9729e97c13cfd999df04416a79116c3bfb483804f85ded4","impliedFormat":1},{"version":"3facaf05f0c5fc569c5649dd359892c98a85557e3e0c847964caeb67076f4d75","impliedFormat":1},{"version":"e44bb8bbac7f10ecc786703fe0a6a4b952189f908707980ba8f3c8975a760962","impliedFormat":1},{"version":"5e1c4c362065a6b95ff952c0eab010f04dcd2c3494e813b493ecfd4fcb9fc0d8","impliedFormat":1},{"version":"68d73b4a11549f9c0b7d352d10e91e5dca8faa3322bfb77b661839c42b1ddec7","impliedFormat":1},{"version":"5efce4fc3c29ea84e8928f97adec086e3dc876365e0982cc8479a07954a3efd4","impliedFormat":1},{"version":"feecb1be483ed332fad555aff858affd90a48ab19ba7272ee084704eb7167569","impliedFormat":1},{"version":"ee7bad0c15b58988daa84371e0b89d313b762ab83cb5b31b8a2d1162e8eb41c2","impliedFormat":1},{"version":"27bdc30a0e32783366a5abeda841bc22757c1797de8681bbe81fbc735eeb1c10","impliedFormat":1},{"version":"8fd575e12870e9944c7e1d62e1f5a73fcf23dd8d3a321f2a2c74c20d022283fe","impliedFormat":1},{"version":"2ab096661c711e4a81cc464fa1e6feb929a54f5340b46b0a07ac6bbf857471f0","impliedFormat":1},{"version":"080941d9f9ff9307f7e27a83bcd888b7c8270716c39af943532438932ec1d0b9","affectsGlobalScope":true,"impliedFormat":1},{"version":"2e80ee7a49e8ac312cc11b77f1475804bee36b3b2bc896bead8b6e1266befb43","affectsGlobalScope":true,"impliedFormat":1},{"version":"c57796738e7f83dbc4b8e65132f11a377649c00dd3eee333f672b8f0a6bea671","affectsGlobalScope":true,"impliedFormat":1},{"version":"dc2df20b1bcdc8c2d34af4926e2c3ab15ffe1160a63e58b7e09833f616efff44","affectsGlobalScope":true,"impliedFormat":1},{"version":"515d0b7b9bea2e31ea4ec968e9edd2c39d3eebf4a2d5cbd04e88639819ae3b71","affectsGlobalScope":true,"impliedFormat":1},{"version":"0559b1f683ac7505ae451f9a96ce4c3c92bdc71411651ca6ddb0e88baaaad6a3","affectsGlobalScope":true,"impliedFormat":1},{"version":"0dc1e7ceda9b8b9b455c3a2d67b0412feab00bd2f66656cd8850e8831b08b537","affectsGlobalScope":true,"impliedFormat":1},{"version":"ce691fb9e5c64efb9547083e4a34091bcbe5bdb41027e310ebba8f7d96a98671","affectsGlobalScope":true,"impliedFormat":1},{"version":"8d697a2a929a5fcb38b7a65594020fcef05ec1630804a33748829c5ff53640d0","affectsGlobalScope":true,"impliedFormat":1},{"version":"4ff2a353abf8a80ee399af572debb8faab2d33ad38c4b4474cff7f26e7653b8d","affectsGlobalScope":true,"impliedFormat":1},{"version":"fb0f136d372979348d59b3f5020b4cdb81b5504192b1cacff5d1fbba29378aa1","affectsGlobalScope":true,"impliedFormat":1},{"version":"d15bea3d62cbbdb9797079416b8ac375ae99162a7fba5de2c6c505446486ac0a","affectsGlobalScope":true,"impliedFormat":1},{"version":"68d18b664c9d32a7336a70235958b8997ebc1c3b8505f4f1ae2b7e7753b87618","affectsGlobalScope":true,"impliedFormat":1},{"version":"eb3d66c8327153d8fa7dd03f9c58d351107fe824c79e9b56b462935176cdf12a","affectsGlobalScope":true,"impliedFormat":1},{"version":"38f0219c9e23c915ef9790ab1d680440d95419ad264816fa15009a8851e79119","affectsGlobalScope":true,"impliedFormat":1},{"version":"69ab18c3b76cd9b1be3d188eaf8bba06112ebbe2f47f6c322b5105a6fbc45a2e","affectsGlobalScope":true,"impliedFormat":1},{"version":"a680117f487a4d2f30ea46f1b4b7f58bef1480456e18ba53ee85c2746eeca012","affectsGlobalScope":true,"impliedFormat":1},{"version":"2f11ff796926e0832f9ae148008138ad583bd181899ab7dd768a2666700b1893","affectsGlobalScope":true,"impliedFormat":1},{"version":"4de680d5bb41c17f7f68e0419412ca23c98d5749dcaaea1896172f06435891fc","affectsGlobalScope":true,"impliedFormat":1},{"version":"954296b30da6d508a104a3a0b5d96b76495c709785c1d11610908e63481ee667","affectsGlobalScope":true,"impliedFormat":1},{"version":"ac9538681b19688c8eae65811b329d3744af679e0bdfa5d842d0e32524c73e1c","affectsGlobalScope":true,"impliedFormat":1},{"version":"0a969edff4bd52585473d24995c5ef223f6652d6ef46193309b3921d65dd4376","affectsGlobalScope":true,"impliedFormat":1},{"version":"9e9fbd7030c440b33d021da145d3232984c8bb7916f277e8ffd3dc2e3eae2bdb","affectsGlobalScope":true,"impliedFormat":1},{"version":"811ec78f7fefcabbda4bfa93b3eb67d9ae166ef95f9bff989d964061cbf81a0c","affectsGlobalScope":true,"impliedFormat":1},{"version":"717937616a17072082152a2ef351cb51f98802fb4b2fdabd32399843875974ca","affectsGlobalScope":true,"impliedFormat":1},{"version":"d7e7d9b7b50e5f22c915b525acc5a49a7a6584cf8f62d0569e557c5cfc4b2ac2","affectsGlobalScope":true,"impliedFormat":1},{"version":"71c37f4c9543f31dfced6c7840e068c5a5aacb7b89111a4364b1d5276b852557","affectsGlobalScope":true,"impliedFormat":1},{"version":"576711e016cf4f1804676043e6a0a5414252560eb57de9faceee34d79798c850","affectsGlobalScope":true,"impliedFormat":1},{"version":"89c1b1281ba7b8a96efc676b11b264de7a8374c5ea1e6617f11880a13fc56dc6","affectsGlobalScope":true,"impliedFormat":1},{"version":"74f7fa2d027d5b33eb0471c8e82a6c87216223181ec31247c357a3e8e2fddc5b","affectsGlobalScope":true,"impliedFormat":1},{"version":"d6d7ae4d1f1f3772e2a3cde568ed08991a8ae34a080ff1151af28b7f798e22ca","affectsGlobalScope":true,"impliedFormat":1},{"version":"063600664504610fe3e99b717a1223f8b1900087fab0b4cad1496a114744f8df","affectsGlobalScope":true,"impliedFormat":1},{"version":"934019d7e3c81950f9a8426d093458b65d5aff2c7c1511233c0fd5b941e608ab","affectsGlobalScope":true,"impliedFormat":1},{"version":"52ada8e0b6e0482b728070b7639ee42e83a9b1c22d205992756fe020fd9f4a47","affectsGlobalScope":true,"impliedFormat":1},{"version":"3bdefe1bfd4d6dee0e26f928f93ccc128f1b64d5d501ff4a8cf3c6371200e5e6","affectsGlobalScope":true,"impliedFormat":1},{"version":"59fb2c069260b4ba00b5643b907ef5d5341b167e7d1dbf58dfd895658bda2867","affectsGlobalScope":true,"impliedFormat":1},{"version":"639e512c0dfc3fad96a84caad71b8834d66329a1f28dc95e3946c9b58176c73a","affectsGlobalScope":true,"impliedFormat":1},{"version":"368af93f74c9c932edd84c58883e736c9e3d53cec1fe24c0b0ff451f529ceab1","affectsGlobalScope":true,"impliedFormat":1},{"version":"af3dd424cf267428f30ccfc376f47a2c0114546b55c44d8c0f1d57d841e28d74","affectsGlobalScope":true,"impliedFormat":1},{"version":"995c005ab91a498455ea8dfb63aa9f83fa2ea793c3d8aa344be4a1678d06d399","affectsGlobalScope":true,"impliedFormat":1},{"version":"959d36cddf5e7d572a65045b876f2956c973a586da58e5d26cde519184fd9b8a","affectsGlobalScope":true,"impliedFormat":1},{"version":"965f36eae237dd74e6cca203a43e9ca801ce38824ead814728a2807b1910117d","affectsGlobalScope":true,"impliedFormat":1},{"version":"3925a6c820dcb1a06506c90b1577db1fdbf7705d65b62b99dce4be75c637e26b","affectsGlobalScope":true,"impliedFormat":1},{"version":"0a3d63ef2b853447ec4f749d3f368ce642264246e02911fcb1590d8c161b8005","affectsGlobalScope":true,"impliedFormat":1},{"version":"8cdf8847677ac7d20486e54dd3fcf09eda95812ac8ace44b4418da1bbbab6eb8","affectsGlobalScope":true,"impliedFormat":1},{"version":"8444af78980e3b20b49324f4a16ba35024fef3ee069a0eb67616ea6ca821c47a","affectsGlobalScope":true,"impliedFormat":1},{"version":"3287d9d085fbd618c3971944b65b4be57859f5415f495b33a6adc994edd2f004","affectsGlobalScope":true,"impliedFormat":1},{"version":"b4b67b1a91182421f5df999988c690f14d813b9850b40acd06ed44691f6727ad","affectsGlobalScope":true,"impliedFormat":1},{"version":"df83c2a6c73228b625b0beb6669c7ee2a09c914637e2d35170723ad49c0f5cd4","affectsGlobalScope":true,"impliedFormat":1},{"version":"436aaf437562f276ec2ddbee2f2cdedac7664c1e4c1d2c36839ddd582eeb3d0a","affectsGlobalScope":true,"impliedFormat":1},{"version":"8e3c06ea092138bf9fa5e874a1fdbc9d54805d074bee1de31b99a11e2fec239d","affectsGlobalScope":true,"impliedFormat":1},{"version":"87dc0f382502f5bbce5129bdc0aea21e19a3abbc19259e0b43ae038a9fc4e326","affectsGlobalScope":true,"impliedFormat":1},{"version":"b1cb28af0c891c8c96b2d6b7be76bd394fddcfdb4709a20ba05a7c1605eea0f9","affectsGlobalScope":true,"impliedFormat":1},{"version":"2fef54945a13095fdb9b84f705f2b5994597640c46afeb2ce78352fab4cb3279","affectsGlobalScope":true,"impliedFormat":1},{"version":"ac77cb3e8c6d3565793eb90a8373ee8033146315a3dbead3bde8db5eaf5e5ec6","affectsGlobalScope":true,"impliedFormat":1},{"version":"56e4ed5aab5f5920980066a9409bfaf53e6d21d3f8d020c17e4de584d29600ad","affectsGlobalScope":true,"impliedFormat":1},{"version":"4ece9f17b3866cc077099c73f4983bddbcb1dc7ddb943227f1ec070f529dedd1","affectsGlobalScope":true,"impliedFormat":1},{"version":"0a6282c8827e4b9a95f4bf4f5c205673ada31b982f50572d27103df8ceb8013c","affectsGlobalScope":true,"impliedFormat":1},{"version":"1c9319a09485199c1f7b0498f2988d6d2249793ef67edda49d1e584746be9032","affectsGlobalScope":true,"impliedFormat":1},{"version":"e3a2a0cee0f03ffdde24d89660eba2685bfbdeae955a6c67e8c4c9fd28928eeb","affectsGlobalScope":true,"impliedFormat":1},{"version":"811c71eee4aa0ac5f7adf713323a5c41b0cf6c4e17367a34fbce379e12bbf0a4","affectsGlobalScope":true,"impliedFormat":1},{"version":"51ad4c928303041605b4d7ae32e0c1ee387d43a24cd6f1ebf4a2699e1076d4fa","affectsGlobalScope":true,"impliedFormat":1},{"version":"60037901da1a425516449b9a20073aa03386cce92f7a1fd902d7602be3a7c2e9","affectsGlobalScope":true,"impliedFormat":1},{"version":"d4b1d2c51d058fc21ec2629fff7a76249dec2e36e12960ea056e3ef89174080f","affectsGlobalScope":true,"impliedFormat":1},{"version":"22adec94ef7047a6c9d1af3cb96be87a335908bf9ef386ae9fd50eeb37f44c47","affectsGlobalScope":true,"impliedFormat":1},{"version":"196cb558a13d4533a5163286f30b0509ce0210e4b316c56c38d4c0fd2fb38405","affectsGlobalScope":true,"impliedFormat":1},{"version":"73f78680d4c08509933daf80947902f6ff41b6230f94dd002ae372620adb0f60","affectsGlobalScope":true,"impliedFormat":1},{"version":"c5239f5c01bcfa9cd32f37c496cf19c61d69d37e48be9de612b541aac915805b","affectsGlobalScope":true,"impliedFormat":1},{"version":"8e7f8264d0fb4c5339605a15daadb037bf238c10b654bb3eee14208f860a32ea","affectsGlobalScope":true,"impliedFormat":1},{"version":"782dec38049b92d4e85c1585fbea5474a219c6984a35b004963b00beb1aab538","affectsGlobalScope":true,"impliedFormat":1},{"version":"0990a7576222f248f0a3b888adcb7389f957928ce2afb1cd5128169086ff4d29","impliedFormat":1},{"version":"eb5b19b86227ace1d29ea4cf81387279d04bb34051e944bc53df69f58914b788","affectsGlobalScope":true,"impliedFormat":1},{"version":"ac51dd7d31333793807a6abaa5ae168512b6131bd41d9c5b98477fc3b7800f9f","impliedFormat":1},{"version":"87d9d29dbc745f182683f63187bf3d53fd8673e5fca38ad5eaab69798ed29fbc","impliedFormat":1},{"version":"035312d4945d13efa134ae482f6dc56a1a9346f7ac3be7ccbad5741058ce87f3","affectsGlobalScope":true,"impliedFormat":1},{"version":"cc69795d9954ee4ad57545b10c7bf1a7260d990231b1685c147ea71a6faa265c","impliedFormat":1},{"version":"8bc6c94ff4f2af1f4023b7bb2379b08d3d7dd80c698c9f0b07431ea16101f05f","impliedFormat":1},{"version":"1b61d259de5350f8b1e5db06290d31eaebebc6baafd5f79d314b5af9256d7153","impliedFormat":1},{"version":"57194e1f007f3f2cbef26fa299d4c6b21f4623a2eddc63dfeef79e38e187a36e","impliedFormat":1},{"version":"0f6666b58e9276ac3a38fdc80993d19208442d6027ab885580d93aec76b4ef00","impliedFormat":1},{"version":"05fd364b8ef02fb1e174fbac8b825bdb1e5a36a016997c8e421f5fab0a6da0a0","impliedFormat":1},{"version":"70521b6ab0dcba37539e5303104f29b721bfb2940b2776da4cc818c07e1fefc1","affectsGlobalScope":true,"impliedFormat":1},{"version":"ab41ef1f2cdafb8df48be20cd969d875602483859dc194e9c97c8a576892c052","affectsGlobalScope":true,"impliedFormat":1},{"version":"d153a11543fd884b596587ccd97aebbeed950b26933ee000f94009f1ab142848","affectsGlobalScope":true,"impliedFormat":1},{"version":"21d819c173c0cf7cc3ce57c3276e77fd9a8a01d35a06ad87158781515c9a438a","impliedFormat":1},{"version":"98cffbf06d6bab333473c70a893770dbe990783904002c4f1a960447b4b53dca","affectsGlobalScope":true,"impliedFormat":1},{"version":"ba481bca06f37d3f2c137ce343c7d5937029b2468f8e26111f3c9d9963d6568d","affectsGlobalScope":true,"impliedFormat":1},{"version":"6d9ef24f9a22a88e3e9b3b3d8c40ab1ddb0853f1bfbd5c843c37800138437b61","affectsGlobalScope":true,"impliedFormat":1},{"version":"1db0b7dca579049ca4193d034d835f6bfe73096c73663e5ef9a0b5779939f3d0","affectsGlobalScope":true,"impliedFormat":1},{"version":"9798340ffb0d067d69b1ae5b32faa17ab31b82466a3fc00d8f2f2df0c8554aaa","affectsGlobalScope":true,"impliedFormat":1},{"version":"f26b11d8d8e4b8028f1c7d618b22274c892e4b0ef5b3678a8ccbad85419aef43","affectsGlobalScope":true,"impliedFormat":1},{"version":"5929864ce17fba74232584d90cb721a89b7ad277220627cc97054ba15a98ea8f","impliedFormat":1},{"version":"763fe0f42b3d79b440a9b6e51e9ba3f3f91352469c1e4b3b67bfa4ff6352f3f4","impliedFormat":1},{"version":"25c8056edf4314820382a5fdb4bb7816999acdcb929c8f75e3f39473b87e85bc","impliedFormat":1},{"version":"c464d66b20788266e5353b48dc4aa6bc0dc4a707276df1e7152ab0c9ae21fad8","impliedFormat":1},{"version":"78d0d27c130d35c60b5e5566c9f1e5be77caf39804636bc1a40133919a949f21","impliedFormat":1},{"version":"c6fd2c5a395f2432786c9cb8deb870b9b0e8ff7e22c029954fabdd692bff6195","impliedFormat":1},{"version":"1d6e127068ea8e104a912e42fc0a110e2aa5a66a356a917a163e8cf9a65e4a75","impliedFormat":1},{"version":"5ded6427296cdf3b9542de4471d2aa8d3983671d4cac0f4bf9c637208d1ced43","impliedFormat":1},{"version":"7f182617db458e98fc18dfb272d40aa2fff3a353c44a89b2c0ccb3937709bfb5","impliedFormat":1},{"version":"cadc8aced301244057c4e7e73fbcae534b0f5b12a37b150d80e5a45aa4bebcbd","impliedFormat":1},{"version":"385aab901643aa54e1c36f5ef3107913b10d1b5bb8cbcd933d4263b80a0d7f20","impliedFormat":1},{"version":"9670d44354bab9d9982eca21945686b5c24a3f893db73c0dae0fd74217a4c219","impliedFormat":1},{"version":"0b8a9268adaf4da35e7fa830c8981cfa22adbbe5b3f6f5ab91f6658899e657a7","impliedFormat":1},{"version":"11396ed8a44c02ab9798b7dca436009f866e8dae3c9c25e8c1fbc396880bf1bb","impliedFormat":1},{"version":"ba7bc87d01492633cb5a0e5da8a4a42a1c86270e7b3d2dea5d156828a84e4882","impliedFormat":1},{"version":"4893a895ea92c85345017a04ed427cbd6a1710453338df26881a6019432febdd","impliedFormat":1},{"version":"c21dc52e277bcfc75fac0436ccb75c204f9e1b3fa5e12729670910639f27343e","impliedFormat":1},{"version":"13f6f39e12b1518c6650bbb220c8985999020fe0f21d818e28f512b7771d00f9","impliedFormat":1},{"version":"9b5369969f6e7175740bf51223112ff209f94ba43ecd3bb09eefff9fd675624a","impliedFormat":1},{"version":"4fe9e626e7164748e8769bbf74b538e09607f07ed17c2f20af8d680ee49fc1da","impliedFormat":1},{"version":"24515859bc0b836719105bb6cc3d68255042a9f02a6022b3187948b204946bd2","impliedFormat":1},{"version":"ea0148f897b45a76544ae179784c95af1bd6721b8610af9ffa467a518a086a43","impliedFormat":1},{"version":"24c6a117721e606c9984335f71711877293a9651e44f59f3d21c1ea0856f9cc9","impliedFormat":1},{"version":"dd3273ead9fbde62a72949c97dbec2247ea08e0c6952e701a483d74ef92d6a17","impliedFormat":1},{"version":"405822be75ad3e4d162e07439bac80c6bcc6dbae1929e179cf467ec0b9ee4e2e","impliedFormat":1},{"version":"0db18c6e78ea846316c012478888f33c11ffadab9efd1cc8bcc12daded7a60b6","impliedFormat":1},{"version":"e61be3f894b41b7baa1fbd6a66893f2579bfad01d208b4ff61daef21493ef0a8","impliedFormat":1},{"version":"bd0532fd6556073727d28da0edfd1736417a3f9f394877b6d5ef6ad88fba1d1a","impliedFormat":1},{"version":"89167d696a849fce5ca508032aabfe901c0868f833a8625d5a9c6e861ef935d2","impliedFormat":1},{"version":"615ba88d0128ed16bf83ef8ccbb6aff05c3ee2db1cc0f89ab50a4939bfc1943f","impliedFormat":1},{"version":"a4d551dbf8746780194d550c88f26cf937caf8d56f102969a110cfaed4b06656","impliedFormat":1},{"version":"8bd86b8e8f6a6aa6c49b71e14c4ffe1211a0e97c80f08d2c8cc98838006e4b88","impliedFormat":1},{"version":"317e63deeb21ac07f3992f5b50cdca8338f10acd4fbb7257ebf56735bf52ab00","impliedFormat":1},{"version":"4732aec92b20fb28c5fe9ad99521fb59974289ed1e45aecb282616202184064f","impliedFormat":1},{"version":"2e85db9e6fd73cfa3d7f28e0ab6b55417ea18931423bd47b409a96e4a169e8e6","impliedFormat":1},{"version":"c46e079fe54c76f95c67fb89081b3e399da2c7d109e7dca8e4b58d83e332e605","impliedFormat":1},{"version":"bf67d53d168abc1298888693338cb82854bdb2e69ef83f8a0092093c2d562107","impliedFormat":1},{"version":"b52476feb4a0cbcb25e5931b930fc73cb6643fb1a5060bf8a3dda0eeae5b4b68","affectsGlobalScope":true,"impliedFormat":1},{"version":"e2677634fe27e87348825bb041651e22d50a613e2fdf6a4a3ade971d71bac37e","impliedFormat":1},{"version":"7394959e5a741b185456e1ef5d64599c36c60a323207450991e7a42e08911419","impliedFormat":1},{"version":"8c0bcd6c6b67b4b503c11e91a1fb91522ed585900eab2ab1f61bba7d7caa9d6f","impliedFormat":1},{"version":"8cd19276b6590b3ebbeeb030ac271871b9ed0afc3074ac88a94ed2449174b776","affectsGlobalScope":true,"impliedFormat":1},{"version":"696eb8d28f5949b87d894b26dc97318ef944c794a9a4e4f62360cd1d1958014b","impliedFormat":1},{"version":"3f8fa3061bd7402970b399300880d55257953ee6d3cd408722cb9ac20126460c","impliedFormat":1},{"version":"35ec8b6760fd7138bbf5809b84551e31028fb2ba7b6dc91d95d098bf212ca8b4","affectsGlobalScope":true,"impliedFormat":1},{"version":"5524481e56c48ff486f42926778c0a3cce1cc85dc46683b92b1271865bcf015a","impliedFormat":1},{"version":"68bd56c92c2bd7d2339457eb84d63e7de3bd56a69b25f3576e1568d21a162398","affectsGlobalScope":true,"impliedFormat":1},{"version":"3e93b123f7c2944969d291b35fed2af79a6e9e27fdd5faa99748a51c07c02d28","impliedFormat":1},{"version":"9d19808c8c291a9010a6c788e8532a2da70f811adb431c97520803e0ec649991","impliedFormat":1},{"version":"87aad3dd9752067dc875cfaa466fc44246451c0c560b820796bdd528e29bef40","impliedFormat":1},{"version":"4aacb0dd020eeaef65426153686cc639a78ec2885dc72ad220be1d25f1a439df","impliedFormat":1},{"version":"f0bd7e6d931657b59605c44112eaf8b980ba7f957a5051ed21cb93d978cf2f45","impliedFormat":1},{"version":"8db0ae9cb14d9955b14c214f34dae1b9ef2baee2fe4ce794a4cd3ac2531e3255","affectsGlobalScope":true,"impliedFormat":1},{"version":"15fc6f7512c86810273af28f224251a5a879e4261b4d4c7e532abfbfc3983134","impliedFormat":1},{"version":"58adba1a8ab2d10b54dc1dced4e41f4e7c9772cbbac40939c0dc8ce2cdb1d442","impliedFormat":1},{"version":"641942a78f9063caa5d6b777c99304b7d1dc7328076038c6d94d8a0b81fc95c1","impliedFormat":1},{"version":"714435130b9015fae551788df2a88038471a5a11eb471f27c4ede86552842bc9","impliedFormat":1},{"version":"855cd5f7eb396f5f1ab1bc0f8580339bff77b68a770f84c6b254e319bbfd1ac7","impliedFormat":1},{"version":"5650cf3dace09e7c25d384e3e6b818b938f68f4e8de96f52d9c5a1b3db068e86","impliedFormat":1},{"version":"1354ca5c38bd3fd3836a68e0f7c9f91f172582ba30ab15bb8c075891b91502b7","affectsGlobalScope":true,"impliedFormat":1},{"version":"27fdb0da0daf3b337c5530c5f266efe046a6ceb606e395b346974e4360c36419","impliedFormat":1},{"version":"2d2fcaab481b31a5882065c7951255703ddbe1c0e507af56ea42d79ac3911201","impliedFormat":1},{"version":"a192fe8ec33f75edbc8d8f3ed79f768dfae11ff5735e7fe52bfa69956e46d78d","impliedFormat":1},{"version":"ca867399f7db82df981d6915bcbb2d81131d7d1ef683bc782b59f71dda59bc85","affectsGlobalScope":true,"impliedFormat":1},{"version":"372413016d17d804e1d139418aca0c68e47a83fb6669490857f4b318de8cccb3","affectsGlobalScope":true,"impliedFormat":1},{"version":"9e043a1bc8fbf2a255bccf9bf27e0f1caf916c3b0518ea34aa72357c0afd42ec","impliedFormat":1},{"version":"b4f70ec656a11d570e1a9edce07d118cd58d9760239e2ece99306ee9dfe61d02","impliedFormat":1},{"version":"3bc2f1e2c95c04048212c569ed38e338873f6a8593930cf5a7ef24ffb38fc3b6","impliedFormat":1},{"version":"6e70e9570e98aae2b825b533aa6292b6abd542e8d9f6e9475e88e1d7ba17c866","impliedFormat":1},{"version":"f9d9d753d430ed050dc1bf2667a1bab711ccbb1c1507183d794cc195a5b085cc","impliedFormat":1},{"version":"9eece5e586312581ccd106d4853e861aaaa1a39f8e3ea672b8c3847eedd12f6e","impliedFormat":1},{"version":"47ab634529c5955b6ad793474ae188fce3e6163e3a3fb5edd7e0e48f14435333","impliedFormat":1},{"version":"37ba7b45141a45ce6e80e66f2a96c8a5ab1bcef0fc2d0f56bb58df96ec67e972","impliedFormat":1},{"version":"45650f47bfb376c8a8ed39d4bcda5902ab899a3150029684ee4c10676d9fbaee","impliedFormat":1},{"version":"fad4e3c207fe23922d0b2d06b01acbfb9714c4f2685cf80fd384c8a100c82fd0","affectsGlobalScope":true,"impliedFormat":1},{"version":"74cf591a0f63db318651e0e04cb55f8791385f86e987a67fd4d2eaab8191f730","impliedFormat":1},{"version":"5eab9b3dc9b34f185417342436ec3f106898da5f4801992d8ff38ab3aff346b5","impliedFormat":1},{"version":"12ed4559eba17cd977aa0db658d25c4047067444b51acfdcbf38470630642b23","affectsGlobalScope":true,"impliedFormat":1},{"version":"f3ffabc95802521e1e4bcba4c88d8615176dc6e09111d920c7a213bdda6e1d65","impliedFormat":1},{"version":"809821b8a065e3234a55b3a9d7846231ed18d66dd749f2494c66288d890daf7f","impliedFormat":1},{"version":"ae56f65caf3be91108707bd8dfbccc2a57a91feb5daabf7165a06a945545ed26","impliedFormat":1},{"version":"a136d5de521da20f31631a0a96bf712370779d1c05b7015d7019a9b2a0446ca9","impliedFormat":1},{"version":"c3b41e74b9a84b88b1dca61ec39eee25c0dbc8e7d519ba11bb070918cfacf656","affectsGlobalScope":true,"impliedFormat":1},{"version":"4737a9dc24d0e68b734e6cfbcea0c15a2cfafeb493485e27905f7856988c6b29","affectsGlobalScope":true,"impliedFormat":1},{"version":"36d8d3e7506b631c9582c251a2c0b8a28855af3f76719b12b534c6edf952748d","impliedFormat":1},{"version":"1ca69210cc42729e7ca97d3a9ad48f2e9cb0042bada4075b588ae5387debd318","impliedFormat":1},{"version":"f5ebe66baaf7c552cfa59d75f2bfba679f329204847db3cec385acda245e574e","impliedFormat":1},{"version":"ed59add13139f84da271cafd32e2171876b0a0af2f798d0c663e8eeb867732cf","affectsGlobalScope":true,"impliedFormat":1},{"version":"b7c5e2ea4a9749097c347454805e933844ed207b6eefec6b7cfd418b5f5f7b28","impliedFormat":1},{"version":"b1810689b76fd473bd12cc9ee219f8e62f54a7d08019a235d07424afbf074d25","impliedFormat":1},{"version":"8caa5c86be1b793cd5f599e27ecb34252c41e011980f7d61ae4989a149ff6ccc","impliedFormat":1},{"version":"f9fd93190acb1ffe0bc0fb395df979452f8d625071e9ffc8636e4dfb86ab2508","impliedFormat":1},{"version":"5f41fd8732a89e940c58ce22206e3df85745feb8983e2b4c6257fb8cbb118493","impliedFormat":1},{"version":"17ed71200119e86ccef2d96b73b02ce8854b76ad6bd21b5021d4269bec527b5f","impliedFormat":1},{"version":"1cfa8647d7d71cb03847d616bd79320abfc01ddea082a49569fda71ac5ece66b","impliedFormat":1},{"version":"bb7a61dd55dc4b9422d13da3a6bb9cc5e89be888ef23bbcf6558aa9726b89a1c","impliedFormat":1},{"version":"db6d2d9daad8a6d83f281af12ce4355a20b9a3e71b82b9f57cddcca0a8964a96","impliedFormat":1},{"version":"cfe4ef4710c3786b6e23dae7c086c70b4f4835a2e4d77b75d39f9046106e83d3","impliedFormat":1},{"version":"cbea99888785d49bb630dcbb1613c73727f2b5a2cf02e1abcaab7bcf8d6bf3c5","impliedFormat":1},{"version":"98817124fd6c4f60e0b935978c207309459fb71ab112cf514f26f333bf30830e","impliedFormat":1},{"version":"a86f82d646a739041d6702101afa82dcb935c416dd93cbca7fd754fd0282ce1f","impliedFormat":1},{"version":"2dad084c67e649f0f354739ec7df7c7df0779a28a4f55c97c6b6883ae850d1ce","impliedFormat":1},{"version":"fa5bbc7ab4130dd8cdc55ea294ec39f76f2bc507a0f75f4f873e38631a836ca7","impliedFormat":1},{"version":"df45ca1176e6ac211eae7ddf51336dc075c5314bc5c253651bae639defd5eec5","impliedFormat":1},{"version":"cf86de1054b843e484a3c9300d62fbc8c97e77f168bbffb131d560ca0474d4a8","impliedFormat":1},{"version":"196c960b12253fde69b204aa4fbf69470b26daf7a430855d7f94107a16495ab0","impliedFormat":1},{"version":"528637e771ee2e808390d46a591eaef375fa4b9c99b03749e22b1d2e868b1b7c","impliedFormat":1},{"version":"bf24f6d35f7318e246010ffe9924395893c4e96d34324cde77151a73f078b9ad","impliedFormat":1},{"version":"596ccf4070268c4f5a8c459d762d8a934fa9b9317c7bf7a953e921bc9d78ce3c","impliedFormat":1},{"version":"10595c7ff5094dd5b6a959ccb1c00e6a06441b4e10a87bc09c15f23755d34439","impliedFormat":1},{"version":"9620c1ff645afb4a9ab4044c85c26676f0a93e8c0e4b593aea03a89ccb47b6d0","impliedFormat":1},{"version":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","impliedFormat":1},{"version":"a9af0e608929aaf9ce96bd7a7b99c9360636c31d73670e4af09a09950df97841","impliedFormat":1},{"version":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","impliedFormat":1},{"version":"c86fe861cf1b4c46a0fb7d74dffe596cf679a2e5e8b1456881313170f092e3fa","impliedFormat":1},{"version":"08ed0b3f0166787f84a6606f80aa3b1388c7518d78912571b203817406e471da","impliedFormat":1},{"version":"47e5af2a841356a961f815e7c55d72554db0c11b4cba4d0caab91f8717846a94","impliedFormat":1},{"version":"9a1a0dc84fecc111e83281743f003e1ae9048e0f83c2ae2028d17bc58fd93cc7","impliedFormat":1},{"version":"f5f541902bf7ae0512a177295de9b6bcd6809ea38307a2c0a18bfca72212f368","impliedFormat":1},{"version":"e8da637cbd6ed1cf6c36e9424f6bcee4515ca2c677534d4006cbd9a05f930f0c","impliedFormat":1},{"version":"ca1b882a105a1972f82cc58e3be491e7d750a1eb074ffd13b198269f57ed9e1b","impliedFormat":1},{"version":"fc3e1c87b39e5ba1142f27ec089d1966da168c04a859a4f6aab64dceae162c2b","impliedFormat":1},{"version":"3867ca0e9757cc41e04248574f4f07b8f9e3c0c2a796a5eb091c65bfd2fc8bdb","impliedFormat":1},{"version":"61888522cec948102eba94d831c873200aa97d00d8989fdfd2a3e0ee75ec65a2","impliedFormat":1},{"version":"4e10622f89fea7b05dd9b52fb65e1e2b5cbd96d4cca3d9e1a60bb7f8a9cb86a1","impliedFormat":1},{"version":"74b2a5e5197bd0f2e0077a1ea7c07455bbea67b87b0869d9786d55104006784f","impliedFormat":1},{"version":"59bf32919de37809e101acffc120596a9e45fdbab1a99de5087f31fdc36e2f11","impliedFormat":1},{"version":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","impliedFormat":1},{"version":"3df3abb3e7c1a74ab419f95500a998b55dd9bc985e295de96ff315dd94c7446f","impliedFormat":1},{"version":"c40c848daad198266370c1c72a7a8c3d18d2f50727c7859fcfefd3ff69a7f288","impliedFormat":1},{"version":"ac60bbee0d4235643cc52b57768b22de8c257c12bd8c2039860540cab1fa1d82","impliedFormat":1},{"version":"973b59a17aaa817eb205baf6c132b83475a5c0a44e8294a472af7793b1817e89","impliedFormat":1},{"version":"ada39cbb2748ab2873b7835c90c8d4620723aedf323550e8489f08220e477c7f","impliedFormat":1},{"version":"6e5f5cee603d67ee1ba6120815497909b73399842254fc1e77a0d5cdc51d8c9c","impliedFormat":1},{"version":"8dba67056cbb27628e9b9a1cba8e57036d359dceded0725c72a3abe4b6c79cd4","impliedFormat":1},{"version":"70f3814c457f54a7efe2d9ce9d2686de9250bb42eb7f4c539bd2280a42e52d33","impliedFormat":1},{"version":"5cbd32af037805215112472e35773bad9d4e03f0e72b1129a0d0c12d9cd63cc7","impliedFormat":1},{"version":"ef61792acbfa8c27c9bd113f02731e66229f7d3a169e3c1993b508134f1a58e0","impliedFormat":1},{"version":"afcb759e8e3ad6549d5798820697002bc07bdd039899fad0bf522e7e8a9f5866","impliedFormat":1},{"version":"f6404e7837b96da3ea4d38c4f1a3812c96c9dcdf264e93d5bdb199f983a3ef4b","impliedFormat":1},{"version":"c5426dbfc1cf90532f66965a7aa8c1136a78d4d0f96d8180ecbfc11d7722f1a5","impliedFormat":1},{"version":"65a15fc47900787c0bd18b603afb98d33ede930bed1798fc984d5ebb78b26cf9","impliedFormat":1},{"version":"9d202701f6e0744adb6314d03d2eb8fc994798fc83d91b691b75b07626a69801","impliedFormat":1},{"version":"de9d2df7663e64e3a91bf495f315a7577e23ba088f2949d5ce9ec96f44fba37d","impliedFormat":1},{"version":"c7af78a2ea7cb1cd009cfb5bdb48cd0b03dad3b54f6da7aab615c2e9e9d570c5","impliedFormat":1},{"version":"1ee45496b5f8bdee6f7abc233355898e5bf9bd51255db65f5ff7ede617ca0027","impliedFormat":1},{"version":"566e5fb812082f8cf929c6727d40924843246cf19ee4e8b9437a6315c4792b03","affectsGlobalScope":true,"impliedFormat":1},{"version":"db01d18853469bcb5601b9fc9826931cc84cc1a1944b33cad76fd6f1e3d8c544","affectsGlobalScope":true,"impliedFormat":1},{"version":"dba114fb6a32b355a9cfc26ca2276834d72fe0e94cd2c3494005547025015369","impliedFormat":1},{"version":"903e299a28282fa7b714586e28409ed73c3b63f5365519776bf78e8cf173db36","affectsGlobalScope":true,"impliedFormat":1},{"version":"fa6c12a7c0f6b84d512f200690bfc74819e99efae69e4c95c4cd30f6884c526e","impliedFormat":1},{"version":"f1c32f9ce9c497da4dc215c3bc84b722ea02497d35f9134db3bb40a8d918b92b","impliedFormat":1},{"version":"b73c319af2cc3ef8f6421308a250f328836531ea3761823b4cabbd133047aefa","affectsGlobalScope":true,"impliedFormat":1},{"version":"e433b0337b8106909e7953015e8fa3f2d30797cea27141d1c5b135365bb975a6","impliedFormat":1},{"version":"dd3900b24a6a8745efeb7ad27629c0f8a626470ac229c1d73f1fe29d67e44dca","impliedFormat":1},{"version":"ddff7fc6edbdc5163a09e22bf8df7bef75f75369ebd7ecea95ba55c4386e2441","impliedFormat":1},{"version":"106c6025f1d99fd468fd8bf6e5bda724e11e5905a4076c5d29790b6c3745e50c","impliedFormat":1},{"version":"ec29be0737d39268696edcec4f5e97ce26f449fa9b7afc2f0f99a86def34a418","impliedFormat":1},{"version":"68a06fb972b2c7e671bf090dc5a5328d22ba07d771376c3d9acd9e7ed786a9db","impliedFormat":1},{"version":"ec6cba1c02c675e4dd173251b156792e8d3b0c816af6d6ad93f1a55d674591aa","impliedFormat":1},{"version":"b620391fe8060cf9bedc176a4d01366e6574d7a71e0ac0ab344a4e76576fcbb8","impliedFormat":1},{"version":"d729408dfde75b451530bcae944cf89ee8277e2a9df04d1f62f2abfd8b03c1e1","impliedFormat":1},{"version":"e15d3c84d5077bb4a3adee4c791022967b764dc41cb8fa3cfa44d4379b2c95f5","impliedFormat":1},{"version":"78244a2a8ab1080e0dd8fc3633c204c9a4be61611d19912f4b157f7ef7367049","impliedFormat":1},{"version":"e1fc1a1045db5aa09366be2b330e4ce391550041fc3e925f60998ca0b647aa97","impliedFormat":1},{"version":"d3f5861c48322adc023d3277e592635402ac008c5beae2e447b335fbf0da56c2","impliedFormat":1},{"version":"43ba4f2fa8c698f5c304d21a3ef596741e8e85a810b7c1f9b692653791d8d97a","impliedFormat":1},{"version":"31fb49ef3aa3d76f0beb644984e01eab0ea222372ea9b49bb6533be5722d756c","impliedFormat":1},{"version":"33cd131e1461157e3e06b06916b5176e7a8ec3fce15a5cfe145e56de744e07d2","impliedFormat":1},{"version":"889ef863f90f4917221703781d9723278db4122d75596b01c429f7c363562b86","impliedFormat":1},{"version":"3556cfbab7b43da96d15a442ddbb970e1f2fc97876d055b6555d86d7ac57dae5","impliedFormat":1},{"version":"437751e0352c6e924ddf30e90849f1d9eb00ca78c94d58d6a37202ec84eb8393","impliedFormat":1},{"version":"48e8af7fdb2677a44522fd185d8c87deff4d36ee701ea003c6c780b1407a1397","impliedFormat":1},{"version":"d11308de5a36c7015bb73adb5ad1c1bdaac2baede4cc831a05cf85efa3cc7f2f","impliedFormat":1},{"version":"8c9f19c480c747b6d8067c53fcc3cef641619029afb0a903672daed3f5acaed2","impliedFormat":1},{"version":"f9812cfc220ecf7557183379531fa409acd249b9e5b9a145d0d52b76c20862de","affectsGlobalScope":true,"impliedFormat":1},{"version":"7b068371563d0396a065ed64b049cffeb4eed89ad433ae7730fc31fb1e00ebf3","impliedFormat":1},{"version":"2e4f37ffe8862b14d8e24ae8763daaa8340c0df0b859d9a9733def0eee7562d9","impliedFormat":1},{"version":"13283350547389802aa35d9f2188effaeac805499169a06ef5cd77ce2a0bd63f","impliedFormat":1},{"version":"680793958f6a70a44c8d9ae7d46b7a385361c69ac29dcab3ed761edce1c14ab8","impliedFormat":1},{"version":"6ac6715916fa75a1f7ebdfeacac09513b4d904b667d827b7535e84ff59679aff","impliedFormat":1},{"version":"42c169fb8c2d42f4f668c624a9a11e719d5d07dacbebb63cbcf7ef365b0a75b3","impliedFormat":1},{"version":"913ddbba170240070bd5921b8f33ea780021bdf42fbdfcd4fcb2691b1884ddde","impliedFormat":1},{"version":"74c105214ddd747037d2a75da6588ec8aa1882f914e1f8a312c528f86feca2b9","impliedFormat":1},{"version":"5fe23bd829e6be57d41929ac374ee9551ccc3c44cee893167b7b5b77be708014","impliedFormat":1},{"version":"4d85f80132e24d9a5b5c5e0734e4ecd6878d8c657cc990ecc70845ef384ca96f","impliedFormat":1},{"version":"438c7513b1df91dcef49b13cd7a1c4720f91a36e88c1df731661608b7c055f10","impliedFormat":1},{"version":"cf185cc4a9a6d397f416dd28cca95c227b29f0f27b160060a95c0e5e36cda865","impliedFormat":1},{"version":"0086f3e4ad898fd7ca56bb223098acfacf3fa065595182aaf0f6c4a6a95e6fbd","impliedFormat":1},{"version":"efaa078e392f9abda3ee8ade3f3762ab77f9c50b184e6883063a911742a4c96a","impliedFormat":1},{"version":"54a8bb487e1dc04591a280e7a673cdfb272c83f61e28d8a64cf1ac2e63c35c51","impliedFormat":1},{"version":"021a9498000497497fd693dd315325484c58a71b5929e2bbb91f419b04b24cea","impliedFormat":1},{"version":"9385cdc09850950bc9b59cca445a3ceb6fcca32b54e7b626e746912e489e535e","impliedFormat":1},{"version":"2894c56cad581928bb37607810af011764a2f511f575d28c9f4af0f2ef02d1ab","impliedFormat":1},{"version":"0a72186f94215d020cb386f7dca81d7495ab6c17066eb07d0f44a5bf33c1b21a","impliedFormat":1},{"version":"84124384abae2f6f66b7fbfc03862d0c2c0b71b826f7dbf42c8085d31f1d3f95","impliedFormat":1},{"version":"63a8e96f65a22604eae82737e409d1536e69a467bb738bec505f4f97cce9d878","impliedFormat":1},{"version":"3fd78152a7031315478f159c6a5872c712ece6f01212c78ea82aef21cb0726e2","impliedFormat":1},{"version":"3a6ed8e1d630cfa1f7edf0dc46a6e20ca6c714dbe754409699008571dfe473a6","impliedFormat":1},{"version":"512fc15cca3a35b8dbbf6e23fe9d07e6f87ad03c895acffd3087ce09f352aad0","impliedFormat":1},{"version":"9a0946d15a005832e432ea0cd4da71b57797efb25b755cc07f32274296d62355","impliedFormat":1},{"version":"a52ff6c0a149e9f370372fc3c715d7f2beee1f3bab7980e271a7ab7d313ec677","impliedFormat":1},{"version":"fd933f824347f9edd919618a76cdb6a0c0085c538115d9a287fa0c7f59957ab3","impliedFormat":1},{"version":"6ac6715916fa75a1f7ebdfeacac09513b4d904b667d827b7535e84ff59679aff","impliedFormat":1},{"version":"6a1aa3e55bdc50503956c5cd09ae4cd72e3072692d742816f65c66ca14f4dfdd","impliedFormat":1},{"version":"ab75cfd9c4f93ffd601f7ca1753d6a9d953bbedfbd7a5b3f0436ac8a1de60dfa","impliedFormat":1},{"version":"59c68235df3905989afa0399381c1198313aaaf1ed387f57937eb616625dff15","impliedFormat":1},{"version":"b73cbf0a72c8800cf8f96a9acfe94f3ad32ca71342a8908b8ae484d61113f647","impliedFormat":1},{"version":"bae6dd176832f6423966647382c0d7ba9e63f8c167522f09a982f086cd4e8b23","impliedFormat":1},{"version":"1364f64d2fb03bbb514edc42224abd576c064f89be6a990136774ecdd881a1da","impliedFormat":1},{"version":"c9958eb32126a3843deedda8c22fb97024aa5d6dd588b90af2d7f2bfac540f23","impliedFormat":1},{"version":"950fb67a59be4c2dbe69a5786292e60a5cb0e8612e0e223537784c731af55db1","impliedFormat":1},{"version":"e927c2c13c4eaf0a7f17e6022eee8519eb29ef42c4c13a31e81a611ab8c95577","impliedFormat":1},{"version":"07ca44e8d8288e69afdec7a31fa408ce6ab90d4f3d620006701d5544646da6aa","impliedFormat":1},{"version":"70246ad95ad8a22bdfe806cb5d383a26c0c6e58e7207ab9c431f1cb175aca657","impliedFormat":1},{"version":"f00f3aa5d64ff46e600648b55a79dcd1333458f7a10da2ed594d9f0a44b76d0b","impliedFormat":1},{"version":"772d8d5eb158b6c92412c03228bd9902ccb1457d7a705b8129814a5d1a6308fc","impliedFormat":1},{"version":"4e4475fba4ed93a72f167b061cd94a2e171b82695c56de9899275e880e06ba41","impliedFormat":1},{"version":"97c5f5d580ab2e4decd0a3135204050f9b97cd7908c5a8fbc041eadede79b2fa","impliedFormat":1},{"version":"c99a3a5f2215d5b9d735aa04cec6e61ed079d8c0263248e298ffe4604d4d0624","impliedFormat":1},{"version":"49b2375c586882c3ac7f57eba86680ff9742a8d8cb2fe25fe54d1b9673690d41","impliedFormat":1},{"version":"802e797bcab5663b2c9f63f51bdf67eff7c41bc64c0fd65e6da3e7941359e2f7","impliedFormat":1},{"version":"b98ce74c2bc49a9b79408f049c49909190c747b0462e78f91c09618da86bae53","impliedFormat":1},{"version":"3ecfccf916fea7c6c34394413b55eb70e817a73e39b4417d6573e523784e3f8e","impliedFormat":1},{"version":"c05bc82af01e673afc99bdffd4ebafde22ab027d63e45be9e1f1db3bc39e2fc0","impliedFormat":1},{"version":"6459054aabb306821a043e02b89d54da508e3a6966601a41e71c166e4ea1474f","impliedFormat":1},{"version":"f416c9c3eee9d47ff49132c34f96b9180e50485d435d5748f0e8b72521d28d2e","impliedFormat":1},{"version":"05c97cddbaf99978f83d96de2d8af86aded9332592f08ce4a284d72d0952c391","impliedFormat":1},{"version":"14e5cdec6f8ae82dfd0694e64903a0a54abdfe37e1d966de3d4128362acbf35f","impliedFormat":1},{"version":"bbc183d2d69f4b59fd4dd8799ffdf4eb91173d1c4ad71cce91a3811c021bf80c","impliedFormat":1},{"version":"7b6ff760c8a240b40dab6e4419b989f06a5b782f4710d2967e67c695ef3e93c4","impliedFormat":1},{"version":"8dbc4134a4b3623fc476be5f36de35c40f2768e2e3d9ed437e0d5f1c4cd850f6","impliedFormat":1},{"version":"4e06330a84dec7287f7ebdd64978f41a9f70a668d3b5edc69d5d4a50b9b376bb","impliedFormat":1},{"version":"65bfa72967fbe9fc33353e1ac03f0480aa2e2ea346d61ff3ea997dfd850f641a","impliedFormat":1},{"version":"8f88c6be9803fe5aaa80b00b27f230c824d4b8a33856b865bea5793cb52bb797","impliedFormat":1},{"version":"f974e4a06953682a2c15d5bd5114c0284d5abf8bc0fe4da25cb9159427b70072","impliedFormat":1},{"version":"872caaa31423f4345983d643e4649fb30f548e9883a334d6d1c5fff68ede22d4","impliedFormat":1},{"version":"94404c4a878fe291e7578a2a80264c6f18e9f1933fbb57e48f0eb368672e389c","impliedFormat":1},{"version":"5c1b7f03aa88be854bc15810bfd5bd5a1943c5a7620e1c53eddd2a013996343e","impliedFormat":1},{"version":"09dfc64fcd6a2785867f2368419859a6cc5a8d4e73cbe2538f205b1642eb0f51","impliedFormat":1},{"version":"bcf6f0a323653e72199105a9316d91463ad4744c546d1271310818b8cef7c608","impliedFormat":1},{"version":"01aa917531e116485beca44a14970834687b857757159769c16b228eb1e49c5f","impliedFormat":1},{"version":"351475f9c874c62f9b45b1f0dc7e2704e80dfd5f1af83a3a9f841f9dfe5b2912","impliedFormat":1},{"version":"ac457ad39e531b7649e7b40ee5847606eac64e236efd76c5d12db95bf4eacd17","impliedFormat":1},{"version":"187a6fdbdecb972510b7555f3caacb44b58415da8d5825d03a583c4b73fde4cf","impliedFormat":1},{"version":"d4c3250105a612202289b3a266bb7e323db144f6b9414f9dea85c531c098b811","impliedFormat":1},{"version":"95b444b8c311f2084f0fb51c616163f950fb2e35f4eaa07878f313a2d36c98a4","impliedFormat":1},{"version":"741067675daa6d4334a2dc80a4452ca3850e89d5852e330db7cb2b5f867173b1","impliedFormat":1},{"version":"f8acecec1114f11690956e007d920044799aefeb3cece9e7f4b1f8a1d542b2c9","impliedFormat":1},{"version":"131b1475d2045f20fb9f43b7aa6b7cb51f25250b5e4c6a1d4aa3cf4dd1a68793","impliedFormat":1},{"version":"3a17f09634c50cce884721f54fd9e7b98e03ac505889c560876291fcf8a09e90","impliedFormat":1},{"version":"32531dfbb0cdc4525296648f53b2b5c39b64282791e2a8c765712e49e6461046","impliedFormat":1},{"version":"0ce1b2237c1c3df49748d61568160d780d7b26693bd9feb3acb0744a152cd86d","impliedFormat":1},{"version":"e489985388e2c71d3542612685b4a7db326922b57ac880f299da7026a4e8a117","impliedFormat":1},{"version":"e1437c5f191edb7a494f7bbbc033b97d72d42e054d521402ee194ac5b6b7bf49","impliedFormat":1},{"version":"04d3aad777b6af5bd000bfc409907a159fe77e190b9d368da4ba649cdc28d39e","affectsGlobalScope":true,"impliedFormat":1},{"version":"fd1b9d883b9446f1e1da1e1033a6a98995c25fbf3c10818a78960e2f2917d10c","impliedFormat":1},{"version":"19252079538942a69be1645e153f7dbbc1ef56b4f983c633bf31fe26aeac32cd","impliedFormat":1},{"version":"bc11f3ac00ac060462597add171220aed628c393f2782ac75dd29ff1e0db871c","impliedFormat":1},{"version":"616775f16134fa9d01fc677ad3f76e68c051a056c22ab552c64cc281a9686790","impliedFormat":1},{"version":"65c24a8baa2cca1de069a0ba9fba82a173690f52d7e2d0f1f7542d59d5eb4db0","impliedFormat":1},{"version":"313c85c332bb6892d5f7c624dc39107ca7a6b2f1b3212db86dbbefbe7f8ddd5a","impliedFormat":1},{"version":"3b0b1d352b8d2e47f1c4df4fb0678702aee071155b12ef0185fce9eb4fa4af1e","impliedFormat":1},{"version":"77e71242e71ebf8528c5802993697878f0533db8f2299b4d36aa015bae08a79c","impliedFormat":1},{"version":"a344403e7a7384e0e7093942533d309194ad0a53eca2a3100c0b0ab4d3932773","impliedFormat":1},{"version":"b7fff2d004c5879cae335db8f954eb1d61242d9f2d28515e67902032723caeab","impliedFormat":1},{"version":"5f3dc10ae646f375776b4e028d2bed039a93eebbba105694d8b910feebbe8b9c","impliedFormat":1},{"version":"bb18bf4a61a17b4a6199eb3938ecfa4a59eb7c40843ad4a82b975ab6f7e3d925","impliedFormat":1},{"version":"4545c1a1ceca170d5d83452dd7c4994644c35cf676a671412601689d9a62da35","impliedFormat":1},{"version":"e9b6fc05f536dfddcdc65dbcf04e09391b1c968ab967382e48924f5cb90d88e1","impliedFormat":1},{"version":"a2d648d333cf67b9aeac5d81a1a379d563a8ffa91ddd61c6179f68de724260ff","impliedFormat":1},{"version":"2b664c3cc544d0e35276e1fb2d4989f7d4b4027ffc64da34ec83a6ccf2e5c528","impliedFormat":1},{"version":"a3f41ed1b4f2fc3049394b945a68ae4fdefd49fa1739c32f149d32c0545d67f5","impliedFormat":1},{"version":"3cd8f0464e0939b47bfccbb9bb474a6d87d57210e304029cd8eb59c63a81935d","impliedFormat":1},{"version":"47699512e6d8bebf7be488182427189f999affe3addc1c87c882d36b7f2d0b0e","impliedFormat":1},{"version":"3026abd48e5e312f2328629ede6e0f770d21c3cd32cee705c450e589d015ee09","impliedFormat":1},{"version":"8b140b398a6afbd17cc97c38aea5274b2f7f39b1ae5b62952cfe65bf493e3e75","impliedFormat":1},{"version":"7663d2c19ce5ef8288c790edba3d45af54e58c84f1b37b1249f6d49d962f3d91","impliedFormat":1},{"version":"30112425b2cf042fca1c79c19e35f88f44bfb2e97454527528cd639dd1a460ca","impliedFormat":1},{"version":"00bd6ebe607246b45296aa2b805bd6a58c859acecda154bfa91f5334d7c175c6","impliedFormat":1},{"version":"ad036a85efcd9e5b4f7dd5c1a7362c8478f9a3b6c3554654ca24a29aa850a9c5","impliedFormat":1},{"version":"fedebeae32c5cdd1a85b4e0504a01996e4a8adf3dfa72876920d3dd6e42978e7","impliedFormat":1},{"version":"504f37ba38bfea8394ec4f397c9a2ade7c78055e41ef5a600073b515c4fd0fc9","impliedFormat":1},{"version":"cdf21eee8007e339b1b9945abf4a7b44930b1d695cc528459e68a3adc39a622e","impliedFormat":1},{"version":"db036c56f79186da50af66511d37d9fe77fa6793381927292d17f81f787bb195","impliedFormat":1},{"version":"87ac2fb61e629e777f4d161dff534c2023ee15afd9cb3b1589b9b1f014e75c58","impliedFormat":1},{"version":"13c8b4348db91e2f7d694adc17e7438e6776bc506d5c8f5de9ad9989707fa3fe","impliedFormat":1},{"version":"3c1051617aa50b38e9efaabce25e10a5dd9b1f42e372ef0e8a674076a68742ed","impliedFormat":1},{"version":"07a3e20cdcb0f1182f452c0410606711fbea922ca76929a41aacb01104bc0d27","impliedFormat":1},{"version":"1de80059b8078ea5749941c9f863aa970b4735bdbb003be4925c853a8b6b4450","impliedFormat":1},{"version":"1d079c37fa53e3c21ed3fa214a27507bda9991f2a41458705b19ed8c2b61173d","impliedFormat":1},{"version":"4cd4b6b1279e9d744a3825cbd7757bbefe7f0708f3f1069179ad535f19e8ed2c","impliedFormat":1},{"version":"5835a6e0d7cd2738e56b671af0e561e7c1b4fb77751383672f4b009f4e161d70","impliedFormat":1},{"version":"c0eeaaa67c85c3bb6c52b629ebbfd3b2292dc67e8c0ffda2fc6cd2f78dc471e6","impliedFormat":1},{"version":"4b7f74b772140395e7af67c4841be1ab867c11b3b82a51b1aeb692822b76c872","impliedFormat":1},{"version":"27be6622e2922a1b412eb057faa854831b95db9db5035c3f6d4b677b902ab3b7","impliedFormat":1},{"version":"b95a6f019095dd1d48fd04965b50dfd63e5743a6e75478343c46d2582a5132bf","impliedFormat":99},{"version":"c2008605e78208cfa9cd70bd29856b72dda7ad89df5dc895920f8e10bcb9cd0a","impliedFormat":99},{"version":"b97cb5616d2ab82a98ec9ada7b9e9cabb1f5da880ec50ea2b8dc5baa4cbf3c16","impliedFormat":99},{"version":"d23df9ff06ae8bf1dcb7cc933e97ae7da418ac77749fecee758bb43a8d69f840","affectsGlobalScope":true,"impliedFormat":1},{"version":"040c71dde2c406f869ad2f41e8d4ce579cc60c8dbe5aa0dd8962ac943b846572","affectsGlobalScope":true,"impliedFormat":1},{"version":"3586f5ea3cc27083a17bd5c9059ede9421d587286d5a47f4341a4c2d00e4fa91","impliedFormat":1},{"version":"a6df929821e62f4719551f7955b9f42c0cd53c1370aec2dd322e24196a7dfe33","impliedFormat":1},{"version":"b789bf89eb19c777ed1e956dbad0925ca795701552d22e68fd130a032008b9f9","impliedFormat":1},"9269d492817e359123ac64c8205e5d05dab63d71a3a7a229e68b5d9a0e8150bf",{"version":"402e5c534fb2b85fa771170595db3ac0dd532112c8fa44fc23f233bc6967488b","impliedFormat":1},{"version":"7965dc3c7648e2a7a586d11781cabb43d4859920716bc2fdc523da912b06570d","impliedFormat":1},{"version":"90c2bd9a3e72fe08b8fa5982e78cb8dc855a1157b26e11e37a793283c52bf64b","impliedFormat":1},{"version":"a8122fe390a2a987079e06c573b1471296114677923c1c094c24a53ddd7344a2","impliedFormat":1},{"version":"70c2cb19c0c42061a39351156653aa0cf5ba1ecdc8a07424dd38e3a1f1e3c7f4","impliedFormat":1},{"version":"a8fb10fd8c7bc7d9b8f546d4d186d1027f8a9002a639bec689b5000dab68e35c","impliedFormat":1},{"version":"c9b467ea59b86bd27714a879b9ad43c16f186012a26d0f7110b1322025ceaa83","impliedFormat":1},{"version":"57ea19c2e6ba094d8087c721bac30ff1c681081dbd8b167ac068590ef633e7a5","impliedFormat":1},{"version":"cba81ec9ae7bc31a4dc56f33c054131e037649d6b9a2cfa245124c67e23e4721","impliedFormat":1},{"version":"ad193f61ba708e01218496f093c23626aa3808c296844a99189be7108a9c8343","impliedFormat":1},{"version":"a0544b3c8b70b2f319a99ea380b55ab5394ede9188cdee452a5d0ce264f258b2","impliedFormat":1},{"version":"8c654c17c334c7c168c1c36e5336896dc2c892de940886c1639bebd9fc7b9be4","impliedFormat":1},{"version":"6a4da742485d5c2eb6bcb322ae96993999ffecbd5660b0219a5f5678d8225bb0","impliedFormat":1},{"version":"c65ca21d7002bdb431f9ab3c7a6e765a489aa5196e7e0ef00aed55b1294df599","impliedFormat":1},{"version":"c8fc655c2c4bafc155ceee01c84ab3d6c03192ced5d3f2de82e20f3d1bd7f9fa","impliedFormat":1},{"version":"be5a7ff3b47f7e553565e9483bdcadb0ca2040ac9e5ec7b81c7e115a81059882","impliedFormat":1},{"version":"1a93f36ecdb60a95e3a3621b561763e2952da81962fae217ab5441ac1d77ffc5","impliedFormat":1},{"version":"2a771d907aebf9391ac1f50e4ad37952943515eeea0dcc7e78aa08f508294668","impliedFormat":1},{"version":"0146fd6262c3fd3da51cb0254bb6b9a4e42931eb2f56329edd4c199cb9aaf804","impliedFormat":1},{"version":"183f480885db5caa5a8acb833c2be04f98056bdcc5fb29e969ff86e07efe57ab","impliedFormat":99},{"version":"b558c9a18ea4e6e4157124465c3ef1063e64640da139e67be5edb22f534f2f08","impliedFormat":1},{"version":"01374379f82be05d25c08d2f30779fa4a4c41895a18b93b33f14aeef51768692","impliedFormat":1},{"version":"b0dee183d4e65cf938242efaf3d833c6b645afb35039d058496965014f158141","impliedFormat":1},{"version":"c0bbbf84d3fbd85dd60d040c81e8964cc00e38124a52e9c5dcdedf45fea3f213","impliedFormat":1},"c30fc9805b445db974a288c3276a0a206b4497e5c2eafe4a477f5c0af069c491","c87bb03b72e47cb63f2d2c96b498a368a0de85733a200dd2c71ca410fced3db6",{"version":"38479e9851ea5f43f60baaa6bc894a49dba0a74dd706ce592d32bcb8b59e3be9","affectsGlobalScope":true,"impliedFormat":1},{"version":"9592f843d45105b9335c4cd364b9b2562ce4904e0895152206ac4f5b2d1bb212","impliedFormat":1},{"version":"f9ff719608ace88cae7cb823f159d5fb82c9550f2f7e6e7d0f4c6e41d4e4edb4","affectsGlobalScope":true,"impliedFormat":1},{"version":"9727eb7b07f1fd14d891412e0a0484a8f01819babcfe2eae9b3b3655f779f5c4","impliedFormat":1},{"version":"41f45ed6b4cd7b8aec2e4888a47d5061ee1020f89375b57d388cfe1f05313991","impliedFormat":99},{"version":"98bb67aa18a720c471e2739441d8bdecdae17c40361914c1ccffab0573356a85","impliedFormat":99},{"version":"8258b4ec62cf9f136f1613e1602156fdd0852bb8715dde963d217ad4d61d8d09","impliedFormat":99},"ce55b5a5ce5e675abf61d5430bfd8eb3dcac3c4121565d8c6255ceb4b74925e1","4de30b20ba9d810b001396e41ea9457585924465c22c1b3c597cd6df99c524ff","d79f92203c7efa24d513ce39358b52f89338b5cf2aca8772b45eb79329d7d1ba","75d49bea7da06ffb459e02b328fc4832ef7c6c393cc957719a3ab870f20b51da","4906f4ef56a0dc1a3caa5115c3199c98c33553277cbcfc1d399716f3b0443bbc","204f55ec5c6fb7228bf7df9af6d8ef67d8861f35dcfba2122ef109504c61a34f","c5bdb4da5b9cefd887ce10ddc8109bd67a6a0bfd1924b31c738e9954401cb4c9","b21a83beb3b028e4341fe8a3919635434abc346c188390fed346505ca7e47583","79dc85b7081875bc3ee3a11053df1839c48f660e9099da9882ce40fd2f4cb999","99f293c5cd322a520d86f83a9c61477855c1b220c79525b901e8618f665f34a4","87c0bd1e525191665ee84e1af459afd13f73a1578ff3be80e5893677b02c47b2","e393cc835b05831ab14c3932876afc70ce23b904ae98af7542a841b7c6fd9f8f","ff797ce29470af35d95ff6a83cd07f45c1842df3426fca71954e51670f063198","a2344ee65b0f2f18db92e9f639f78dfcf3645d8d4c18d5299b0e3f51f51f5b8d","7c44a6d0b911d6fde868261157286640d442689eb60a91b883586cb0daf0026e","77a655d121739afc8162e5530e25bdb4800c9de8c0341a414abdbcdaa4959400","684cb292d39fed9dac15e56a7004ae0436dc8a6cdfd9461e5827550867c70160",{"version":"c57b441e0c0a9cbdfa7d850dae1f8a387d6f81cbffbc3cd0465d530084c2417d","impliedFormat":99},{"version":"26c57c9f839e6d2048d6c25e81f805ba0ca32a28fd4d824399fd5456c9b0575b","impliedFormat":1},"d710fb226c17467f0cdb0d971f64bf2a35e96465dde92e1599a9baa27a3a02dc","40672f62c09b18e49a9a5b1188b5c8ae38f1e7bfe4855c20eac9cf1c1db35c21","81241a38b21114808f4048984b6ce61e83942db8007c19f8d542d10037f4a2a5","c7dec05b0077853ef4ed1d303e059f3664e62cff3fee29835fe646ae0cb25090","3b851874ecd011cb7643163513be1c7367bbc2075fb90432a7254632da29400d",{"version":"96d14f21b7652903852eef49379d04dbda28c16ed36468f8c9fa08f7c14c9538","impliedFormat":1}],"root":[408,433,434,[442,458],[461,465]],"options":{"allowJs":true,"esModuleInterop":true,"jsx":1,"module":99,"skipLibCheck":true,"strict":true},"referencedMap":[[464,1],[465,2],[408,3],[361,4],[466,4],[142,5],[143,5],[144,6],[99,7],[145,8],[146,9],[147,10],[94,4],[97,11],[95,4],[96,4],[148,12],[149,13],[150,14],[151,15],[152,16],[153,17],[154,17],[155,18],[156,19],[157,20],[158,21],[100,4],[98,4],[159,22],[160,23],[161,24],[193,25],[162,26],[163,27],[164,28],[165,29],[166,30],[167,31],[168,32],[169,33],[170,34],[171,35],[172,35],[173,36],[174,4],[175,37],[177,38],[176,39],[178,40],[179,41],[180,42],[181,43],[182,44],[183,45],[184,46],[185,47],[186,48],[187,49],[188,50],[189,51],[190,52],[101,4],[102,4],[103,4],[141,53],[191,54],[192,55],[86,4],[198,56],[199,57],[197,58],[195,59],[196,60],[84,4],[87,61],[285,58],[459,4],[85,4],[437,62],[438,58],[435,4],[436,4],[93,63],[364,64],[368,65],[370,66],[219,67],[233,68],[335,69],[264,4],[338,70],[300,71],[308,72],[336,73],[220,74],[263,4],[265,75],[337,76],[240,77],[221,78],[244,77],[234,77],[204,77],[291,79],[292,80],[209,4],[288,81],[293,82],[379,83],[286,82],[380,84],[270,4],[289,85],[392,86],[391,87],[295,82],[390,4],[388,4],[389,88],[290,58],[277,89],[278,90],[287,91],[303,92],[304,93],[294,94],[272,95],[273,96],[383,97],[386,98],[251,99],[250,100],[249,101],[395,58],[248,102],[225,4],[398,4],[401,4],[400,58],[402,103],[200,4],[329,4],[232,104],[202,105],[352,4],[353,4],[355,4],[358,106],[354,4],[356,107],[357,107],[218,4],[231,4],[363,108],[371,109],[375,110],[214,111],[280,112],[279,4],[271,95],[299,113],[297,114],[296,4],[298,4],[302,115],[275,116],[213,117],[238,118],[326,119],[205,120],[212,121],[201,69],[340,122],[350,123],[339,4],[349,124],[239,4],[223,125],[317,126],[316,4],[323,127],[325,128],[318,129],[322,130],[324,127],[321,129],[320,127],[319,129],[260,131],[245,131],[311,132],[246,132],[207,133],[206,4],[315,134],[314,135],[313,136],[312,137],[208,138],[284,139],[301,140],[283,141],[307,142],[309,143],[306,141],[241,138],[194,4],[327,144],[266,145],[348,146],[269,147],[343,148],[211,4],[344,149],[346,150],[347,151],[330,4],[342,120],[242,152],[328,153],[351,154],[215,4],[217,4],[222,155],[310,156],[210,157],[216,4],[268,158],[267,159],[224,160],[276,161],[274,162],[226,163],[228,164],[399,4],[227,165],[229,166],[366,4],[365,4],[367,4],[397,4],[230,167],[282,58],[92,4],[305,168],[252,4],[262,169],[373,58],[382,170],[259,58],[377,82],[258,171],[360,172],[257,170],[203,4],[384,173],[255,58],[256,58],[247,4],[261,4],[254,174],[253,175],[243,176],[237,94],[345,4],[236,177],[235,4],[369,4],[281,58],[362,178],[83,4],[91,179],[88,58],[89,4],[90,4],[341,180],[334,181],[333,4],[332,182],[331,4],[372,183],[374,184],[376,185],[378,186],[381,187],[407,188],[385,188],[406,189],[387,190],[393,191],[394,192],[396,193],[403,194],[405,4],[404,195],[359,196],[425,197],[423,198],[424,199],[412,200],[413,198],[420,201],[411,202],[416,203],[426,4],[417,204],[422,205],[428,206],[427,207],[410,208],[418,209],[419,210],[414,211],[421,197],[415,212],[409,4],[460,4],[431,213],[430,4],[429,4],[432,214],[81,4],[82,4],[13,4],[14,4],[16,4],[15,4],[2,4],[17,4],[18,4],[19,4],[20,4],[21,4],[22,4],[23,4],[24,4],[3,4],[25,4],[26,4],[4,4],[27,4],[31,4],[28,4],[29,4],[30,4],[32,4],[33,4],[34,4],[5,4],[35,4],[36,4],[37,4],[38,4],[6,4],[42,4],[39,4],[40,4],[41,4],[43,4],[7,4],[44,4],[49,4],[50,4],[45,4],[46,4],[47,4],[48,4],[8,4],[54,4],[51,4],[52,4],[53,4],[55,4],[9,4],[56,4],[57,4],[58,4],[60,4],[59,4],[61,4],[62,4],[10,4],[63,4],[64,4],[65,4],[11,4],[66,4],[67,4],[68,4],[69,4],[70,4],[1,4],[71,4],[72,4],[12,4],[76,4],[74,4],[79,4],[78,4],[73,4],[77,4],[75,4],[80,4],[119,215],[129,216],[118,215],[139,217],[110,218],[109,219],[138,195],[132,220],[137,221],[112,222],[126,223],[111,224],[135,225],[107,226],[106,195],[136,227],[108,228],[113,229],[114,4],[117,229],[104,4],[140,230],[130,231],[121,232],[122,233],[124,234],[120,235],[123,236],[133,195],[115,237],[116,238],[125,239],[105,240],[128,231],[127,229],[131,4],[134,241],[441,242],[440,243],[439,4],[462,244],[463,245],[447,246],[452,247],[457,248],[456,246],[451,249],[450,250],[458,251],[448,252],[455,253],[453,254],[454,255],[434,58],[443,256],[449,4],[461,257],[444,258],[445,258],[446,259],[442,4],[433,260]],"semanticDiagnosticsPerFile":[[444,[{"start":3781,"length":174,"code":2345,"category":1,"messageText":{"messageText":"Argument of type '(state: ActorState) => { actors: Actor[]; actorDetails: { [x: string]: ActorDetail | undefined; }; }' is not assignable to parameter of type 'ActorState | Partial<ActorState> | ((state: ActorState) => ActorState | Partial<ActorState>)'.","category":1,"code":2345,"next":[{"messageText":"Type '(state: ActorState) => { actors: Actor[]; actorDetails: { [x: string]: ActorDetail | undefined; }; }' is not assignable to type '(state: ActorState) => ActorState | Partial<ActorState>'.","category":1,"code":2322,"next":[{"messageText":"Type '{ actors: Actor[]; actorDetails: { [x: string]: ActorDetail | undefined; }; }' is not assignable to type 'ActorState | Partial<ActorState>'.","category":1,"code":2322,"next":[{"messageText":"Type '{ actors: Actor[]; actorDetails: { [x: string]: ActorDetail | undefined; }; }' is not assignable to type 'Partial<ActorState>'.","category":1,"code":2322,"next":[{"messageText":"Types of property 'actorDetails' are incompatible.","category":1,"code":2326,"next":[{"messageText":"Type '{ [x: string]: ActorDetail | undefined; }' is not assignable to type 'Record<string, ActorDetail>'.","category":1,"code":2322,"next":[{"messageText":"'string' index signatures are incompatible.","category":1,"code":2634,"next":[{"messageText":"Type 'ActorDetail | undefined' is not assignable to type 'ActorDetail'.","category":1,"code":2322,"next":[{"messageText":"Type 'undefined' is not assignable to type 'ActorDetail'.","category":1,"code":2322}]}]}],"canonicalHead":{"code":2322,"messageText":"Type '{ actors: Actor[]; actorDetails: { [x: string]: ActorDetail | undefined; }; }' is not assignable to type 'Partial<ActorState>'."}}]}]}],"canonicalHead":{"code":2322,"messageText":"Type '(state: ActorState) => { actors: Actor[]; actorDetails: { [x: string]: ActorDetail | undefined; }; }' is not assignable to type '(state: ActorState) => ActorState | Partial<ActorState>'."}}]}]}}]]],"affectedFilesPendingEmit":[464,465,462,463,447,452,457,456,451,450,458,448,455,453,454,434,443,449,461,444,445,446,442,433],"version":"5.9.3"}
 ```
 
 

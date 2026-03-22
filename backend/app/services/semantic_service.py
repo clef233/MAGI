@@ -19,9 +19,8 @@ from app.models.database import (
     QuestionIntent,
     SemanticTopic,
     SemanticComparison,
-    WorkflowPromptTemplate,
 )
-from app.services.llm_adapter import create_adapter, LLMAdapter
+from app.services.llm_adapter import LLMAdapter
 from app.services.prompt_service import PromptService
 
 logger = logging.getLogger('magi.semantic')
@@ -110,105 +109,16 @@ class SemanticService:
     def __init__(self, db: AsyncSession, prompt_service: PromptService):
         self.db = db
         self.prompt_service = prompt_service
-        self._intent_template: Optional[WorkflowPromptTemplate] = None
-        self._extraction_template: Optional[WorkflowPromptTemplate] = None
-        self._compare_template: Optional[WorkflowPromptTemplate] = None
+        # Templates are loaded via PromptService, no direct template storage needed
 
     async def _load_templates(self):
-        """Load prompt templates from database."""
-        if not self._intent_template:
-            try:
-                self._intent_template = await self.prompt_service.get_template("question_intent_analysis")
-            except:
-                logger.warning("question_intent_analysis template not found, using fallback")
+        """Load prompt templates from database via PromptService.
 
-        if not self._extraction_template:
-            try:
-                self._extraction_template = await self.prompt_service.get_template("semantic_extraction")
-            except:
-                logger.warning("semantic_extraction template not found, using fallback")
-
-        if not self._compare_template:
-            try:
-                self._compare_template = await self.prompt_service.get_template("cross_actor_compare")
-            except:
-                logger.warning("cross_actor_compare template not found, using fallback")
-
-    def _get_fallback_intent_prompt(self, question: str) -> str:
-        """Fallback prompt for question intent analysis."""
-        return f"""你是一个问题分析专家。请分析以下问题，提取其核心意图和比较维度。
-
-问题：{question}
-
-请以 JSON 格式返回：
-{{
-  "question_type": "问题类型（如 investment_decision, analysis, comparison 等）",
-  "user_goal": "用户的核心目标",
-  "time_horizons": ["短期", "中期", "长期"],
-  "comparison_axes": [
-    {{"axis_id": "维度ID", "label": "维度名称"}}
-  ]
-}}
-
-只返回 JSON，不要其他文字。"""
-
-    def _get_fallback_extraction_prompt(self, question: str, answer: str, axes: list[dict]) -> str:
-        """Fallback prompt for semantic extraction."""
-        axes_text = "\n".join([f"- {a.get('axis_id', a.get('label', ''))}: {a.get('label', '')}" for a in axes])
-
-        return f"""你是一个语义分析专家。请分析以下回答，提取其核心主题和立场。
-
-问题：{question}
-
-回答：{answer}
-
-可用的比较维度（axis_id必须从以下列表中选择）：
-{axes_text}
-
-请以 JSON 格式返回该回答的主题：
-{{
-  "topics": [
-    {{
-      "topic_id": "主题标识（唯一ID）",
-      "axis_id": "必须从上面的比较维度列表中选择一个axis_id",
-      "label": "主题名称",
-      "summary": "观点摘要（一句话）",
-      "stance": "立场标签（如：保守、激进、中立）",
-      "time_horizon": "时间维度（short/medium/long）",
-      "risk_level": "风险偏好（low/medium/high）",
-      "novelty": "观点新颖度（low/medium/high）",
-      "quotes": ["原文中支持该观点的引用"]
-    }}
-  ]
-}}
-
-重要：axis_id 必须严格从给定的比较维度列表中选择，不能自己编造。只返回 JSON，不要其他文字。"""
-
-    def _get_fallback_compare_prompt(self, topic_label: str, positions: list[dict]) -> str:
-        """Fallback prompt for cross-actor comparison."""
-        positions_text = "\n\n".join([
-            f"**{p.get('actor_name', 'Unknown')}**: {p.get('summary', '')}"
-            for p in positions
-        ])
-
-        return f"""你是一个观点比较专家。请比较以下多个回答在同一主题上的差异。
-
-主题：{topic_label}
-
-各回答的观点：
-{positions_text}
-
-请以 JSON 格式返回：
-{{
-  "salience": "<0.0-1.0之间的小数，表示该主题的重要性>",
-  "disagreement_score": "<0.0-1.0之间的小数，0表示完全一致，1表示完全分歧>",
-  "status": "converged/divergent/partial",
-  "difference_types": ["solution_class", "time_horizon", "risk_preference"],
-  "agreement_summary": "一致点",
-  "disagreement_summary": "分歧点"
-}}
-
-只返回 JSON，不要其他文字。"""
+        Raises PromptError if templates are missing - NO fallback allowed.
+        """
+        # Templates are loaded on-demand via prompt_service.get_template()
+        # This method exists for compatibility but doesn't store templates locally
+        pass
 
     async def analyze_question_intent(
         self,
@@ -225,15 +135,10 @@ class SemanticService:
         Returns:
             QuestionIntentResult with comparison axes
         """
-        await self._load_templates()
-
-        # Build prompt
-        if self._intent_template:
-            prompt = self.prompt_service.render(self._intent_template.template_text, {
-                "question": question,
-            })
-        else:
-            prompt = self._get_fallback_intent_prompt(question)
+        # Get prompt from PromptService - NO fallback allowed
+        prompt = await self.prompt_service.render_template("question_intent_analysis", {
+            "question": question,
+        })
 
         # Call LLM
         full_response = ""
@@ -291,23 +196,18 @@ class SemanticService:
         Returns:
             List of TopicResult
         """
-        await self._load_templates()
-
         if not comparison_axes:
             comparison_axes = [
                 {"axis_id": "main_topic", "label": "核心观点"},
                 {"axis_id": "approach", "label": "解决思路"},
             ]
 
-        # Build prompt
-        if self._extraction_template:
-            prompt = self.prompt_service.render(self._extraction_template.template_text, {
-                "question": question,
-                "answer": answer,
-                "comparison_axes": json.dumps(comparison_axes, ensure_ascii=False),
-            })
-        else:
-            prompt = self._get_fallback_extraction_prompt(question, answer, comparison_axes)
+        # Get prompt from PromptService - NO fallback allowed
+        prompt = await self.prompt_service.render_template("semantic_extraction", {
+            "question": question,
+            "answer": answer,
+            "comparison_axes": json.dumps(comparison_axes, ensure_ascii=False),
+        })
 
         # Call LLM
         full_response = ""
@@ -361,7 +261,7 @@ class SemanticService:
 
     async def compare_actors(
         self,
-        question: str,
+        question: str,  # noqa: ARG002 - kept for potential future use
         topics_by_actor: dict[str, list[TopicResult]],
         actors: list[Actor],
         adapter: LLMAdapter,
@@ -382,8 +282,6 @@ class SemanticService:
         axis_id comes from the comparison_axes extracted from question intent,
         providing a stable cross-actor alignment coordinate.
         """
-        await self._load_templates()
-
         # Build actor lookup
         actor_map = {a.id: a for a in actors}
 
@@ -425,14 +323,11 @@ class SemanticService:
                     "quotes": topic.quotes[:2] if topic.quotes else [],
                 })
 
-            # Call LLM for comparison
-            if self._compare_template:
-                prompt = self.prompt_service.render(self._compare_template.template_text, {
-                    "topic_label": label,
-                    "actor_positions": json.dumps(positions, ensure_ascii=False),
-                })
-            else:
-                prompt = self._get_fallback_compare_prompt(label, positions)
+            # Call LLM for comparison - NO fallback allowed
+            prompt = await self.prompt_service.render_template("cross_actor_compare", {
+                "topic_label": label,
+                "actor_positions": json.dumps(positions, ensure_ascii=False),
+            })
 
             try:
                 full_response = ""
@@ -531,7 +426,7 @@ class SemanticService:
         phase: str,
         actor_id: str,
         topics: list[TopicResult],
-        cycle: int = 0,
+        cycle: int = 0,  # noqa: ARG002 - kept for API consistency
     ) -> list[SemanticTopic]:
         """Save semantic topics to database."""
         db_topics = []
@@ -563,7 +458,7 @@ class SemanticService:
         round_number: int,
         phase: str,
         comparisons: list[TopicComparisonResult],
-        cycle: int = 0,
+        cycle: int = 0,  # noqa: ARG002 - kept for API consistency
     ) -> list[SemanticComparison]:
         """Save semantic comparisons to database."""
         db_comparisons = []

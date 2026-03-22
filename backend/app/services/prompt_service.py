@@ -11,6 +11,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.models.database import WorkflowPromptTemplate, PromptPreset
+from app.services.prompt_serializer import (
+    BlockPhase,
+    serialize_answer_block,
+    serialize_peer_answer_blocks,
+    serialize_peer_review_blocks,
+    serialize_latest_answer_blocks,
+    serialize_history_blocks,
+    BlockRole,
+)
 
 logger = logging.getLogger('magi.prompts')
 
@@ -143,62 +152,166 @@ class PromptService:
     async def get_review_prompt(
         self,
         question: str,
-        own_answer: str,
-        other_answers: str,
-        actor_custom_prompt: Optional[str] = None,
+        self_actor_name: str,
+        self_answer_block: str,
+        peer_answer_blocks: str,
     ) -> str:
-        """Get the prompt for peer review phase."""
+        """Get the prompt for peer review phase.
+
+        Args:
+            question: The original question
+            self_actor_name: Name of the current actor
+            self_answer_block: Serialized block of the actor's own answer
+            peer_answer_blocks: Serialized blocks of peer answers
+        """
         return await self.render_template("peer_review", {
             "question": question,
-            "own_answer": own_answer,
-            "other_answers": other_answers,
+            "self_actor_name": self_actor_name,
+            "self_answer_block": self_answer_block,
+            "peer_answer_blocks": peer_answer_blocks,
         })
 
     async def get_revision_prompt(
         self,
         question: str,
-        own_answer: str,
-        reviews_about_me: str,
-        actor_custom_prompt: Optional[str] = None,
+        self_actor_name: str,
+        self_previous_answer_block: str,
+        peer_review_blocks: str,
     ) -> str:
-        """Get the prompt for revision phase."""
+        """Get the prompt for revision phase.
+
+        Args:
+            question: The original question
+            self_actor_name: Name of the current actor
+            self_previous_answer_block: Serialized block of the actor's previous answer
+            peer_review_blocks: Serialized blocks of peer reviews about this actor
+        """
         return await self.render_template("revision", {
             "question": question,
-            "own_answer": own_answer,
-            "reviews_about_me": reviews_about_me,
+            "self_actor_name": self_actor_name,
+            "self_previous_answer_block": self_previous_answer_block,
+            "peer_review_blocks": peer_review_blocks,
         })
 
     async def get_summary_prompt(
         self,
         question: str,
-        history: str,
+        self_actor_name: str,
+        history_blocks: str,
     ) -> str:
-        """Get the prompt for summary phase."""
+        """Get the prompt for summary phase.
+
+        Args:
+            question: The original question
+            self_actor_name: Name of the judge actor
+            history_blocks: Serialized blocks of all history
+        """
         return await self.render_template("summary", {
             "question": question,
-            "history": history,
+            "self_actor_name": self_actor_name,
+            "history_blocks": history_blocks,
         })
 
     async def get_convergence_prompt(
         self,
         question: str,
-        latest_answers: str,
+        latest_answer_blocks: str,
     ) -> str:
-        """Get the prompt for convergence check."""
+        """Get the prompt for convergence check.
+
+        Args:
+            question: The original question
+            latest_answer_blocks: Serialized blocks of all latest answers
+        """
         return await self.render_template("convergence_check", {
             "question": question,
-            "latest_answers": latest_answers,
+            "latest_answer_blocks": latest_answer_blocks,
         })
 
     async def get_final_answer_prompt(
         self,
         question: str,
-        actor_answers: str,
+        self_actor_name: str,
+        actor_answer_blocks: str,
         convergence_info: str = "",
     ) -> str:
-        """Get the prompt for final answer phase."""
+        """Get the prompt for final answer phase.
+
+        Args:
+            question: The original question
+            self_actor_name: Name of the judge actor
+            actor_answer_blocks: Serialized blocks of all actor answers
+            convergence_info: Convergence analysis results
+        """
         return await self.render_template("final_answer", {
             "question": question,
-            "actor_answers": actor_answers,
+            "self_actor_name": self_actor_name,
+            "actor_answer_blocks": actor_answer_blocks,
             "convergence_info": convergence_info,
         })
+
+    # === Helper methods for serialization ===
+
+    def build_self_answer_block(
+        self,
+        actor_name: str,
+        content: str,
+        phase: BlockPhase = BlockPhase.INITIAL,
+    ) -> str:
+        """Build a self answer block for the current actor."""
+        return serialize_answer_block(
+            actor_name=actor_name,
+            phase=phase,
+            role=BlockRole.SELF,
+            content=content,
+        )
+
+    def build_peer_answer_blocks(
+        self,
+        answers: list[dict],
+        phase: BlockPhase = BlockPhase.INITIAL,
+    ) -> str:
+        """Build peer answer blocks from a list of answers.
+
+        Args:
+            answers: List of dicts with keys: actor_name, content
+            phase: The debate phase
+        """
+        return serialize_peer_answer_blocks(answers, phase)
+
+    def build_peer_review_blocks(
+        self,
+        reviews: list[dict],
+        phase: BlockPhase = BlockPhase.INITIAL,
+    ) -> str:
+        """Build peer review blocks from a list of reviews.
+
+        Args:
+            reviews: List of dicts with keys: reviewer_name, about_actor_name, content
+            phase: The debate phase
+        """
+        return serialize_peer_review_blocks(reviews, phase)
+
+    def build_latest_answer_blocks(
+        self,
+        answers: list[dict],
+    ) -> str:
+        """Build latest answer blocks for convergence check.
+
+        Args:
+            answers: List of dicts with keys: actor_name, content
+        """
+        return serialize_latest_answer_blocks(answers)
+
+    def build_history_blocks(
+        self,
+        history_items: list[dict],
+        self_actor_name: str,
+    ) -> str:
+        """Build history blocks for summary phase.
+
+        Args:
+            history_items: List of dicts with keys: actor_name, role, cycle, content
+            self_actor_name: Name of the actor viewing the history
+        """
+        return serialize_history_blocks(history_items, self_actor_name)

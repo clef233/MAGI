@@ -63,7 +63,7 @@ async def _seed_default_prompts():
                 key="initial_answer",
                 name="初始回答提示词",
                 description="用于生成初始回答的系统提示词模板",
-                template_text="""你是一名专业的分析者，正在参与一个多模型互评系统。
+                template_text="""你是 {{actor_name}}，一名专业的分析者，正在参与一个多模型互评系统。
 
 请针对以下问题给出你的专业回答。你的回答应该：
 1. 结构清晰，逻辑严谨
@@ -73,7 +73,7 @@ async def _seed_default_prompts():
 问题：{{question}}
 
 请给出你的回答：""",
-                required_variables=["question"],
+                required_variables=["question", "actor_name"],
             ),
             WorkflowPromptTemplate(
                 key="peer_review",
@@ -83,11 +83,19 @@ async def _seed_default_prompts():
 
 原始问题：{{question}}
 
-你的回答：
-{{own_answer}}
+你是 {{self_actor_name}}，下面是你的回答：
+
+{{self_answer_block}}
 
 其他参与者的回答：
-{{other_answers}}
+
+{{peer_answer_blocks}}
+
+## 重要说明
+
+- 引用自己的回答时，请说"我的回答"或"{{self_actor_name}} 的回答"
+- 引用其他参与者时，请使用他们的 actor_name 属性值
+- 不要把自己的回答称为"你的回答"
 
 请从以下角度进行评审：
 1. 各回答的优点和亮点
@@ -95,7 +103,7 @@ async def _seed_default_prompts():
 3. 改进建议
 
 请给出你的评审意见：""",
-                required_variables=["question", "own_answer", "other_answers"],
+                required_variables=["question", "self_actor_name", "self_answer_block", "peer_answer_blocks"],
             ),
             WorkflowPromptTemplate(
                 key="revision",
@@ -105,11 +113,19 @@ async def _seed_default_prompts():
 
 原始问题：{{question}}
 
-你的原始回答：
-{{own_answer}}
+你是 {{self_actor_name}}，你的原始回答：
 
-其他参与者的评审意见：
-{{reviews_about_me}}
+{{self_previous_answer_block}}
+
+其他参与者对你的评审意见：
+
+{{peer_review_blocks}}
+
+## 重要说明
+
+- 引用自己的上一轮回答时，请说"我的上一轮回答"或"{{self_actor_name}} 的上一轮回答"
+- 不要把自己的回答称为"你的回答"
+- 引用评审者时，请使用 reviewer_name 属性值
 
 请根据这些意见修订你的回答：
 1. 接纳合理的批评和建议
@@ -117,13 +133,13 @@ async def _seed_default_prompts():
 3. 提供更全面准确的答案
 
 请给出修订后的回答：""",
-                required_variables=["question", "own_answer", "reviews_about_me"],
+                required_variables=["question", "self_actor_name", "self_previous_answer_block", "peer_review_blocks"],
             ),
             WorkflowPromptTemplate(
                 key="final_answer",
                 name="最终回答提示词",
                 description="综合各模型回答，生成面向用户的最终回答",
-                template_text="""你是一个综合决策助手，需要基于多轮互评的结果，输出一篇面向用户的最终回答。
+                template_text="""你是 {{self_actor_name}}，一个综合决策助手，需要基于多轮互评的结果，输出一篇面向用户的最终回答。
 
 ## 原始问题
 
@@ -131,7 +147,7 @@ async def _seed_default_prompts():
 
 ## 各参与者的最终回答
 
-{{actor_answers}}
+{{actor_answer_blocks}}
 
 ## 收敛分析结果
 
@@ -145,19 +161,26 @@ async def _seed_default_prompts():
 3. 如果收敛度较低，给出分情境建议
 4. 使用清晰、自然的语言，不要使用 JSON 格式
 5. 直接给出最终回答，不要解释过程
+6. 引用参与者观点时，使用 actor_name 属性值
 """,
-                required_variables=["question", "actor_answers", "convergence_info"],
+                required_variables=["question", "self_actor_name", "actor_answer_blocks", "convergence_info"],
             ),
             WorkflowPromptTemplate(
                 key="summary",
                 name="总结提示词",
                 description="总结模型生成最终综合结论",
-                template_text="""你是一个公正的综合者，需要根据多轮互评的结果生成最终的综合结论。
+                template_text="""你是 {{self_actor_name}}，一个公正的综合者，需要根据多轮互评的结果生成最终的综合结论。
 
 原始问题：{{question}}
 
 完整的互评历史：
-{{history}}
+
+{{history_blocks}}
+
+## 重要说明
+
+- 引用参与者观点时，请使用 actor_name 属性值
+- 引用自己的分析时，请说"我认为"或"经综合分析"
 
 请根据以上信息，生成一个综合性的最终回答。你的回答应该：
 1. 整合各参与者的核心观点
@@ -173,7 +196,7 @@ async def _seed_default_prompts():
   "confidence": <你对结论的信心程度，0.0-1.0之间的小数，如果不确定则省略此字段>,
   "recommendation": "最终建议"
 }""",
-                required_variables=["question", "history"],
+                required_variables=["question", "self_actor_name", "history_blocks"],
             ),
             WorkflowPromptTemplate(
                 key="convergence_check",
@@ -184,12 +207,16 @@ async def _seed_default_prompts():
 原始问题：{{question}}
 
 各参与者的最新回答：
-{{latest_answers}}
+
+{{latest_answer_blocks}}
 
 请判断这些回答是否已收敛。收敛的标准是：
 1. 核心观点基本一致
 2. 主要分歧已经缩小到次要细节
 3. 不太可能通过更多轮次获得显著改进
+
+## 重要说明
+- 引用参与者时，请使用 actor_name 属性值
 
 请以 JSON 格式返回：
 {
@@ -199,7 +226,7 @@ async def _seed_default_prompts():
   "agreements": ["已达成共识的点"],
   "disagreements": ["仍存在分歧的点"]
 }""",
-                required_variables=["question", "latest_answers"],
+                required_variables=["question", "latest_answer_blocks"],
             ),
             # Semantic analysis prompts
             WorkflowPromptTemplate(
@@ -301,13 +328,34 @@ async def _seed_default_prompts():
             ),
         ]
 
-        # Only add templates that don't exist
+        # Only add templates that don't exist, or update if variables changed
         added_count = 0
         for wp in workflow_prompts:
             if wp.key not in existing_keys:
                 db.add(wp)
                 added_count += 1
                 logger.info(f"Added missing template: {wp.key}")
+            else:
+                # Check if required_variables mismatch - force update if stale
+                result = await db.execute(
+                    select(WorkflowPromptTemplate)
+                    .where(WorkflowPromptTemplate.key == wp.key)
+                )
+                existing = result.scalar_one_or_none()
+                if existing:
+                    existing_vars = set(existing.required_variables or [])
+                    new_vars = set(wp.required_variables or [])
+                    if existing_vars != new_vars:
+                        logger.warning(
+                            f"Template '{wp.key}' has stale variables: "
+                            f"{list(existing_vars)} → {list(new_vars)}. "
+                            f"Force updating template_text and required_variables."
+                        )
+                        existing.required_variables = wp.required_variables
+                        existing.template_text = wp.template_text
+                        existing.name = wp.name
+                        existing.description = wp.description
+                        added_count += 1
 
         # Load existing preset keys
         result = await db.execute(

@@ -33,6 +33,7 @@ from app.services.llm_adapter import create_adapter, LLMAdapter
 from app.services.prompt_service import PromptService, PromptError
 from app.services.convergence_service import check_convergence, ConvergenceResult
 from app.services.semantic_service import SemanticService
+from app.services.prompt_serializer import BlockPhase
 
 logger = logging.getLogger('magi.debate_engine')
 logger.setLevel(logging.DEBUG)
@@ -352,17 +353,24 @@ class DebateEngine:
                 adapter = self.get_adapter(actor)
                 logger.info(f"Created adapter: {type(adapter).__name__}")
 
-                # Build system prompt from actor config + template
+                # Build system prompt from actor config
                 system_prompt = actor.system_prompt or f"You are {actor.name}, an AI assistant."
                 if actor.custom_instructions:
                     system_prompt += f"\n\n{actor.custom_instructions}"
+
+                # Get initial answer prompt from PromptService - NO fallback
+                initial_prompt = await self.prompt_service.get_initial_answer_prompt(
+                    question=self.session.question,
+                    actor_name=actor.name,
+                    actor_custom_prompt=None,  # Already included in system_prompt above
+                )
 
                 full_response = ""
                 logger.info(f"Calling stream_completion for {actor.name}...")
 
                 # Real streaming: emit each token
                 async for token in adapter.stream_completion(
-                    messages=[{"role": "user", "content": self.session.question}],
+                    messages=[{"role": "user", "content": initial_prompt}],
                     system_prompt=system_prompt,
                     max_tokens=actor.max_tokens,
                     temperature=actor.temperature,
@@ -428,6 +436,7 @@ class DebateEngine:
 
     async def _run_review_round(self, cycle: int, db_round: DBRound):
         """Run review round where each actor critiques others' answers"""
+        phase = BlockPhase.INITIAL if cycle == 1 else BlockPhase.REVISION
 
         # Get latest answers from each actor
         latest_answers = {}
@@ -455,39 +464,41 @@ class DebateEngine:
                 }
             })
 
-            # Get other actors' answers
-            other_responses = []
+            # Build self answer block
+            my_answer = latest_answers.get(actor.id, "")
+            self_answer_block = self.prompt_service.build_self_answer_block(
+                actor_name=actor.name,
+                content=my_answer,
+                phase=phase,
+            )
+
+            # Build peer answer blocks
+            peer_answers = []
             for aid, content in latest_answers.items():
                 if aid != actor.id:
                     other_actor = next((a for a in self.actors if a.id == aid), None)
                     if other_actor:
-                        other_responses.append(f"**{other_actor.name}**: {content}")
+                        peer_answers.append({
+                            "actor_name": other_actor.name,
+                            "content": content,
+                        })
 
-            my_answer = latest_answers.get(actor.id, "")
+            peer_answer_blocks = self.prompt_service.build_peer_answer_blocks(
+                answers=peer_answers,
+                phase=phase,
+            )
 
-            # Build review prompt using prompt_service
+            # Build review prompt using prompt_service - NO fallback allowed
             system_prompt = actor.review_prompt or f"You are {actor.name}. Provide a critical review."
             if actor.custom_instructions:
                 system_prompt += f"\n\n{actor.custom_instructions}"
 
-            try:
-                review_prompt = await self.prompt_service.get_review_prompt(
-                    question=self.session.question,
-                    own_answer=my_answer,
-                    other_answers="\n\n".join(other_responses),
-                )
-            except PromptError:
-                # Fallback to hardcoded prompt if template not found
-                review_prompt = f"""Original question: {self.session.question}
-
-Here are the responses from other participants:
-
-{chr(10).join(other_responses)}
-
-Please provide a critical review of these responses. Focus on:
-1. Key points you agree with
-2. Important points that were missed or incorrect
-3. Suggestions for improvement"""
+            review_prompt = await self.prompt_service.get_review_prompt(
+                question=self.session.question,
+                self_actor_name=actor.name,
+                self_answer_block=self_answer_block,
+                peer_answer_blocks=peer_answer_blocks,
+            )
 
             full_response = ""
             async for token in adapter.stream_completion(
@@ -541,6 +552,7 @@ Please provide a critical review of these responses. Focus on:
 
     async def _run_revision_round(self, cycle: int, review_round: DBRound, db_round: DBRound):
         """Run revision round where actors improve their answers"""
+        phase = BlockPhase.INITIAL if cycle == 1 else BlockPhase.REVISION
 
         # Get review messages
         result = await self.db.execute(
@@ -574,42 +586,42 @@ Please provide a critical review of these responses. Focus on:
                 }
             })
 
-            # Get reviews about this actor's response
-            reviews_about_me = []
+            # Build self previous answer block
+            my_answer = latest_answers.get(actor.id, "")
+            self_previous_answer_block = self.prompt_service.build_self_answer_block(
+                actor_name=actor.name,
+                content=my_answer,
+                phase=phase,
+            )
+
+            # Build peer review blocks (reviews about this actor)
+            peer_reviews = []
             for msg in review_messages:
                 if msg.actor_id != actor.id:
                     other_actor = next((a for a in self.actors if a.id == msg.actor_id), None)
                     if other_actor:
-                        reviews_about_me.append(f"**{other_actor.name}'s review**: {msg.content}")
+                        peer_reviews.append({
+                            "reviewer_name": other_actor.name,
+                            "about_actor_name": actor.name,
+                            "content": msg.content,
+                        })
 
-            my_answer = latest_answers.get(actor.id, "")
+            peer_review_blocks = self.prompt_service.build_peer_review_blocks(
+                reviews=peer_reviews,
+                phase=phase,
+            )
 
-            # Build revision prompt using prompt_service
+            # Build revision prompt using prompt_service - NO fallback allowed
             system_prompt = actor.revision_prompt or f"You are {actor.name}. Revise based on feedback."
             if actor.custom_instructions:
                 system_prompt += f"\n\n{actor.custom_instructions}"
 
-            try:
-                revision_prompt = await self.prompt_service.get_revision_prompt(
-                    question=self.session.question,
-                    own_answer=my_answer,
-                    reviews_about_me="\n\n".join(reviews_about_me),
-                )
-            except PromptError:
-                # Fallback to hardcoded prompt if template not found
-                revision_prompt = f"""Original question: {self.session.question}
-
-Your current response:
-{my_answer}
-
-Reviews from other participants:
-{chr(10).join(reviews_about_me)}
-
-Please revise your response to:
-1. Address valid critiques from the reviews
-2. Incorporate useful suggestions
-3. Maintain your unique perspective where appropriate
-4. Provide a more comprehensive and accurate answer"""
+            revision_prompt = await self.prompt_service.get_revision_prompt(
+                question=self.session.question,
+                self_actor_name=actor.name,
+                self_previous_answer_block=self_previous_answer_block,
+                peer_review_blocks=peer_review_blocks,
+            )
 
             full_response = ""
             async for token in adapter.stream_completion(
@@ -678,6 +690,7 @@ Please revise your response to:
             question=self.session.question,
             responses=latest_answers,
             threshold=self.session.convergence_threshold or 0.85,
+            prompt_service=self.prompt_service,  # REQUIRED - no hardcoded prompts
         )
 
     async def _run_semantic_analysis_safe(self, round_number: int, phase: str, cycle: int = 0):
@@ -940,11 +953,16 @@ Please revise your response to:
                     latest_answers[actor.id] = r["content"]
                     break
 
-        # Build answer list
-        answer_list = []
+        # Build actor answer blocks
+        actor_answers = []
         for actor in self.actors:
             content = latest_answers.get(actor.id, "")
-            answer_list.append(f"**{actor.name}**:\n{content}")
+            actor_answers.append({
+                "actor_name": actor.name,
+                "content": content,
+            })
+
+        actor_answer_blocks = self.prompt_service.build_latest_answer_blocks(actor_answers)
 
         # Build convergence info
         convergence_info = ""
@@ -974,37 +992,15 @@ Please revise your response to:
         await self.db.commit()
         await self.db.refresh(final_round)
 
-        # Build final answer prompt using prompt_service
+        # Build final answer prompt using prompt_service - NO fallback allowed
         system_prompt = judge.system_prompt or "你是一个专业的综合决策助手，输出简洁明了的最终回答。"
 
-        try:
-            final_answer_prompt = await self.prompt_service.get_final_answer_prompt(
-                question=self.session.question,
-                actor_answers="\n\n".join(answer_list),
-                convergence_info=convergence_info,
-            )
-        except PromptError:
-            # Fallback to hardcoded prompt if template not found
-            final_answer_prompt = f"""你是一个综合决策助手，需要基于多轮互评的结果，输出一篇面向用户的最终回答。
-
-## 原始问题
-
-{self.session.question}
-
-## 各参与者的最终回答
-
-{chr(10).join(answer_list)}
-{convergence_info}
-
-## 要求
-
-请直接回答用户的问题，要求：
-1. 优先采用已达成共识的观点
-2. 对仍有分歧的地方说明条件与不确定性
-3. 如果收敛度较低，给出分情境建议
-4. 使用清晰、自然的语言，不要使用 JSON 格式
-5. 直接给出最终回答，不要解释过程
-"""
+        final_answer_prompt = await self.prompt_service.get_final_answer_prompt(
+            question=self.session.question,
+            self_actor_name=judge.name,
+            actor_answer_blocks=actor_answer_blocks,
+            convergence_info=convergence_info,
+        )
 
         # Emit actor_start with judge's info
         await self._emit({
@@ -1064,8 +1060,11 @@ Please revise your response to:
         })
 
     async def _run_summary_phase(self, convergence_result: Optional[ConvergenceResult] = None):
-        """Run summary phase to synthesize final conclusion"""
+        """Run summary phase to synthesize final conclusion
 
+        Note: convergence_result is currently unused but kept for potential
+        future integration with summary templates.
+        """
         # Get judge actor
         result = await self.db.execute(
             select(Actor).where(Actor.id == self.session.judge_actor_id)
@@ -1078,38 +1077,23 @@ Please revise your response to:
 
         adapter = self.get_adapter(judge)
 
-        # Compile all history
-        history = f"**Original Question**: {self.session.question}\n\n"
-
+        # Build history blocks with actor attribution
+        history_items = []
         for actor in self.actors:
             responses = self.actor_responses.get(actor.id, [])
-            history += f"## {actor.name}\n\n"
             for r in responses:
-                role_label = {
-                    "answer": "Initial Answer",
-                    "review": "Review",
-                    "revision": "Revision",
-                    "final_answer": "Final Answer",
-                }.get(r.get("role"), r.get("role", "Response"))
-                cycle = r.get("cycle", 0)
-                history += f"### {role_label}" + (f" (Cycle {cycle})" if cycle > 0 else "") + "\n"
-                history += f"{r.get('content', '')}\n\n"
+                role = r.get("role", "response")
+                history_items.append({
+                    "actor_name": actor.name,
+                    "role": role,
+                    "cycle": r.get("cycle", 0),
+                    "content": r.get("content", ""),
+                })
 
-        # Add convergence info if available
-        convergence_info = ""
-        if convergence_result:
-            convergence_info = f"""
-## 收敛分析
-
-共识度: {round(convergence_result.score * 100)}%
-是否已收敛: {"是" if convergence_result.converged else "否"}
-
-已达成共识的观点:
-{chr(10).join(f"- {a}" for a in convergence_result.agreements) if convergence_result.agreements else "- 无"}
-
-仍存在分歧的观点:
-{chr(10).join(f"- {d}" for d in convergence_result.disagreements) if convergence_result.disagreements else "- 无"}
-"""
+        history_blocks = self.prompt_service.build_history_blocks(
+            history_items=history_items,
+            self_actor_name=judge.name,
+        )
 
         system_prompt = judge.system_prompt or "You are an impartial Meta Judge synthesizing multi-agent reviews. Always respond with valid JSON."
 
@@ -1123,32 +1107,12 @@ Please revise your response to:
         await self.db.commit()
         await self.db.refresh(summary_round)
 
-        # Build summary prompt using prompt_service
-        try:
-            summary_prompt = await self.prompt_service.get_summary_prompt(
-                question=self.session.question,
-                history=history,
-            )
-        except PromptError:
-            # Fallback to hardcoded prompt if template not found
-            summary_prompt = f"""Based on the following multi-agent review, please provide a comprehensive summary.
-{history}
-{convergence_info}
-Please provide:
-1. A concise summary of the key conclusions
-2. Points where all participants agreed
-3. Points where participants disagreed
-4. Your confidence level (0-1) in the consensus - only provide a number if you can make a confident assessment
-5. A final recommendation
-
-Format your response as JSON:
-{{
-  "summary": "...",
-  "agreements": ["point 1", "point 2"],
-  "disagreements": ["point 1"],
-  "confidence": <0.0-1.0 or omit if uncertain>,
-  "recommendation": "..."
-}}"""
+        # Build summary prompt using prompt_service - NO fallback allowed
+        summary_prompt = await self.prompt_service.get_summary_prompt(
+            question=self.session.question,
+            self_actor_name=judge.name,
+            history_blocks=history_blocks,
+        )
 
         # Emit judge start with judge's actual id
         await self._emit({

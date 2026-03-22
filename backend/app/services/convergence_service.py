@@ -7,12 +7,16 @@ would be beneficial.
 
 import json
 import logging
-from typing import List
+from typing import List, TYPE_CHECKING
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.models.database import Actor, SemanticComparison
 from app.services.llm_adapter import create_adapter
+from app.services.prompt_serializer import serialize_latest_answer_blocks
+
+if TYPE_CHECKING:
+    from app.services.prompt_service import PromptService
 
 logger = logging.getLogger('magi.convergence')
 
@@ -131,6 +135,7 @@ async def check_convergence(
     question: str,
     responses: dict[str, str],  # actor_id -> response content
     threshold: float = 0.85,
+    prompt_service: "PromptService" = None,
 ) -> ConvergenceResult:
     """
     Check if responses have converged using the judge model.
@@ -141,10 +146,20 @@ async def check_convergence(
         question: The original question
         responses: Map of actor_id to their latest response
         threshold: Convergence threshold (0-1)
+        prompt_service: REQUIRED - PromptService instance for loading templates
 
     Returns:
         ConvergenceResult with convergence status and details
+
+    Raises:
+        ValueError: If prompt_service is not provided
     """
+    if prompt_service is None:
+        raise ValueError(
+            "prompt_service is required — hardcoded prompts are banned in this project. "
+            "See .claude/RULES.md"
+        )
+
     # Get judge actor
     result = await db.execute(
         select(Actor).where(Actor.id == judge_actor_id)
@@ -159,95 +174,83 @@ async def check_convergence(
             reason="Judge actor not found",
         )
 
-    # Build the prompt
-    response_list = []
+    # Build structured answer blocks
+    answer_blocks = []
     for actor_id, content in responses.items():
         # Get actor name
         actor_result = await db.execute(
             select(Actor.name).where(Actor.id == actor_id)
         )
         actor_name = actor_result.scalar_one_or_none() or "Unknown"
-        response_list.append(f"**{actor_name}**:\n{content}")
+        answer_blocks.append({
+            "actor_name": actor_name,
+            "content": content,
+        })
 
-    prompt = f"""你是一个收敛判断器，需要判断以下回答是否已经收敛（达成足够共识）。
+    latest_answer_blocks = serialize_latest_answer_blocks(answer_blocks)
 
-原始问题：{question}
-
-各参与者的最新回答：
-
-{chr(10).join(response_list)}
-
-请判断这些回答是否已收敛。收敛的标准是：
-1. 核心观点基本一致
-2. 主要分歧已经缩小到次要细节
-3. 不太可能通过更多轮次获得显著改进
-
-请以 JSON 格式返回：
-{{
-  "converged": true或false,
-  "score": 0.0到1.0之间的数值,
-  "reason": "判断理由",
-  "agreements": ["已达成共识的点"],
-  "disagreements": ["仍存在分歧的点"]
-}}
-"""
+    # Get prompt from PromptService - NO fallback allowed
+    prompt = await prompt_service.get_convergence_prompt(
+        question=question,
+        latest_answer_blocks=latest_answer_blocks,
+    )
 
     try:
-            adapter = create_adapter(
-                provider=judge.provider.value,
-                api_key=judge.api_key,
-                base_url=judge.base_url,
-                model=judge.model,
-            )
+        adapter = create_adapter(
+            provider=judge.provider.value,
+            api_key=judge.api_key,
+            base_url=judge.base_url,
+            model=judge.model,
+        )
 
-            full_response = ""
-            async for token in adapter.stream_completion(
-                messages=[{"role": "user", "content": prompt}],
-                system_prompt="你是一个专业的收敛判断器。请以JSON格式返回判断结果。",
-                max_tokens=judge.max_tokens,
-                temperature=0.3,
-            ):
-                full_response += token
+        full_response = ""
+        async for token in adapter.stream_completion(
+            messages=[{"role": "user", "content": prompt}],
+            system_prompt="你是一个专业的收敛判断器。请以JSON格式返回判断结果。",
+            max_tokens=judge.max_tokens,
+            temperature=0.3,
+        ):
+            full_response += token
 
-            # Parse JSON response
-            json_start = full_response.find("{")
-            json_end = full_response.rfind("}") + 1
+        # Parse JSON response
+        json_start = full_response.find("{")
+        json_end = full_response.rfind("}") + 1
 
-            if json_start >= 0 and json_end > json_start:
-                json_str = full_response[json_start:json_end]
-                data = json.loads(json_str)
+        if json_start >= 0 and json_end > json_start:
+            json_str = full_response[json_start:json_end]
+            data = json.loads(json_str)
 
-                converged = data.get("converged", False)
-                score = data.get("score")
+            converged = data.get("converged", False)
+            score = data.get("score")
 
-                # Validate score - if not provided or invalid, mark as unavailable
-                if score is None:
+            # Validate score - if not provided or invalid, mark as unavailable
+            if score is None:
+                score = None
+                converged = False
+            else:
+                try:
+                    score = float(score)
+                    # Apply threshold
+                    if score >= threshold:
+                        converged = True
+                except (ValueError, TypeError):
                     score = None
                     converged = False
-                else:
-                    try:
-                        score = float(score)
-                        # Apply threshold
-                        if score >= threshold:
-                            converged = True
-                    except (ValueError, TypeError):
-                        score = None
-                        converged = False
 
-                return ConvergenceResult(
-                    converged=converged,
-                    score=score if score is not None else 0.0,
-                    reason=data.get("reason", "") + (" (置信度不可用)" if score is None else ""),
-                    agreements=data.get("agreements", []),
-                    disagreements=data.get("disagreements", []),
-                )
-            else:
-                logger.warning(f"Could not parse convergence response: {full_response}")
-                return ConvergenceResult(
-                    converged=False,
-                    score=0.0,
-                    reason="无法解析收敛判断结果",
-                )
+            return ConvergenceResult(
+                converged=converged,
+                score=score if score is not None else 0.0,
+                reason=data.get("reason", "") + (" (置信度不可用)" if score is None else ""),
+                agreements=data.get("agreements", []),
+                disagreements=data.get("disagreements", []),
+            )
+        else:
+            logger.warning(f"Could not parse convergence response: {full_response}")
+            return ConvergenceResult(
+                converged=False,
+                score=0.0,
+                reason="无法解析收敛判断结果",
+            )
 
     except Exception as e:
         logger.error(f"Convergence check failed: {e}")
