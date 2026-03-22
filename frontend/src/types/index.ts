@@ -70,6 +70,7 @@ export interface Consensus {
   disagreements: string[]
   confidence: number | null
   recommendation: string
+  key_uncertainties?: string[]
 }
 
 export interface DebateSession {
@@ -205,4 +206,35 @@ export interface TopicComparison {
 export interface SemanticAnalysisResult {
   question_intent?: QuestionIntent
   comparisons: TopicComparison[]
+}
+
+// ========== Semantic Model Config Types ==========
+
+export interface SemanticModelConfig {
+  id: string
+  provider: ProviderType
+  api_format: string
+  base_url?: string
+  model: string
+  max_tokens: number
+  temperature: number
+  question_intent_timeout: number
+  topic_extraction_timeout: number
+  cross_compare_timeout: number
+  is_active: boolean
+  created_at: string
+  updated_at?: string
+}
+
+export interface SemanticModelConfigCreate {
+  provider: ProviderType
+  api_format: string
+  base_url?: string
+  api_key: string
+  model: string
+  max_tokens?: number
+  temperature?: number
+  question_intent_timeout?: number
+  topic_extraction_timeout?: number
+  cross_compare_timeout?: number
 }

@@ -16,6 +16,8 @@ interface SemanticSidebarProps {
   status?: string
   currentPhase?: string
   currentPhaseRecord?: LivePhaseRecord | null
+  semanticSkipped?: boolean
+  semanticSkipReason?: string | null
 }
 
 const phaseLabels: Record<string, string> = {
@@ -66,6 +68,8 @@ export default function SemanticSidebar({
   status = 'idle',
   currentPhase = '',
   currentPhaseRecord = null,
+  semanticSkipped = false,
+  semanticSkipReason = null,
 }: SemanticSidebarProps) {
   const [showRawDiff, setShowRawDiff] = useState(false)
   const [hasUserSelectedPhase, setHasUserSelectedPhase] = useState(false)
@@ -214,7 +218,28 @@ export default function SemanticSidebar({
       <div className="flex-1 overflow-y-auto p-3 min-h-0">
         {!selectedComparisons.length ? (
           <div className="text-text-tertiary text-xs text-center py-8 space-y-4">
-            {isLiveWaiting ? (
+            {semanticSkipped ? (
+              <>
+                <div className="text-accent-orange text-sm">⚠️ 语义分析已跳过</div>
+                <div className="text-text-tertiary text-xs mt-2">
+                  {semanticSkipReason || '语义分析模型未配置'}
+                </div>
+                <div className="mt-4 p-3 bg-accent-orange/10 border border-accent-orange/20 rounded-lg">
+                  <p className="text-xs text-text-secondary">
+                    请前往 <span className="text-accent-blue">设置 → 语义分析模型</span> 配置专用模型，
+                    即可在下次互评中启用语义图谱功能。
+                  </p>
+                </div>
+                {onSwitchToDiffTab && (
+                  <button
+                    onClick={onSwitchToDiffTab}
+                    className="px-4 py-2 bg-accent-blue/20 text-accent-blue rounded-lg hover:bg-accent-blue/30 transition-colors mt-4"
+                  >
+                    查看原文差异对比
+                  </button>
+                )}
+              </>
+            ) : isLiveWaiting ? (
               <>
                 {/* Live waiting state - show skeleton */}
                 <div className="text-text-secondary">语义图谱构建中...</div>

@@ -36,6 +36,8 @@ interface DebateState {
   questionIntent: QuestionIntent | null
   semanticComparisons: Map<string, TopicComparison[]>  // phaseId -> comparisons
   selectedTopicId: string | null
+  semanticSkipped: boolean
+  semanticSkipReason: string | null
 
   // Progress tracking
   progress: ProgressState
@@ -104,6 +106,8 @@ export const useDebateStore = create<DebateState>((set, get) => ({
   questionIntent: null,
   semanticComparisons: new Map(),
   selectedTopicId: null,
+  semanticSkipped: false,
+  semanticSkipReason: null,
   progress: {
     startedAt: null,
     currentPhaseStartedAt: null,
@@ -156,6 +160,8 @@ export const useDebateStore = create<DebateState>((set, get) => ({
       questionIntent: null,
       semanticComparisons: new Map(),
       selectedTopicId: null,
+      semanticSkipped: false,
+      semanticSkipReason: null,
       error: null,
       progress: {
         startedAt: Date.now(),
@@ -193,6 +199,8 @@ export const useDebateStore = create<DebateState>((set, get) => ({
       questionIntent: null,
       semanticComparisons: new Map(),
       selectedTopicId: null,
+      semanticSkipped: false,
+      semanticSkipReason: null,
       progress: {
         startedAt: Date.now(),
         currentPhaseStartedAt: null,
@@ -747,6 +755,15 @@ export const useDebateStore = create<DebateState>((set, get) => ({
       })
     })
 
+    eventSource.addEventListener('semantic_skipped', (e: MessageEvent) => {
+      console.log('[SSE] semantic_skipped:', e.data)
+      const data = JSON.parse(e.data)
+      set({
+        semanticSkipped: true,
+        semanticSkipReason: data.message || '语义分析已跳过',
+      })
+    })
+
     eventSource.addEventListener('complete', async (e: MessageEvent) => {
       console.log('[SSE] complete:', e.data)
       expectedClose = true
@@ -870,6 +887,8 @@ export const useDebateStore = create<DebateState>((set, get) => ({
       questionIntent: null,
       semanticComparisons: new Map(),
       selectedTopicId: null,
+      semanticSkipped: false,
+      semanticSkipReason: null,
       error: null,
       progress: {
         startedAt: null,
@@ -941,6 +960,8 @@ export const useDebateStore = create<DebateState>((set, get) => ({
       questionIntent: null,
       semanticComparisons: new Map(),
       selectedTopicId: null,
+      semanticSkipped: false,
+      semanticSkipReason: null,
       status: 'idle',
       error: null,
       progress: {

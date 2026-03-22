@@ -82,6 +82,7 @@ class DebateSession(Base):
     consensus_disagreements = Column(JSON, default=list)
     consensus_confidence = Column(Float)
     consensus_recommendation = Column(Text)
+    consensus_key_uncertainties = Column(JSON, default=list)
 
     # Stats
     total_tokens = Column(Integer, default=0)
@@ -245,3 +246,33 @@ class SemanticComparison(Base):
 
     # Relationships
     session = relationship("DebateSession", backref="semantic_comparisons")
+
+
+class SemanticModelConfig(Base):
+    """
+    语义分析专用模型配置 - 全局单例。
+    独立于 judge/debate actors，使用独立的 API 配置，
+    避免与主流程竞争 API 限速。
+    """
+    __tablename__ = "semantic_model_configs"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+
+    # API Configuration - 与 Actor 表结构对齐
+    provider = Column(SQLEnum(ProviderType), nullable=False)
+    api_format = Column(String(50), default="openai_compatible")
+    base_url = Column(String(255))
+    api_key = Column(String(255), nullable=False)
+    model = Column(String(100), nullable=False)
+    max_tokens = Column(Integer, default=2048)
+    temperature = Column(Float, default=0.3)
+
+    # Timeout 配置（秒）
+    question_intent_timeout = Column(Integer, default=60)
+    topic_extraction_timeout = Column(Integer, default=90)
+    cross_compare_timeout = Column(Integer, default=90)
+
+    # Meta
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

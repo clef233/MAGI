@@ -54,6 +54,8 @@ export default function Arena() {
   const semanticComparisons = useDebateStore((state) => state.semanticComparisons)
   const selectedTopicId = useDebateStore((state) => state.selectedTopicId)
   const selectTopic = useDebateStore((state) => state.selectTopic)
+  const semanticSkipped = useDebateStore((state) => state.semanticSkipped)
+  const semanticSkipReason = useDebateStore((state) => state.semanticSkipReason)
 
   // Progress state
   const progress = useDebateStore((state) => state.progress)
@@ -216,6 +218,8 @@ export default function Arena() {
                   selectedTopicId={selectedTopicId}
                   onSelectTopic={selectTopic}
                   consensus={currentSession?.consensus}  // Pass consensus to DebateView
+                  semanticSkipped={semanticSkipped}
+                  semanticSkipReason={semanticSkipReason}
                 />
               </div>
             )}

@@ -1,5 +1,5 @@
 from .database import Base, Actor, DebateSession, DebateSessionActor, Round, Message
-from .database import ProviderType, SessionStatus
+from .database import ProviderType, SessionStatus, SemanticModelConfig
 
 __all__ = [
     "Base",
@@ -10,4 +10,5 @@ __all__ = [
     "Message",
     "ProviderType",
     "SessionStatus",
+    "SemanticModelConfig",
 ]

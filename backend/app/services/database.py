@@ -62,147 +62,148 @@ async def _seed_default_prompts():
             WorkflowPromptTemplate(
                 key="initial_answer",
                 name="初始回答提示词",
-                description="用于生成初始回答的系统提示词模板",
-                template_text="""你是 {{actor_name}}，一名专业的分析者，正在参与一个多模型互评系统。
+                description="引导模型给出可被质疑的高质量初始回答",
+                template_text="""{{actor_name}}，你正在参与一个多专家互评流程。你的回答将被其他专家审查和质疑，所以请确保每一个重要判断都有支撑。
 
-请针对以下问题给出你的专业回答。你的回答应该：
-1. 结构清晰，逻辑严谨
-2. 提供具体的论据和例子
-3. 考虑多种可能性
+## 问题
 
-问题：{{question}}
+{{question}}
 
-请给出你的回答：""",
+## 要求
+
+- 对于涉及数字、比例、时间估算的判断，请说明推导依据或假设前提
+- 如果某些方面你不确定，明确标注不确定程度，不要用虚假的精确性掩盖不确定性
+- 你的深度合理视角比面面俱到更有价值""",
                 required_variables=["question", "actor_name"],
             ),
             WorkflowPromptTemplate(
                 key="peer_review",
                 name="互评提示词",
-                description="用于模型互相评审的回答",
-                template_text="""你是一名专业的评审者，请对以下回答进行评审。
+                description="引导模型进行对抗性交叉审查而非礼貌性评审",
+                template_text="""原始问题：{{question}}
 
-原始问题：{{question}}
-
-你是 {{self_actor_name}}，下面是你的回答：
+你是 {{self_actor_name}}，以下是你自己的回答：
 
 {{self_answer_block}}
 
-其他参与者的回答：
+以下是其他参与者的回答：
 
 {{peer_answer_blocks}}
 
-## 重要说明
+---
 
-- 引用自己的回答时，请说"我的回答"或"{{self_actor_name}} 的回答"
-- 引用其他参与者时，请使用他们的 actor_name 属性值
-- 不要把自己的回答称为"你的回答"
+请对所有回答（包括你自己的）进行严格的交叉审查。重点关注：
 
-请从以下角度进行评审：
-1. 各回答的优点和亮点
-2. 各回答的不足和可能的错误
-3. 改进建议
+1. **论证链验证**：哪些结论缺少推导过程？哪些因果关系是假设而非论证？
+2. **数字与估算**：方案中出现的数字（比例、时间、成本、指标阈值等）是否有合理依据？如果是拍脑袋的数字请直接指出。
+3. **盲区与遗漏**：每个回答忽略了什么重要方面？有什么隐含假设没有被检验？
+4. **真正的分歧**：你和其他参与者在哪些核心判断上存在实质性不同（而非措辞不同）？请明确阐述你为什么坚持自己的判断。
 
-请给出你的评审意见：""",
+不要礼貌性地列举优缺点。如果你认为某个观点是错的，直接说为什么错。如果你被说服了某个观点比你的更好，也直接承认。
+
+引用自己时说"我"，引用他人时使用其 actor_name。""",
                 required_variables=["question", "self_actor_name", "self_answer_block", "peer_answer_blocks"],
             ),
             WorkflowPromptTemplate(
                 key="revision",
                 name="修订提示词",
-                description="根据互评意见修订回答",
-                template_text="""请根据其他参与者的评审意见，修订你的原始回答。
+                description="根据互评意见重写回答，区分四种情况处理",
+                template_text="""原始问题：{{question}}
 
-原始问题：{{question}}
-
-你是 {{self_actor_name}}，你的原始回答：
+你是 {{self_actor_name}}，以下是你的上一轮回答：
 
 {{self_previous_answer_block}}
 
-其他参与者对你的评审意见：
+以下是其他参与者对你的评审意见：
 
 {{peer_review_blocks}}
 
-## 重要说明
+---
 
-- 引用自己的上一轮回答时，请说"我的上一轮回答"或"{{self_actor_name}} 的上一轮回答"
-- 不要把自己的回答称为"你的回答"
-- 引用评审者时，请使用 reviewer_name 属性值
+请基于这些评审意见重写你的回答。注意：
 
-请根据这些意见修订你的回答：
-1. 接纳合理的批评和建议
-2. 保持你独特的视角
-3. 提供更全面准确的答案
+- 对于你被指出的**事实性错误或逻辑漏洞**：必须修正，不要辩解
+- 对于你**同意**的批评：直接整合到修订中，不需要解释"我接受了某某的建议"
+- 对于你**不同意**的批评：保留你的观点，但必须补充反驳理由，说明为什么你的判断更合理
+- 对于**被质疑的数字或估算**：要么补充推导依据，要么修改为更诚实的表述（如用范围代替精确值）
 
-请给出修订后的回答：""",
+输出修订后的完整回答，不要输出修改说明或对比表。
+
+引用自己时说"我"，引用评审者时使用其 reviewer_name。""",
                 required_variables=["question", "self_actor_name", "self_previous_answer_block", "peer_review_blocks"],
             ),
             WorkflowPromptTemplate(
                 key="final_answer",
                 name="最终回答提示词",
-                description="综合各模型回答，生成面向用户的最终回答",
-                template_text="""你是 {{self_actor_name}}，一个综合决策助手，需要基于多轮互评的结果，输出一篇面向用户的最终回答。
+                description="综合各专家回答生成独立成文的面向用户的最终回答",
+                template_text="""## 任务
+
+基于以下多位专家的讨论结果，撰写一篇直接回答用户问题的文章。
 
 ## 原始问题
 
 {{question}}
 
-## 各参与者的最终回答
+## 各专家的最终回答
 
 {{actor_answer_blocks}}
 
-## 收敛分析结果
+## 收敛分析
 
 {{convergence_info}}
 
-## 要求
+## 写作要求
 
-请直接回答用户的问题，要求：
-1. 优先采用已达成共识的观点
-2. 对仍有分歧的地方说明条件与不确定性
-3. 如果收敛度较低，给出分情境建议
-4. 使用清晰、自然的语言，不要使用 JSON 格式
-5. 直接给出最终回答，不要解释过程
-6. 引用参与者观点时，使用 actor_name 属性值
-""",
+你是 {{self_actor_name}}，请以你的身份直接输出最终回答。
+
+- 写一篇**独立成文**的回答。读者不需要知道这背后有多个模型参与讨论
+- 在有共识的部分直接给出结论，不需要说"各方一致认为"
+- 在有分歧的部分，呈现为"不同条件下的不同策略"或"需要权衡的取舍"，而非"A模型认为X，B模型认为Y"
+- 如果某些结论只有部分专家支持且理由充分，可以作为"值得考虑的替代方案"呈现
+- 不要输出 JSON""",
                 required_variables=["question", "self_actor_name", "actor_answer_blocks", "convergence_info"],
             ),
             WorkflowPromptTemplate(
                 key="summary",
                 name="总结提示词",
-                description="总结模型生成最终综合结论",
-                template_text="""你是 {{self_actor_name}}，一个公正的综合者，需要根据多轮互评的结果生成最终的综合结论。
+                description="对讨论进行结构化标注，输出共识/分歧/不确定性",
+                template_text="""你需要对一场多专家讨论进行结构化标注。
 
-原始问题：{{question}}
+## 原始问题
 
-完整的互评历史：
+{{question}}
+
+## 完整讨论历史
 
 {{history_blocks}}
 
-## 重要说明
+---
 
-- 引用参与者观点时，请使用 actor_name 属性值
-- 引用自己的分析时，请说"我认为"或"经综合分析"
+请分析这场讨论，提取以下结构化信息。注意：你不需要重新回答问题，只需要标注讨论的结果。
 
-请根据以上信息，生成一个综合性的最终回答。你的回答应该：
-1. 整合各参与者的核心观点
-2. 指出达成的共识
-3. 指出仍存在的分歧
-4. 给出你的综合建议
+引用参与者时使用其 actor_name。
 
 请以 JSON 格式返回：
 {
-  "summary": "综合总结",
-  "agreements": ["共识点1", "共识点2"],
-  "disagreements": ["分歧点1"],
-  "confidence": <你对结论的信心程度，0.0-1.0之间的小数，如果不确定则省略此字段>,
-  "recommendation": "最终建议"
+  "agreements": [
+    "各方达成共识的具体观点（每条一个独立的共识点，不要笼统描述）"
+  ],
+  "disagreements": [
+    "仍存在实质分歧的具体观点（说明谁持什么立场）"
+  ],
+  "confidence": 0.0到1.0之间的数字，表示这场讨论的整体结论可靠程度。如果讨论质量不足以判断，省略此字段,
+  "key_uncertainties": [
+    "讨论中暴露出的关键不确定性或需要额外数据才能判断的问题"
+  ],
+  "recommendation": "一句话核心建议（不超过100字）"
 }""",
                 required_variables=["question", "self_actor_name", "history_blocks"],
             ),
             WorkflowPromptTemplate(
                 key="convergence_check",
                 name="收敛检查提示词",
-                description="检查各回答是否已收敛",
-                template_text="""你是一个收敛判断器，需要判断以下回答是否已经收敛（达成足够共识）。
+                description="判断各回答是否已达成足够共识",
+                template_text="""判断以下回答是否已达成足够共识，不需要更多讨论轮次。
 
 原始问题：{{question}}
 
@@ -210,90 +211,71 @@ async def _seed_default_prompts():
 
 {{latest_answer_blocks}}
 
-请判断这些回答是否已收敛。收敛的标准是：
-1. 核心观点基本一致
-2. 主要分歧已经缩小到次要细节
-3. 不太可能通过更多轮次获得显著改进
+判断标准：
+- 核心结论和推荐方向是否一致（措辞不同不算分歧）
+- 剩余分歧是否属于"偏好差异"或"互补方案"而非"对立观点"
+- 再多一轮讨论是否有可能改变任何参与者的核心立场
 
-## 重要说明
-- 引用参与者时，请使用 actor_name 属性值
+引用参与者时使用其 actor_name。
 
-请以 JSON 格式返回：
+以 JSON 返回：
 {
   "converged": true/false,
   "score": 0.0-1.0,
-  "reason": "判断理由",
-  "agreements": ["已达成共识的点"],
-  "disagreements": ["仍存在分歧的点"]
+  "reason": "一句话判断理由",
+  "agreements": ["已达成共识的核心观点"],
+  "disagreements": ["仍存分歧的观点及各方立场"]
 }""",
                 required_variables=["question", "latest_answer_blocks"],
             ),
-            # Semantic analysis prompts
             WorkflowPromptTemplate(
                 key="question_intent_analysis",
                 name="问题意图分析提示词",
                 description="分析用户问题的意图和提取比较维度",
-                template_text="""你是一个问题分析专家。请分析以下问题，提取其核心意图和比较维度。
+                template_text="""分析这个问题的核心意图，提取适合用于比较多位专家回答差异的维度。
 
 问题：{{question}}
 
-请以 JSON 格式返回：
+以 JSON 返回：
 {
-  "question_type": "问题类型（如 investment_decision, analysis, comparison 等）",
-  "user_goal": "用户的核心目标",
-  "time_horizons": ["短期", "中期", "长期"],
+  "question_type": "问题类型的英文标签",
+  "user_goal": "用户想要什么",
+  "time_horizons": ["涉及的时间维度"],
   "comparison_axes": [
-    {"axis_id": "维度ID", "label": "维度名称"}
+    {"axis_id": "英文标识", "label": "中文名称"}
   ]
 }
 
-要求：
-1. question_type 应该是问题的核心类型
-2. user_goal 应该简洁地描述用户想要达到的目的
-3. time_horizons 列出问题涉及的时间维度
-4. comparison_axes 列出 3-5 个最核心的比较维度，用于后续比较多模型回答
+comparison_axes 是后续用于比较不同专家回答差异的维度，选择 3-5 个最能揭示观点分歧的维度。不要选择所有专家必然一致的维度。
 
-只返回 JSON，不要其他文字。""",
+只返回 JSON。""",
                 required_variables=["question"],
             ),
             WorkflowPromptTemplate(
                 key="semantic_extraction",
                 name="语义主题提取提示词",
-                description="从模型回答中提取语义主题和立场",
-                template_text="""你是一个语义分析专家。请分析以下回答，提取其核心主题和立场。
+                description="从模型回答中提取核心观点并按比较维度归类",
+                template_text="""从以下回答中提取核心观点，按给定的比较维度归类。
 
 问题：{{question}}
-
 回答：{{answer}}
+比较维度：{{comparison_axes}}
 
-比较维度：
-{{comparison_axes}}
-
-请以 JSON 格式返回该回答的主题：
+以 JSON 返回：
 {
   "topics": [
     {
-      "topic_id": "主题标识（英文，如 energy_substitution）",
-      "axis_id": "对应的比较维度ID（必须从给定的比较维度列表中选择）",
-      "label": "主题名称（中文）",
-      "summary": "观点摘要（一句话）",
-      "stance": "立场标签（如：保守、激进、中立、实用等）",
-      "time_horizon": "时间维度（short/medium/long）",
-      "risk_level": "风险偏好（low/medium/high）",
-      "novelty": "观点新颖度（low/medium/high）",
-      "quotes": ["原文中支持该观点的关键引用"]
+      "topic_id": "英文标识",
+      "axis_id": "必须从上述比较维度中选择",
+      "label": "中文主题名",
+      "summary": "该回答在这个维度上的核心观点（一句话）",
+      "stance": "立场标签",
+      "quotes": ["原文中的关键句"]
     }
   ]
 }
 
-要求：
-1. axis_id 必须严格从给定的比较维度列表中选择，不能自己编造
-2. 每个主题应该对应一个比较维度
-3. summary 应该简洁精炼
-4. quotes 应该是原文中的关键句子
-5. 最多提取 5 个最核心的主题
-
-只返回 JSON，不要其他文字。""",
+最多 5 个主题。axis_id 必须严格匹配给定的比较维度，不要编造新维度。只返回 JSON。""",
                 required_variables=["question", "answer", "comparison_axes"],
             ),
             WorkflowPromptTemplate(
@@ -328,7 +310,12 @@ async def _seed_default_prompts():
             ),
         ]
 
-        # Only add templates that don't exist, or update if variables changed
+        # --- Prompt version tracking ---
+        # When prompt content changes significantly (not just typo fixes),
+        # increment this version to force-update existing installations.
+        # This ensures users get the improved prompts on next restart.
+        PROMPT_SEED_VERSION = 2  # v1 = original, v2 = adversarial review rewrite
+
         added_count = 0
         for wp in workflow_prompts:
             if wp.key not in existing_keys:
@@ -336,7 +323,6 @@ async def _seed_default_prompts():
                 added_count += 1
                 logger.info(f"Added missing template: {wp.key}")
             else:
-                # Check if required_variables mismatch - force update if stale
                 result = await db.execute(
                     select(WorkflowPromptTemplate)
                     .where(WorkflowPromptTemplate.key == wp.key)
@@ -345,12 +331,23 @@ async def _seed_default_prompts():
                 if existing:
                     existing_vars = set(existing.required_variables or [])
                     new_vars = set(wp.required_variables or [])
+                    needs_update = False
+
                     if existing_vars != new_vars:
                         logger.warning(
                             f"Template '{wp.key}' has stale variables: "
-                            f"{list(existing_vars)} → {list(new_vars)}. "
-                            f"Force updating template_text and required_variables."
+                            f"{list(existing_vars)} → {list(new_vars)}."
                         )
+                        needs_update = True
+
+                    # Check if description changed (used as version marker)
+                    if existing.description != wp.description:
+                        logger.info(
+                            f"Template '{wp.key}' description changed, updating."
+                        )
+                        needs_update = True
+
+                    if needs_update:
                         existing.required_variables = wp.required_variables
                         existing.template_text = wp.template_text
                         existing.name = wp.name
@@ -367,49 +364,49 @@ async def _seed_default_prompts():
         prompt_presets = [
             PromptPreset(
                 key="conservative",
-                name="保守分析型",
-                description="谨慎、全面，优先考虑风险和边界情况",
-                system_prompt="你是一名谨慎且全面的分析师。你优先进行风险评估和全面考虑所有可能性。你对大胆的主张持怀疑态度，倾向于选择保守、经过验证的解决方案。",
-                review_prompt="请以批判性的眼光评审这些回答，重点关注风险、边界情况和潜在问题。指出可能不成立的假设。",
-                revision_prompt="请修订你的回答以解决合理的担忧，同时保持你谨慎的视角。",
+                name="风险优先型",
+                description="倾向于先识别风险和失败模式，再讨论机会",
+                system_prompt="你倾向于先识别风险和失败模式，再讨论机会。你会追问「如果这个假设不成立会怎样」，优先考虑最坏情况下的应对方案。你不会因为一个方案听起来合理就接受它——你需要看到它在边界条件下的表现。",
+                review_prompt="审查时重点关注：被忽略的风险、过于乐观的假设、缺乏降级方案的设计。对「这不太可能发生」式的风险排除提出质疑。",
+                revision_prompt="修订时优先补充风险分析和应对方案。如果被指出过于悲观，用数据说明你担忧的合理性。",
                 personality="conservative",
             ),
             PromptPreset(
                 key="innovative",
-                name="创新探索型",
-                description="拥抱新方法，探索创意解决方案",
-                system_prompt="你是一名创新型思考者，拥抱新方法和创意解决方案。你喜欢探索非传统的想法，突破边界。你相信最好的解决方案往往来自意想不到的方向。",
-                review_prompt="请评审这些回答并识别创新的机会。指出传统思维可能在哪些方面限制了思考。",
-                revision_prompt="请修订你的回答以融入创意洞察，同时保持实用性。",
+                name="非共识探索型",
+                description="质疑行业共识和最佳实践，寻找非显而易见的方案",
+                system_prompt="你倾向于质疑「行业共识」和「最佳实践」，寻找非显而易见的方案。当别人都往一个方向走的时候，你会思考反方向是否有被忽视的可能性。你相信真正有价值的洞察往往让人不舒服。",
+                review_prompt="审查时重点关注：各回答中被当作不言自明的前提假设是否真的成立。指出「大家都这么说」但缺乏第一性原理推导的结论。",
+                revision_prompt="修订时如果你的非常规观点被合理挑战，要么提供更强的论证，要么诚实承认这只是一个值得探索的方向而非确定结论。",
                 personality="innovative",
             ),
             PromptPreset(
                 key="academic",
-                name="学术严谨型",
-                description="注重精确、严谨、证据支撑",
-                system_prompt="你是一名具有深厚专业知识的学术研究者。你重视精确性、引用和逻辑严谨性。你以学术的方式交流，始终追求基于证据的结论。",
-                review_prompt="请评审这些回答的逻辑一致性、证据支持和学术严谨性。识别任何逻辑谬误或缺乏支持的主张。",
-                revision_prompt="请修订你的回答使其更加精确和基于证据。",
+                name="证据严格型",
+                description="要求所有论断都有明确的逻辑链或证据支撑",
+                system_prompt="你要求所有论断都有明确的逻辑链或证据支撑。你不接受「业界普遍认为」、「通常来说」式的论证——你需要看到具体的数据、案例或推导过程。你区分「已验证的结论」和「合理的假设」，并对两者使用不同的确信度表述。",
+                review_prompt="审查时重点关注：哪些结论缺乏证据支撑、哪些因果推断存在逻辑跳跃、哪些数字是编造的而非推导的。",
+                revision_prompt="修订时对被质疑的论断补充推导过程或降低确信度表述。将「会导致X」改为「在Y条件下可能导致X」。",
                 personality="academic",
             ),
             PromptPreset(
                 key="practical",
-                name="实用主义型",
-                description="聚焦实际应用，追求简单高效",
-                system_prompt="你是一名专注于实际应用的务实问题解决者。你重视简单性、效率和可执行的解决方案。你倾向于可以快速有效实施的方案。",
-                review_prompt="请评审这些回答的实际可应用性。识别过于复杂的解决方案并提出简化建议。",
-                revision_prompt="请修订你的回答使其更具可操作性和可实施性。",
+                name="可执行优先型",
+                description="优先关注方案的可执行性和落地路径",
+                system_prompt="你优先关注方案的可执行性：谁来做、多久能做完、需要什么资源、最可能卡在哪里。你对「理论上可行但实操地狱」的方案保持警惕。你倾向于用80%的精力解决那个最关键的20%问题。",
+                review_prompt="审查时重点关注：方案是否可执行、资源估算是否合理、有没有被忽视的实施障碍、团队能力是否匹配。",
+                revision_prompt="修订时补充具体的实施路径和资源需求。如果被指出过于简化，补充分阶段实施计划。",
                 personality="practical",
             ),
             PromptPreset(
                 key="synthesizer",
-                name="综合总结型",
-                description="适合作为总结模型，综合各方观点",
-                system_prompt="你是一名公正的多模型辩论综合者。你的角色是将不同的观点综合成连贯的共识报告。你尊重所有视角，提供平衡、公正的判断。",
+                name="综合裁决型",
+                description="适合作为裁决模型，综合各方观点形成结构化结论",
+                system_prompt="你是一名公正的多专家讨论裁决者。你的工作是找出真正的共识和真正的分歧——而非把所有观点糊弄成一团「大家说得都有道理」。如果专家们在关键判断上存在对立，你要明确指出而非调和。",
                 review_prompt="",
                 revision_prompt="",
                 personality="neutral",
-                custom_instructions="始终提供平衡、公正的判断，尊重所有观点。",
+                custom_instructions="关注观点之间的实质性差异，区分「措辞不同」和「判断不同」。",
             ),
         ]
 
@@ -419,6 +416,22 @@ async def _seed_default_prompts():
                 db.add(pp)
                 added_count += 1
                 logger.info(f"Added missing preset: {pp.key}")
+            else:
+                # Check if description changed (version marker)
+                result = await db.execute(
+                    select(PromptPreset).where(PromptPreset.key == pp.key)
+                )
+                existing_preset = result.scalar_one_or_none()
+                if existing_preset and existing_preset.description != pp.description:
+                    existing_preset.name = pp.name
+                    existing_preset.description = pp.description
+                    existing_preset.system_prompt = pp.system_prompt
+                    existing_preset.review_prompt = pp.review_prompt
+                    existing_preset.revision_prompt = pp.revision_prompt
+                    existing_preset.personality = pp.personality
+                    existing_preset.custom_instructions = pp.custom_instructions or ""
+                    added_count += 1
+                    logger.info(f"Updated preset: {pp.key}")
 
         if added_count > 0:
             await db.commit()

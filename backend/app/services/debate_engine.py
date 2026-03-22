@@ -67,6 +67,7 @@ class DebateEngine:
         self.step_number = 0  # Global step counter for phases
         self.question_intent = None  # Store question intent analysis result
         self.latest_semantic_comparisons = []  # Store latest semantic comparisons
+        self.semantic_model_config = None  # Loaded from DB in _run_semantic_analysis
 
     def _check_cancelled(self) -> bool:
         """Check if the debate should be cancelled."""
@@ -739,17 +740,38 @@ class DebateEngine:
             bg_semantic_service = SemanticService(bg_db, bg_prompt_service)
 
             try:
-                # Get judge actor for semantic analysis
-                result = await bg_db.execute(
-                    select(Actor).where(Actor.id == self.session.judge_actor_id)
-                )
-                judge = result.scalar_one_or_none()
+                # Load semantic model config from DB
+                from app.models.database import SemanticModelConfig
 
-                if not judge:
-                    logger.warning("Judge actor not found for semantic analysis, skipping")
+                result = await bg_db.execute(
+                    select(SemanticModelConfig).where(SemanticModelConfig.is_active == True).limit(1)
+                )
+                semantic_config = result.scalar_one_or_none()
+
+                if not semantic_config:
+                    logger.warning("Semantic model not configured, skipping semantic analysis")
+                    await self._emit({
+                        "event": "semantic_skipped",
+                        "data": {
+                            "reason": "semantic_model_not_configured",
+                            "message": "语义分析模型未配置，请在设置中配置后重试",
+                        }
+                    })
                     return
 
-                adapter = self.get_adapter(judge)
+                # Create independent adapter for semantic analysis
+                from app.services.llm_adapter import create_adapter as create_llm_adapter
+                adapter = create_llm_adapter(
+                    provider=semantic_config.provider.value,
+                    api_key=semantic_config.api_key,
+                    base_url=semantic_config.base_url,
+                    model=semantic_config.model,
+                )
+
+                # Store timeout configs for use in this method
+                intent_timeout = float(semantic_config.question_intent_timeout)
+                extraction_timeout = float(semantic_config.topic_extraction_timeout)
+                compare_timeout = float(semantic_config.cross_compare_timeout)
 
                 # Step 1: Analyze question intent (only once) - with timeout
                 if not self.question_intent:
@@ -760,7 +782,7 @@ class DebateEngine:
                                 question=self.session.question,
                                 adapter=adapter,
                             ),
-                            timeout=60.0  # 60 second timeout
+                            timeout=intent_timeout
                         )
                         # Save to database
                         await bg_semantic_service.save_question_intent(
@@ -823,7 +845,7 @@ class DebateEngine:
                                 actor_id=actor.id,
                                 adapter=adapter,
                             ),
-                            timeout=30.0  # 30 second timeout per actor
+                            timeout=extraction_timeout
                         )
                         return actor.id, topics
                     except asyncio.TimeoutError:
@@ -868,7 +890,7 @@ class DebateEngine:
                                 actors=self.actors,
                                 adapter=adapter,
                             ),
-                            timeout=60.0  # 60 second timeout
+                            timeout=compare_timeout
                         )
 
                         # Save to database
@@ -1215,11 +1237,12 @@ The previous response could not be parsed. Please provide ONLY a valid JSON obje
                 logger.info(f"Using convergence score {fallback_confidence} as fallback confidence")
 
             consensus = {
-                "summary": full_response,
+                "summary": "",
                 "agreements": convergence_result.agreements if convergence_result else [],
                 "disagreements": convergence_result.disagreements if convergence_result else [],
                 "confidence": fallback_confidence,
-                "recommendation": full_response,
+                "recommendation": full_response[:200] if full_response else "",
+                "key_uncertainties": [],
                 "confidence_unavailable": fallback_confidence is None,
             }
             logger.warning(f"Summary JSON parse failed after retry, fallback confidence: {fallback_confidence}")
@@ -1233,8 +1256,9 @@ The previous response could not be parsed. Please provide ONLY a valid JSON obje
         )
         self.db.add(message)
 
-        # Store consensus (only store confidence if valid)
-        self.session.consensus_summary = consensus.get("summary", "")
+        # Store consensus
+        # New prompt schema: no "summary" field, use "recommendation" as summary fallback
+        self.session.consensus_summary = consensus.get("summary", "") or consensus.get("recommendation", "")
         self.session.consensus_agreements = consensus.get("agreements", [])
         self.session.consensus_disagreements = consensus.get("disagreements", [])
         # Store confidence as-is (could be None if unavailable)
@@ -1244,6 +1268,7 @@ The previous response could not be parsed. Please provide ONLY a valid JSON obje
         else:
             self.session.consensus_confidence = None
         self.session.consensus_recommendation = consensus.get("recommendation", "")
+        self.session.consensus_key_uncertainties = consensus.get("key_uncertainties", [])
         await self.db.commit()
 
         await self._emit({

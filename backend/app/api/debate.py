@@ -273,13 +273,14 @@ async def get_debate(
         ))
 
     consensus = None
-    if session.consensus_summary:
+    if session.consensus_summary or session.consensus_recommendation:
         consensus = ConsensusResult(
-            summary=session.consensus_summary,
+            summary=session.consensus_summary or "",
             agreements=session.consensus_agreements or [],
             disagreements=session.consensus_disagreements or [],
             confidence=session.consensus_confidence,  # Can be None
             recommendation=session.consensus_recommendation or "",
+            key_uncertainties=session.consensus_key_uncertainties or [],
         )
 
     return DebateSessionResponse(

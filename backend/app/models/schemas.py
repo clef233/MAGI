@@ -147,6 +147,7 @@ class ConsensusResult(BaseModel):
     disagreements: list[str]
     confidence: Optional[float] = None
     recommendation: str
+    key_uncertainties: list[str] = Field(default_factory=list)
 
 
 class DebateSessionResponse(BaseModel):
@@ -297,3 +298,51 @@ class SemanticAnalysisResult(BaseModel):
     """Complete semantic analysis result for a session"""
     question_intent: Optional[QuestionIntentResponse] = None
     comparisons: list[SemanticComparisonResponse] = Field(default_factory=list)
+
+
+# ========== Semantic Model Config Schemas ==========
+
+class SemanticModelConfigResponse(BaseModel):
+    id: str
+    provider: ProviderType
+    api_format: str
+    base_url: Optional[str] = None
+    model: str
+    max_tokens: int
+    temperature: float
+    question_intent_timeout: int
+    topic_extraction_timeout: int
+    cross_compare_timeout: int
+    is_active: bool
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class SemanticModelConfigCreate(BaseModel):
+    provider: ProviderType
+    api_format: str = "openai_compatible"
+    base_url: Optional[str] = None
+    api_key: str = ""  # 空字符串 = 保留现有 key（仅对 update 生效）
+    model: str
+    max_tokens: int = 2048
+    temperature: float = Field(default=0.3, ge=0.0, le=2.0)
+    question_intent_timeout: int = Field(default=60, ge=10, le=300)
+    topic_extraction_timeout: int = Field(default=90, ge=10, le=300)
+    cross_compare_timeout: int = Field(default=90, ge=10, le=300)
+
+
+class SemanticModelConfigUpdate(BaseModel):
+    provider: Optional[ProviderType] = None
+    api_format: Optional[str] = None
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None  # None means keep existing
+    model: Optional[str] = None
+    max_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    question_intent_timeout: Optional[int] = None
+    topic_extraction_timeout: Optional[int] = None
+    cross_compare_timeout: Optional[int] = None
+    is_active: Optional[bool] = None

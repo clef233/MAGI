@@ -22,6 +22,8 @@ interface DebateViewProps {
   selectedTopicId?: string | null
   onSelectTopic?: (topicId: string | null) => void
   consensus?: Consensus | null  // Add consensus prop
+  semanticSkipped?: boolean
+  semanticSkipReason?: string | null
 }
 
 type SidebarTab = 'monitor' | 'semantic' | 'diff'
@@ -40,6 +42,8 @@ export default function DebateView({
   selectedTopicId = null,
   onSelectTopic,
   consensus,
+  semanticSkipped = false,
+  semanticSkipReason = null,
 }: DebateViewProps) {
   // Sidebar tab state
   const [sidebarTab, setSidebarTab] = useState<SidebarTab>('monitor')
@@ -157,6 +161,8 @@ export default function DebateView({
               status={status}
               currentPhase={currentPhase}
               currentPhaseRecord={currentPhaseRecord}
+              semanticSkipped={semanticSkipped}
+              semanticSkipReason={semanticSkipReason}
             />
           ) : (
             <DiffSidebar

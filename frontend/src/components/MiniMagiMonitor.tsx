@@ -211,8 +211,8 @@ export default function MiniMagiMonitor({
           50%, 100% { fill: rgba(254, 194, 0, 0.3); stroke: rgba(254, 194, 0, 0.3); }
         }
 
-        .state-thinking .node-fill { animation: flash-fill-blue 0.4s steps(1, end) infinite; }
-        .state-thinking .node-text { animation: flash-text-dark 0.4s steps(1, end) infinite; }
+        .state-thinking .node-fill { animation: flash-fill-blue 0.8s steps(1, end) infinite; }
+        .state-thinking .node-text { animation: flash-text-dark 0.8s steps(1, end) infinite; }
 
         .state-done .node-fill { fill: #67ff8c; }
         .state-done .node-text { fill: #0a1f2e; }
@@ -220,13 +220,105 @@ export default function MiniMagiMonitor({
         .state-error .node-fill { fill: #e30000; }
         .state-error .node-text { fill: #0a1f2e; }
 
-        .state-judge_active .node-fill { animation: flash-fill-purple 0.4s steps(1, end) infinite; }
-        .state-judge_active .node-text { animation: flash-text-dark 0.4s steps(1, end) infinite; }
+        .state-judge_active .node-fill { animation: flash-fill-purple 0.8s steps(1, end) infinite; }
+        .state-judge_active .node-text { animation: flash-text-dark 0.8s steps(1, end) infinite; }
 
         .shingi-box { opacity: 0; }
         .shingi-box.active { opacity: 1; }
         .shingi-box.active rect { animation: flash-shingi 1s steps(1, end) infinite; }
         .shingi-box.active text { animation: flash-shingi 1s steps(1, end) infinite; stroke: none; }
+
+        /* Judge flow node */
+        .judge-flow-node {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 8px;
+          padding: 4px 12px;
+          margin: 0 auto;
+          position: relative;
+        }
+
+        .judge-flow-arrow {
+          width: 1px;
+          height: 16px;
+          background: #f26600;
+          margin: 0 auto;
+          position: relative;
+        }
+        .judge-flow-arrow::after {
+          content: '';
+          position: absolute;
+          bottom: -3px;
+          left: 50%;
+          transform: translateX(-50%);
+          width: 0;
+          height: 0;
+          border-left: 4px solid transparent;
+          border-right: 4px solid transparent;
+          border-top: 5px solid #f26600;
+        }
+
+        .judge-node-box {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          padding: 4px 16px;
+          border: 1.5px solid rgba(242, 102, 0, 0.4);
+          border-radius: 4px;
+          background: transparent;
+          transition: all 0.3s ease;
+        }
+
+        .judge-node-box.judge-idle {
+          border-color: rgba(242, 102, 0, 0.25);
+          opacity: 0.5;
+        }
+
+        .judge-node-box.judge-active {
+          border-color: #9333ea;
+          background: rgba(147, 51, 234, 0.1);
+          animation: judge-pulse 0.8s steps(1, end) infinite;
+        }
+
+        .judge-node-box.judge-done {
+          border-color: #67ff8c;
+          background: rgba(103, 255, 140, 0.08);
+        }
+
+        @keyframes judge-pulse {
+          0%, 49.9% { border-color: #9333ea; background: rgba(147, 51, 234, 0.15); }
+          50%, 100% { border-color: rgba(147, 51, 234, 0.4); background: rgba(147, 51, 234, 0.05); }
+        }
+
+        .judge-dot {
+          width: 6px;
+          height: 6px;
+          border-radius: 50%;
+          flex-shrink: 0;
+        }
+        .judge-dot.dot-idle { background: rgba(242, 102, 0, 0.3); }
+        .judge-dot.dot-active { background: #9333ea; animation: flash-fill-purple 0.8s steps(1, end) infinite; }
+        .judge-dot.dot-done { background: #67ff8c; }
+
+        .judge-name {
+          font-family: 'Noto Serif JP', serif;
+          font-size: 11px;
+          font-weight: 900;
+          letter-spacing: 0.08em;
+          color: rgba(242, 102, 0, 0.6);
+          transition: color 0.3s ease;
+        }
+        .judge-active .judge-name { color: #9333ea; }
+        .judge-done .judge-name { color: #67ff8c; }
+
+        .judge-status-label {
+          font-size: 10px;
+          color: #56565A;
+          letter-spacing: 0.05em;
+        }
+        .judge-active .judge-status-label { color: rgba(147, 51, 234, 0.8); }
+        .judge-done .judge-status-label { color: rgba(103, 255, 140, 0.6); }
       `}</style>
 
       {/* SVG Monitor - faithful reproduction of START.HTML layout */}
@@ -347,17 +439,19 @@ export default function MiniMagiMonitor({
                 <polygon className="node-stroke" points="835,275 660,275 535,400 535,470 835,470" />
                 <text x="685" y="395" textAnchor="middle" className="node-text node-text-base" fontSize="24">{actorCLabel}</text>
               </g>
-
-              {/* JUDGE label next to 審議中 box */}
-              <g className={`state-${judgeState}`}>
-                <rect x="710" y="255" width="120" height="30" rx="4" className="node-fill node-fill-base" />
-                <rect x="710" y="255" width="120" height="30" rx="4" fill="none" stroke="#f26600" strokeWidth="2" />
-                <text x="770" y="275" textAnchor="middle" className="node-text node-text-base" fontSize="14">{judgeLabel}</text>
-              </g>
             </>
           )}
         </svg>
       </div>
+
+      {/* Judge flow node - only in 3-actor mode */}
+      {actorC && judgeActor && (
+        <JudgeFlowNode
+          judgeActor={judgeActor}
+          judgeState={judgeState}
+          currentPhase={currentPhase}
+        />
+      )}
 
       {/* Phase status bar */}
       <div className="px-3 py-2 border-t border-[#f26600]/30 text-center">
@@ -368,6 +462,49 @@ export default function MiniMagiMonitor({
             {completedCount}/{totalActors} 模型完成
           </p>
         )}
+      </div>
+    </div>
+  )
+}
+
+function JudgeFlowNode({
+  judgeActor,
+  judgeState,
+  currentPhase,
+}: {
+  judgeActor: Actor
+  judgeState: NodeState
+  currentPhase: string
+}) {
+  // Determine display state class
+  const stateClass =
+    judgeState === 'judge_active' ? 'judge-active' :
+    judgeState === 'done' ? 'judge-done' :
+    'judge-idle'
+
+  const dotClass =
+    judgeState === 'judge_active' ? 'dot-active' :
+    judgeState === 'done' ? 'dot-done' :
+    'dot-idle'
+
+  const statusText =
+    judgeState === 'judge_active'
+      ? (currentPhase === 'final_answer' ? '最終回答生成中' : '共識裁決中')
+      : judgeState === 'done'
+      ? '完了'
+      : '待機中'
+
+  const label = judgeActor.name.slice(0, 12).toUpperCase()
+
+  return (
+    <div className="shrink-0 px-3 py-1">
+      {/* Arrow */}
+      <div className="judge-flow-arrow" />
+      {/* Node */}
+      <div className={`judge-node-box ${stateClass}`}>
+        <div className={`judge-dot ${dotClass}`} />
+        <span className="judge-name">{label}</span>
+        <span className="judge-status-label">{statusText}</span>
       </div>
     </div>
   )

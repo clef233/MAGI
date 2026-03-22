@@ -31,7 +31,7 @@ interface PromptPreset {
   updated_at: string | null
 }
 
-type SettingsTab = 'workflow' | 'presets'
+type SettingsTab = 'workflow' | 'presets' | 'semantic'
 
 interface SettingsViewProps {
   onBack: () => void
@@ -45,6 +45,34 @@ export default function SettingsView({ onBack }: SettingsViewProps) {
   const [saving, setSaving] = useState<string | null>(null)
   const [editedPrompts, setEditedPrompts] = useState<Record<string, string>>({})
   const [editedPresets, setEditedPresets] = useState<Record<string, Partial<PromptPreset>>>({})
+
+  const [semanticConfig, setSemanticConfig] = useState<{
+    provider: string
+    api_format: string
+    base_url: string
+    api_key: string
+    model: string
+    max_tokens: number
+    temperature: number
+    question_intent_timeout: number
+    topic_extraction_timeout: number
+    cross_compare_timeout: number
+    is_configured: boolean
+  }>({
+    provider: 'custom',
+    api_format: 'openai_compatible',
+    base_url: '',
+    api_key: '',
+    model: '',
+    max_tokens: 2048,
+    temperature: 0.3,
+    question_intent_timeout: 60,
+    topic_extraction_timeout: 90,
+    cross_compare_timeout: 90,
+    is_configured: false,
+  })
+  const [semanticTesting, setSemanticTesting] = useState(false)
+  const [semanticTestResult, setSemanticTestResult] = useState<string | null>(null)
 
   useEffect(() => {
     loadData()
@@ -66,6 +94,26 @@ export default function SettingsView({ onBack }: SettingsViewProps) {
         initialEdits[p.key] = p.template_text
       })
       setEditedPrompts(initialEdits)
+
+      // Load semantic model config (may 404 if not configured)
+      try {
+        const sc = await apiClient.getSemanticModelConfig()
+        setSemanticConfig({
+          provider: sc.provider,
+          api_format: sc.api_format,
+          base_url: sc.base_url || '',
+          api_key: '',  // Never show existing key
+          model: sc.model,
+          max_tokens: sc.max_tokens,
+          temperature: sc.temperature,
+          question_intent_timeout: sc.question_intent_timeout,
+          topic_extraction_timeout: sc.topic_extraction_timeout,
+          cross_compare_timeout: sc.cross_compare_timeout,
+          is_configured: true,
+        })
+      } catch {
+        // 404 = not configured, keep defaults
+      }
     } catch (err) {
       console.error('Failed to load settings:', err)
     } finally {
@@ -104,6 +152,43 @@ export default function SettingsView({ onBack }: SettingsViewProps) {
       console.error('Failed to save:', err)
     } finally {
       setSaving(null)
+    }
+  }
+
+  const saveSemanticConfig = async () => {
+    setSaving('semantic')
+    try {
+      await apiClient.upsertSemanticModelConfig({
+        provider: semanticConfig.provider as import('@/types').ProviderType,
+        api_format: semanticConfig.api_format,
+        base_url: semanticConfig.base_url || undefined,
+        api_key: semanticConfig.api_key,
+        model: semanticConfig.model,
+        max_tokens: semanticConfig.max_tokens,
+        temperature: semanticConfig.temperature,
+        question_intent_timeout: semanticConfig.question_intent_timeout,
+        topic_extraction_timeout: semanticConfig.topic_extraction_timeout,
+        cross_compare_timeout: semanticConfig.cross_compare_timeout,
+      })
+      await loadData()
+      setSemanticTestResult(null)
+    } catch (err) {
+      console.error('Failed to save semantic config:', err)
+    } finally {
+      setSaving(null)
+    }
+  }
+
+  const testSemanticConfig = async () => {
+    setSemanticTesting(true)
+    setSemanticTestResult(null)
+    try {
+      const result = await apiClient.testSemanticModel()
+      setSemanticTestResult(`✅ ${result.response}`)
+    } catch (err) {
+      setSemanticTestResult(`❌ ${(err as Error).message}`)
+    } finally {
+      setSemanticTesting(false)
     }
   }
 
@@ -158,6 +243,16 @@ export default function SettingsView({ onBack }: SettingsViewProps) {
               }`}
             >
               Actor 预设
+            </button>
+            <button
+              onClick={() => setTab('semantic')}
+              className={`pb-3 px-4 transition-colors ${
+                tab === 'semantic'
+                  ? 'text-accent-blue border-b-2 border-accent-blue'
+                  : 'text-text-secondary hover:text-text-primary'
+              }`}
+            >
+              语义分析模型
             </button>
           </div>
 
@@ -220,7 +315,7 @@ export default function SettingsView({ onBack }: SettingsViewProps) {
                 </motion.div>
               ))}
             </div>
-          ) : (
+          ) : tab === 'presets' ? (
             /* Prompt Presets */
             <div className="space-y-6">
               {promptPresets.map((preset) => (
@@ -350,6 +445,150 @@ export default function SettingsView({ onBack }: SettingsViewProps) {
                   )}
                 </motion.div>
               ))}
+            </div>
+          ) : (
+            /* Semantic Model Config */
+            <div className="space-y-6">
+              <motion.div
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                className="bg-bg-secondary border border-border rounded-2xl p-6"
+              >
+                <div className="flex items-start justify-between mb-4">
+                  <div>
+                    <h3 className="text-lg font-medium">语义分析专用模型</h3>
+                    <p className="text-text-tertiary text-sm mt-1">
+                      独立于主流程的轻量模型，用于提取语义主题和生成分歧图谱。
+                      建议使用响应速度快的小模型，避免与主流程竞争 API 限速。
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {semanticConfig.is_configured && (
+                      <button
+                        onClick={testSemanticConfig}
+                        disabled={semanticTesting}
+                        className="flex items-center gap-2 px-4 py-2 bg-bg-tertiary text-text-secondary rounded-xl hover:bg-bg-tertiary/80 disabled:opacity-50 transition-colors"
+                      >
+                        {semanticTesting ? '测试中...' : '测试连接'}
+                      </button>
+                    )}
+                    <button
+                      onClick={saveSemanticConfig}
+                      disabled={saving === 'semantic' || !semanticConfig.model || !semanticConfig.api_key}
+                      className="flex items-center gap-2 px-4 py-2 bg-accent-blue text-white rounded-xl hover:bg-blue-600 disabled:opacity-50 transition-colors"
+                    >
+                      <Save className="w-4 h-4" />
+                      {saving === 'semantic' ? 'Saving...' : 'Save'}
+                    </button>
+                  </div>
+                </div>
+
+                {semanticTestResult && (
+                  <div className="mb-4 p-3 bg-bg-tertiary rounded-xl text-sm text-text-secondary">
+                    {semanticTestResult}
+                  </div>
+                )}
+
+                {!semanticConfig.is_configured && (
+                  <div className="mb-4 p-3 bg-accent-orange/10 border border-accent-orange/20 rounded-xl text-sm text-accent-orange">
+                    ⚠️ 语义分析模型尚未配置。配置后互评将自动启用语义图谱功能。
+                  </div>
+                )}
+
+                <div className="space-y-4">
+                  {/* Provider & Model */}
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="text-text-secondary text-sm block mb-1">Provider</label>
+                      <select
+                        value={semanticConfig.provider}
+                        onChange={(e) => setSemanticConfig(prev => ({ ...prev, provider: e.target.value }))}
+                        className="w-full px-4 py-2 bg-bg-tertiary border border-border rounded-xl focus:outline-none focus:border-accent-blue"
+                      >
+                        <option value="openai">OpenAI</option>
+                        <option value="anthropic">Anthropic</option>
+                        <option value="custom">Custom</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-text-secondary text-sm block mb-1">Model</label>
+                      <input
+                        type="text"
+                        value={semanticConfig.model}
+                        onChange={(e) => setSemanticConfig(prev => ({ ...prev, model: e.target.value }))}
+                        className="w-full px-4 py-2 bg-bg-tertiary border border-border rounded-xl focus:outline-none focus:border-accent-blue"
+                        placeholder="gpt-4o-mini"
+                      />
+                    </div>
+                  </div>
+
+                  {/* API Key */}
+                  <div>
+                    <label className="text-text-secondary text-sm block mb-1">
+                      API Key {semanticConfig.is_configured && <span className="text-text-tertiary">(留空保留现有)</span>}
+                    </label>
+                    <input
+                      type="password"
+                      value={semanticConfig.api_key}
+                      onChange={(e) => setSemanticConfig(prev => ({ ...prev, api_key: e.target.value }))}
+                      className="w-full px-4 py-2 bg-bg-tertiary border border-border rounded-xl focus:outline-none focus:border-accent-blue"
+                      placeholder={semanticConfig.is_configured ? '留空保留现有 key' : 'sk-...'}
+                    />
+                  </div>
+
+                  {/* Base URL */}
+                  <div>
+                    <label className="text-text-secondary text-sm block mb-1">Base URL（Custom provider 必填）</label>
+                    <input
+                      type="text"
+                      value={semanticConfig.base_url}
+                      onChange={(e) => setSemanticConfig(prev => ({ ...prev, base_url: e.target.value }))}
+                      className="w-full px-4 py-2 bg-bg-tertiary border border-border rounded-xl focus:outline-none focus:border-accent-blue"
+                      placeholder="https://api.siliconflow.cn/v1"
+                    />
+                  </div>
+
+                  {/* Timeout Configuration */}
+                  <div className="border-t border-border pt-4">
+                    <h4 className="text-text-primary font-medium mb-3">超时配置（秒）</h4>
+                    <div className="grid grid-cols-3 gap-4">
+                      <div>
+                        <label className="text-text-tertiary text-xs block mb-1">问题意图分析</label>
+                        <input
+                          type="number"
+                          min={10}
+                          max={300}
+                          value={semanticConfig.question_intent_timeout}
+                          onChange={(e) => setSemanticConfig(prev => ({ ...prev, question_intent_timeout: Number(e.target.value) }))}
+                          className="w-full px-3 py-2 bg-bg-tertiary border border-border rounded-lg focus:outline-none focus:border-accent-blue text-sm"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-text-tertiary text-xs block mb-1">主题提取（每模型）</label>
+                        <input
+                          type="number"
+                          min={10}
+                          max={300}
+                          value={semanticConfig.topic_extraction_timeout}
+                          onChange={(e) => setSemanticConfig(prev => ({ ...prev, topic_extraction_timeout: Number(e.target.value) }))}
+                          className="w-full px-3 py-2 bg-bg-tertiary border border-border rounded-lg focus:outline-none focus:border-accent-blue text-sm"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-text-tertiary text-xs block mb-1">跨模型比较</label>
+                        <input
+                          type="number"
+                          min={10}
+                          max={300}
+                          value={semanticConfig.cross_compare_timeout}
+                          onChange={(e) => setSemanticConfig(prev => ({ ...prev, cross_compare_timeout: Number(e.target.value) }))}
+                          className="w-full px-3 py-2 bg-bg-tertiary border border-border rounded-lg focus:outline-none focus:border-accent-blue text-sm"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </motion.div>
             </div>
           )}
         </div>

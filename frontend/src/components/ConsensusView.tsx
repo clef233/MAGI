@@ -2,7 +2,7 @@
 
 import { motion } from 'framer-motion'
 import { Consensus } from '@/types'
-import { Check, X, Lightbulb } from 'lucide-react'
+import { Check, X, Lightbulb, HelpCircle } from 'lucide-react'
 import MarkdownBlock from './MarkdownBlock'
 
 interface ConsensusViewProps {
@@ -13,6 +13,12 @@ export default function ConsensusView({ consensus }: ConsensusViewProps) {
   const confidencePercent = consensus.confidence !== null && consensus.confidence !== undefined
     ? Math.round(consensus.confidence * 100)
     : null
+
+  // Only show summary if it's a meaningful standalone text (not just a copy of recommendation)
+  const showSummary = consensus.summary
+    && consensus.summary.length > 0
+    && consensus.summary.length < 300
+    && consensus.summary !== consensus.recommendation
 
   return (
     <motion.div
@@ -43,8 +49,19 @@ export default function ConsensusView({ consensus }: ConsensusViewProps) {
       </div>
 
       <div className="p-6 space-y-6">
-        {/* Summary - only show if it's significantly different from final_answer content */}
-        {consensus.summary && consensus.summary.length < 500 && (
+        {/* Recommendation - always show if present */}
+        {consensus.recommendation && (
+          <div className="bg-accent-blue/5 border border-accent-blue/20 rounded-xl p-4">
+            <h4 className="text-text-secondary text-sm mb-2 flex items-center gap-2">
+              <Lightbulb className="w-4 h-4 text-accent-blue" />
+              核心建议
+            </h4>
+            <MarkdownBlock content={consensus.recommendation} />
+          </div>
+        )}
+
+        {/* Summary - only if it's a meaningful separate text */}
+        {showSummary && (
           <div>
             <h4 className="text-text-secondary text-sm mb-2">概要</h4>
             <MarkdownBlock content={consensus.summary} />
@@ -56,7 +73,7 @@ export default function ConsensusView({ consensus }: ConsensusViewProps) {
           <div>
             <h4 className="text-text-secondary text-sm mb-2 flex items-center gap-2">
               <Check className="w-4 h-4 text-accent-green" />
-              Agreements
+              共识观点
             </h4>
             <ul className="space-y-2">
               {consensus.agreements.map((agreement, i) => (
@@ -74,7 +91,7 @@ export default function ConsensusView({ consensus }: ConsensusViewProps) {
           <div>
             <h4 className="text-text-secondary text-sm mb-2 flex items-center gap-2">
               <X className="w-4 h-4 text-accent-orange" />
-              Disagreements
+              仍存分歧
             </h4>
             <ul className="space-y-2">
               {consensus.disagreements.map((disagreement, i) => (
@@ -87,14 +104,21 @@ export default function ConsensusView({ consensus }: ConsensusViewProps) {
           </div>
         )}
 
-        {/* Recommendation */}
-        {consensus.recommendation && (
-          <div className="bg-bg-tertiary rounded-xl p-4">
+        {/* Key Uncertainties - new section */}
+        {consensus.key_uncertainties && consensus.key_uncertainties.length > 0 && (
+          <div>
             <h4 className="text-text-secondary text-sm mb-2 flex items-center gap-2">
-              <Lightbulb className="w-4 h-4 text-accent-blue" />
-              Recommendation
+              <HelpCircle className="w-4 h-4 text-accent-purple" />
+              关键不确定性
             </h4>
-            <MarkdownBlock content={consensus.recommendation} />
+            <ul className="space-y-2">
+              {consensus.key_uncertainties.map((uncertainty, i) => (
+                <li key={i} className="flex items-start gap-2">
+                  <span className="text-accent-purple mt-1">•</span>
+                  <MarkdownBlock content={uncertainty} className="flex-1" />
+                </li>
+              ))}
+            </ul>
           </div>
         )}
       </div>
