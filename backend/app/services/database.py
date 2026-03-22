@@ -1,6 +1,6 @@
 import logging
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy import select
+from sqlalchemy import select, text
 from app.core.config import get_settings
 
 logger = logging.getLogger('magi.database')
@@ -39,8 +39,45 @@ async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
+    # Migrate existing tables: add missing columns
+    await _migrate_add_columns()
+
     # Seed default workflow prompts and presets
     await _seed_default_prompts()
+
+
+async def _migrate_add_columns():
+    """Add missing columns to existing tables.
+
+    SQLAlchemy's create_all only creates new tables, it does NOT alter
+    existing tables to add new columns. This function uses raw ALTER TABLE
+    statements to add any missing columns.
+
+    Each migration is idempotent - it checks if the column exists before
+    attempting to add it, so it's safe to run on every startup.
+    """
+    # Define migrations: (table_name, column_name, column_type, default_value)
+    migrations = [
+        ("debate_sessions", "consensus_key_uncertainties", "TEXT", "'[]'"),
+    ]
+
+    async with engine.begin() as conn:
+        for table, column, col_type, default in migrations:
+            # Check if column exists by querying table_info
+            result = await conn.execute(
+                text(f"PRAGMA table_info({table})")
+            )
+            rows = result.fetchall()
+            existing_columns = {row[1] for row in rows}
+
+            if column not in existing_columns:
+                logger.info(f"Migrating: ALTER TABLE {table} ADD COLUMN {column}")
+                await conn.execute(
+                    text(f"ALTER TABLE {table} ADD COLUMN {column} {col_type} DEFAULT {default}")
+                )
+                logger.info(f"Migration complete: {table}.{column}")
+            else:
+                logger.debug(f"Column {table}.{column} already exists, skipping")
 
 
 async def _seed_default_prompts():
