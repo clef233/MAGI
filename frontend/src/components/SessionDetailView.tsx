@@ -1,17 +1,45 @@
 'use client'
 
 import { useState, useEffect, useMemo } from 'react'
-import { motion } from 'framer-motion'
-import { ArrowLeft, Loader2, AlertCircle } from 'lucide-react'
+import { Loader2, AlertCircle, Square } from 'lucide-react'
 import { apiClient } from '@/lib/apiClient'
-import { DebateSession, Actor, SemanticAnalysisResult, TopicComparison } from '@/types'
+import { DebateSession, SemanticAnalysisResult, Consensus } from '@/types'
 import {
   hydrateSessionToPhaseHistory,
   hydrateSemanticToMap,
   hydrateConsensus,
 } from '@/lib/sessionHydrator'
+import { useDebateStore } from '@/stores/debateStore'
 import DebateView from './DebateView'
 import QuestionBox from './QuestionBox'
+
+/**
+ * Safely convert a value to string for rendering.
+ * Handles cases where LLM returns structured objects instead of plain strings.
+ */
+function safeString(val: unknown): string {
+  if (typeof val === 'string') return val
+  if (val && typeof val === 'object') {
+    const values = Object.values(val).filter(Boolean)
+    if (values.length > 0) return values.join(' — ')
+    return JSON.stringify(val)
+  }
+  return String(val ?? '')
+}
+
+/**
+ * Sanitize consensus data to ensure all array fields contain strings.
+ * This handles legacy data where arrays may contain dict objects.
+ */
+function sanitizeConsensus(consensus: Consensus | null): Consensus | null {
+  if (!consensus) return null
+  return {
+    ...consensus,
+    agreements: (consensus.agreements || []).map(safeString),
+    disagreements: (consensus.disagreements || []).map(safeString),
+    key_uncertainties: (consensus.key_uncertainties || []).map(safeString),
+  }
+}
 
 interface SessionDetailViewProps {
   sessionId: string
@@ -25,6 +53,42 @@ export default function SessionDetailView({ sessionId, onBack }: SessionDetailVi
   const [error, setError] = useState<string | null>(null)
   const [selectedDiffPhaseId, setSelectedDiffPhaseId] = useState<string | null>(null)
   const [selectedTopicId, setSelectedTopicId] = useState<string | null>(null)
+  const [stopping, setStopping] = useState(false)
+
+  // Get live state from store
+  const resumeDebate = useDebateStore((s) => s.resumeDebate)
+  const disconnectStream = useDebateStore((s) => s.disconnectStream)
+  const storeSessionId = useDebateStore((s) => s.currentSessionId)
+  const storeSession = useDebateStore((s) => s.currentSession)
+  const storePhaseHistory = useDebateStore((s) => s.phaseHistory)
+  const storeCurrentPhaseRecord = useDebateStore((s) => s.currentPhaseRecord)
+  const storeStatus = useDebateStore((s) => s.status)
+  const storeCurrentPhase = useDebateStore((s) => s.currentPhase)
+  const storeSemanticComparisons = useDebateStore((s) => s.semanticComparisons)
+  const storeSemanticSkipped = useDebateStore((s) => s.semanticSkipped)
+  const storeSemanticSkipReason = useDebateStore((s) => s.semanticSkipReason)
+
+  // Check if session is active (in progress)
+  const isActiveSession = useMemo(() => {
+    return session && ['initializing', 'debating', 'judging'].includes(session.status)
+  }, [session])
+
+  // Check if store is attached to this session
+  const isStoreAttached = storeSessionId === sessionId
+
+  // Resume debate if active and not yet attached
+  useEffect(() => {
+    if (session && isActiveSession && !isStoreAttached) {
+      resumeDebate(session)
+    }
+  }, [session, isActiveSession, isStoreAttached, resumeDebate])
+
+  // Auto-refresh when live session completes
+  useEffect(() => {
+    if (isStoreAttached && storeStatus === 'completed') {
+      loadSession()
+    }
+  }, [isStoreAttached, storeStatus])
 
   useEffect(() => {
     loadSession()
@@ -48,34 +112,72 @@ export default function SessionDetailView({ sessionId, onBack }: SessionDetailVi
     }
   }
 
+  const handleStop = async () => {
+    if (!session || stopping) return
+    if (!confirm('确定要终止这个任务吗？')) return
+
+    setStopping(true)
+    try {
+      await apiClient.stopDebate(sessionId)
+      if (isStoreAttached) {
+        disconnectStream()
+      }
+      await loadSession()
+    } catch (err) {
+      setError((err as Error).message)
+    } finally {
+      setStopping(false)
+    }
+  }
+
+  // Effective values - use store data if attached, otherwise use local data
+  const effectiveSession = isStoreAttached && storeSession ? storeSession : session
+
   // Convert historical data to live format
-  const phaseHistory = useMemo(() => {
+  const localPhaseHistory = useMemo(() => {
     if (!session) return []
     return hydrateSessionToPhaseHistory(session)
   }, [session])
 
+  const effectivePhaseHistory = isStoreAttached ? storePhaseHistory : localPhaseHistory
+
   // Convert semantic data to comparisons map
-  const semanticComparisons = useMemo(() => {
+  const localSemanticComparisons = useMemo(() => {
     return hydrateSemanticToMap(semantic)
   }, [semantic])
 
+  const effectiveSemanticComparisons = isStoreAttached ? storeSemanticComparisons : localSemanticComparisons
+
   // Get consensus
-  const consensus = useMemo(() => {
+  const localConsensus = useMemo(() => {
     if (!session) return null
     return hydrateConsensus(session)
   }, [session])
 
+  // Sanitize consensus to ensure string arrays (handles legacy data with dict objects)
+  const sanitizedConsensus = useMemo(() => {
+    const c = effectiveSession?.consensus || localConsensus
+    return sanitizeConsensus(c)
+  }, [effectiveSession, localConsensus])
+
+  // Get effective status and phase
+  const effectiveStatus = isStoreAttached ? storeStatus : (session?.status === 'completed' ? 'completed' : 'idle')
+  const effectiveCurrentPhase = isStoreAttached ? storeCurrentPhase : 'completed'
+  const effectiveCurrentPhaseRecord = isStoreAttached ? storeCurrentPhaseRecord : null
+  const effectiveSemanticSkipped = isStoreAttached ? storeSemanticSkipped : false
+  const effectiveSemanticSkipReason = isStoreAttached ? storeSemanticSkipReason : null
+
   // Get actors (non-judge for debate view)
   const debateActors = useMemo(() => {
-    if (!session) return []
-    return session.actors.filter(a => !a.is_meta_judge)
-  }, [session])
+    if (!effectiveSession) return []
+    return effectiveSession.actors.filter(a => !a.is_meta_judge)
+  }, [effectiveSession])
 
   // Get judge actor
   const judgeActor = useMemo(() => {
-    if (!session) return undefined
-    return session.judge_actor
-  }, [session])
+    if (!effectiveSession) return undefined
+    return effectiveSession.judge_actor
+  }, [effectiveSession])
 
   const formatDate = (dateStr: string) => {
     return new Date(dateStr).toLocaleString('zh-CN', {
@@ -143,7 +245,18 @@ export default function SessionDetailView({ sessionId, onBack }: SessionDetailVi
             ← Back
           </button>
           <h1 className="text-lg font-semibold tracking-wider text-accent-orange">互评详情</h1>
-          <div className="w-16" />
+          <div className="w-16 flex justify-end">
+            {isActiveSession && (
+              <button
+                onClick={handleStop}
+                disabled={stopping}
+                className="flex items-center gap-2 px-3 py-1.5 bg-accent-red/20 text-accent-red rounded-lg hover:bg-accent-red/30 transition-colors text-sm disabled:opacity-50"
+              >
+                <Square className="w-4 h-4" />
+                {stopping ? '终止中...' : '终止任务'}
+              </button>
+            )}
+          </div>
         </div>
       </header>
 
@@ -152,18 +265,18 @@ export default function SessionDetailView({ sessionId, onBack }: SessionDetailVi
         <div className="h-full max-w-[1600px] mx-auto px-6 py-4 flex flex-col">
           {/* Question */}
           <div className="mb-4 shrink-0">
-            <QuestionBox question={session.question} className="mb-0" />
-            <p className="text-text-tertiary text-sm mt-2">{formatDate(session.created_at)}</p>
+            <QuestionBox question={effectiveSession?.question || ''} className="mb-0" />
+            <p className="text-text-tertiary text-sm mt-2">{effectiveSession ? formatDate(effectiveSession.created_at) : ''}</p>
           </div>
 
           {/* Status */}
           <div className="mb-4 shrink-0">
             <span className={`px-3 py-1 rounded-full text-sm ${
-              session.status === 'completed' ? 'bg-accent-green/20 text-accent-green' :
-              session.status === 'debating' ? 'bg-accent-blue/20 text-accent-blue' :
+              effectiveSession?.status === 'completed' ? 'bg-accent-green/20 text-accent-green' :
+              effectiveSession?.status === 'debating' ? 'bg-accent-blue/20 text-accent-blue' :
               'bg-text-tertiary/20 text-text-tertiary'
             }`}>
-              {session.status === 'completed' ? '已完成' : session.status}
+              {effectiveSession?.status === 'completed' ? '已完成' : effectiveSession?.status || ''}
             </span>
           </div>
 
@@ -172,17 +285,19 @@ export default function SessionDetailView({ sessionId, onBack }: SessionDetailVi
             <DebateView
               actors={debateActors}
               judgeActor={judgeActor}
-              phaseHistory={phaseHistory}
-              currentPhaseRecord={null}
+              phaseHistory={effectivePhaseHistory}
+              currentPhaseRecord={effectiveCurrentPhaseRecord}
               selectedDiffPhaseId={selectedDiffPhaseId}
               onSelectDiffPhase={setSelectedDiffPhaseId}
-              status="completed"
-              currentPhase="completed"
-              question={session.question}
-              semanticComparisons={semanticComparisons}
+              status={effectiveStatus}
+              currentPhase={effectiveCurrentPhase}
+              question={effectiveSession?.question || ''}
+              semanticComparisons={effectiveSemanticComparisons}
               selectedTopicId={selectedTopicId}
               onSelectTopic={setSelectedTopicId}
-              consensus={consensus}
+              consensus={sanitizedConsensus}
+              semanticSkipped={effectiveSemanticSkipped}
+              semanticSkipReason={effectiveSemanticSkipReason}
             />
           </div>
         </div>

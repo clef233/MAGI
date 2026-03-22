@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useMemo, useEffect } from 'react'
+import { useState, useMemo, useEffect, useRef } from 'react'
 import { motion } from 'framer-motion'
 import { Actor, LivePhaseRecord, TopicComparison, Consensus } from '@/types'
 import ReviewChatView from './ReviewChatView'
@@ -76,11 +76,21 @@ export default function DebateView({
     return semanticComparisons.size > 0
   }, [semanticComparisons])
 
+  // Track previous status to only auto-switch once on transition to completed
+  const prevStatusRef = useRef(status)
+
   // Auto-switch to semantic tab when debate completes and semantic data is available
+  // Only do this when transitioning from non-completed to completed (live session)
+  // Don't auto-switch when opening a completed session from history
   useEffect(() => {
-    if (status === 'completed' && hasSemanticData && sidebarTab === 'monitor') {
+    const wasNotCompleted = prevStatusRef.current !== 'completed'
+    const isNowCompleted = status === 'completed'
+
+    if (wasNotCompleted && isNowCompleted && hasSemanticData && sidebarTab === 'monitor') {
       setSidebarTab('semantic')
     }
+
+    prevStatusRef.current = status
   }, [status, hasSemanticData, sidebarTab])
 
   return (

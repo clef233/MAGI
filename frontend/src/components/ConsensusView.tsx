@@ -5,6 +5,21 @@ import { Consensus } from '@/types'
 import { Check, X, Lightbulb, HelpCircle } from 'lucide-react'
 import MarkdownBlock from './MarkdownBlock'
 
+/**
+ * Safely convert a value to string for rendering.
+ * Handles cases where LLM returns structured objects instead of plain strings.
+ */
+function safeString(val: unknown): string {
+  if (typeof val === 'string') return val
+  if (val && typeof val === 'object') {
+    // Handle dict-like objects from malformed LLM output
+    const values = Object.values(val).filter(Boolean)
+    if (values.length > 0) return values.join(' — ')
+    return JSON.stringify(val)
+  }
+  return String(val ?? '')
+}
+
 interface ConsensusViewProps {
   consensus: Consensus
 }
@@ -79,7 +94,7 @@ export default function ConsensusView({ consensus }: ConsensusViewProps) {
               {consensus.agreements.map((agreement, i) => (
                 <li key={i} className="flex items-start gap-2">
                   <span className="text-accent-green mt-1">•</span>
-                  <MarkdownBlock content={agreement} className="flex-1" />
+                  <MarkdownBlock content={safeString(agreement)} className="flex-1" />
                 </li>
               ))}
             </ul>
@@ -97,7 +112,7 @@ export default function ConsensusView({ consensus }: ConsensusViewProps) {
               {consensus.disagreements.map((disagreement, i) => (
                 <li key={i} className="flex items-start gap-2">
                   <span className="text-accent-orange mt-1">•</span>
-                  <MarkdownBlock content={disagreement} className="flex-1" />
+                  <MarkdownBlock content={safeString(disagreement)} className="flex-1" />
                 </li>
               ))}
             </ul>
@@ -115,7 +130,7 @@ export default function ConsensusView({ consensus }: ConsensusViewProps) {
               {consensus.key_uncertainties.map((uncertainty, i) => (
                 <li key={i} className="flex items-start gap-2">
                   <span className="text-accent-purple mt-1">•</span>
-                  <MarkdownBlock content={uncertainty} className="flex-1" />
+                  <MarkdownBlock content={safeString(uncertainty)} className="flex-1" />
                 </li>
               ))}
             </ul>

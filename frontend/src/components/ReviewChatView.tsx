@@ -44,6 +44,7 @@ const MessageCard = memo(function MessageCard({
 }) {
   // Don't render Markdown during streaming - use plain text for performance
   const isStreaming = message.status === 'streaming'
+  const isPending = message.status === 'pending'
 
   return (
     <motion.div
@@ -68,11 +69,17 @@ const MessageCard = memo(function MessageCard({
         {isStreaming && (
           <span className="text-xs text-accent-blue animate-pulse">streaming...</span>
         )}
+        {isPending && (
+          <span className="text-xs text-text-tertiary">等待中</span>
+        )}
       </div>
 
-      {/* Content - plain text during streaming, Markdown when done */}
+      {/* Content - plain text during streaming, Markdown when done, placeholder for pending */}
       <div className="px-4 py-4">
-        {isStreaming ? (
+        {isPending ? (
+          // Placeholder for pending actors
+          <div className="text-text-tertiary text-sm">等待开始...</div>
+        ) : isStreaming ? (
           // Plain text during streaming for performance
           <div className="whitespace-pre-wrap break-words text-text-primary">
             {message.content}
@@ -257,7 +264,36 @@ export default function ReviewChatView({
     return allRecords
       .filter((record) => record.phase !== 'summary')
       .map((record) => {
-        const messages = Object.values(record.messages) as LiveMessage[]
+        let messages = Object.values(record.messages) as LiveMessage[]
+
+        // For current streaming phase in initial/review/revision, add placeholder cards for pending actors
+        const isCurrentStreamingPhase =
+          status === 'streaming' &&
+          currentPhaseRecord?.id === record.id &&
+          ['initial', 'review', 'revision'].includes(record.phase)
+
+        if (isCurrentStreamingPhase) {
+          // Get existing actor IDs
+          const existingActorIds = new Set(messages.map(m => m.actorId))
+
+          // Create placeholder messages for actors not yet started
+          const placeholders: LiveMessage[] = actors
+            .filter(a => !existingActorIds.has(a.id))
+            .map(actor => ({
+              actorId: actor.id,
+              actorName: actor.name,
+              actorIcon: actor.icon,
+              actorColor: actor.display_color,
+              phase: record.phase,
+              step: record.step,
+              cycle: record.cycle,
+              content: '',
+              status: 'pending' as const,
+            }))
+
+          messages = [...messages, ...placeholders]
+        }
+
         const sortedMessages = messages.sort((a, b) => {
           const aIndex = actors.findIndex((act) => act.id === a.actorId)
           const bIndex = actors.findIndex((act) => act.id === b.actorId)
@@ -269,7 +305,7 @@ export default function ReviewChatView({
           messages: sortedMessages,
         }
       })
-  }, [phaseHistory, currentPhaseRecord, actors])
+  }, [phaseHistory, currentPhaseRecord, actors, status])
 
   return (
     <div ref={scrollRef} className="space-y-6 overflow-y-auto h-full pb-8 pr-2">

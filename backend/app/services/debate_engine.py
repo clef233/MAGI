@@ -46,6 +46,25 @@ if not logger.handlers:
 logger.propagate = False
 
 
+def _sanitize_string_list(items: list) -> list[str]:
+    """Ensure all items in list are strings. LLM sometimes returns dicts.
+
+    This handles cases where the LLM returns structured objects like:
+    {"topic": "...", "detail": "..."} instead of plain strings.
+    """
+    result = []
+    for item in items:
+        if isinstance(item, str):
+            result.append(item)
+        elif isinstance(item, dict):
+            # Convert dict to readable string by joining all values
+            parts = [str(v) for v in item.values() if v]
+            result.append(" — ".join(parts) if parts else str(item))
+        else:
+            result.append(str(item))
+    return result
+
+
 class DebateEngine:
     """Core debate orchestration engine"""
 
@@ -406,34 +425,33 @@ class DebateEngine:
                 await self._emit({"event": "debate_error", "data": {"message": f"Actor {actor.name} failed: {str(e)}"}})
                 raise
 
-        # Run all actors in parallel with real streaming
-        tasks = [actor_response_stream(actor) for actor in self.actors]
+        # Run all actors in parallel with real streaming using as_completed
+        # to commit each actor's message immediately when done
+        tasks = [asyncio.create_task(actor_response_stream(actor)) for actor in self.actors]
         logger.info(f"Created {len(tasks)} streaming tasks for actors")
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Store messages AFTER all parallel tasks complete (sequential DB writes)
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.error(f"Actor {self.actors[i].name} failed: {result}")
-            elif isinstance(result, tuple):
-                actor_id, full_response = result
-                message = Message(
-                    round_id=db_round.id,
-                    actor_id=actor_id,
-                    role="answer",
-                    content=full_response,
-                )
-                self.db.add(message)
-                # Track for later rounds
-                self.actor_responses[actor_id].append({
-                    "role": "answer",
-                    "content": full_response,
-                    "cycle": 0,
-                })
-
-        # Commit all messages at once
-        await self.db.commit()
+        for coro in asyncio.as_completed(tasks):
+            try:
+                result = await coro
+                if isinstance(result, tuple):
+                    actor_id, full_response = result
+                    # Commit immediately when this actor completes
+                    message = Message(
+                        round_id=db_round.id,
+                        actor_id=actor_id,
+                        role="answer",
+                        content=full_response,
+                    )
+                    self.db.add(message)
+                    await self.db.commit()
+                    # Track for later rounds
+                    self.actor_responses[actor_id].append({
+                        "role": "answer",
+                        "content": full_response,
+                        "cycle": 0,
+                    })
+            except Exception as e:
+                logger.error(f"Actor task failed: {e}")
 
     async def _run_review_round(self, cycle: int, db_round: DBRound):
         """Run review round where each actor critiques others' answers"""
@@ -529,27 +547,29 @@ class DebateEngine:
 
             return actor.id, full_response
 
-        tasks = [actor_review_stream(actor) for actor in self.actors]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        tasks = [asyncio.create_task(actor_review_stream(actor)) for actor in self.actors]
 
-        # Store messages AFTER all parallel tasks complete
-        for result in results:
-            if isinstance(result, tuple):
-                actor_id, full_response = result
-                message = Message(
-                    round_id=db_round.id,
-                    actor_id=actor_id,
-                    role="review",
-                    content=full_response,
-                )
-                self.db.add(message)
-                self.actor_responses[actor_id].append({
-                    "role": "review",
-                    "content": full_response,
-                    "cycle": cycle,
-                })
-
-        await self.db.commit()
+        for coro in asyncio.as_completed(tasks):
+            try:
+                result = await coro
+                if isinstance(result, tuple):
+                    actor_id, full_response = result
+                    # Commit immediately when this actor completes
+                    message = Message(
+                        round_id=db_round.id,
+                        actor_id=actor_id,
+                        role="review",
+                        content=full_response,
+                    )
+                    self.db.add(message)
+                    await self.db.commit()
+                    self.actor_responses[actor_id].append({
+                        "role": "review",
+                        "content": full_response,
+                        "cycle": cycle,
+                    })
+            except Exception as e:
+                logger.error(f"Review task failed: {e}")
 
     async def _run_revision_round(self, cycle: int, review_round: DBRound, db_round: DBRound):
         """Run revision round where actors improve their answers"""
@@ -652,27 +672,29 @@ class DebateEngine:
 
             return actor.id, full_response
 
-        tasks = [actor_revision_stream(actor) for actor in self.actors]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        tasks = [asyncio.create_task(actor_revision_stream(actor)) for actor in self.actors]
 
-        # Store messages AFTER all parallel tasks complete
-        for result in results:
-            if isinstance(result, tuple):
-                actor_id, full_response = result
-                message = Message(
-                    round_id=db_round.id,
-                    actor_id=actor_id,
-                    role="revision",
-                    content=full_response,
-                )
-                self.db.add(message)
-                self.actor_responses[actor_id].append({
-                    "role": "revision",
-                    "content": full_response,
-                    "cycle": cycle,
-                })
-
-        await self.db.commit()
+        for coro in asyncio.as_completed(tasks):
+            try:
+                result = await coro
+                if isinstance(result, tuple):
+                    actor_id, full_response = result
+                    # Commit immediately when this actor completes
+                    message = Message(
+                        round_id=db_round.id,
+                        actor_id=actor_id,
+                        role="revision",
+                        content=full_response,
+                    )
+                    self.db.add(message)
+                    await self.db.commit()
+                    self.actor_responses[actor_id].append({
+                        "role": "revision",
+                        "content": full_response,
+                        "cycle": cycle,
+                    })
+            except Exception as e:
+                logger.error(f"Revision task failed: {e}")
 
     async def _check_convergence(self) -> ConvergenceResult:
         """Check if responses have converged."""
@@ -1259,8 +1281,8 @@ The previous response could not be parsed. Please provide ONLY a valid JSON obje
         # Store consensus
         # New prompt schema: no "summary" field, use "recommendation" as summary fallback
         self.session.consensus_summary = consensus.get("summary", "") or consensus.get("recommendation", "")
-        self.session.consensus_agreements = consensus.get("agreements", [])
-        self.session.consensus_disagreements = consensus.get("disagreements", [])
+        self.session.consensus_agreements = _sanitize_string_list(consensus.get("agreements", []))
+        self.session.consensus_disagreements = _sanitize_string_list(consensus.get("disagreements", []))
         # Store confidence as-is (could be None if unavailable)
         confidence_value = consensus.get("confidence")
         if confidence_value is not None:
@@ -1268,7 +1290,7 @@ The previous response could not be parsed. Please provide ONLY a valid JSON obje
         else:
             self.session.consensus_confidence = None
         self.session.consensus_recommendation = consensus.get("recommendation", "")
-        self.session.consensus_key_uncertainties = consensus.get("key_uncertainties", [])
+        self.session.consensus_key_uncertainties = _sanitize_string_list(consensus.get("key_uncertainties", []))
         await self.db.commit()
 
         await self._emit({

@@ -1,6 +1,6 @@
 # Project: MAGI
 
-Generated: 2026-03-22 14:16:13
+Generated: 2026-03-22 18:11:54
 Root: D:\Projects\MAGI
 Files: 63
 
@@ -502,6 +502,27 @@ from app.services.task_manager import task_manager
 router = APIRouter(prefix="/api/debate", tags=["debate"])
 
 
+def _ensure_string_list(items) -> list[str]:
+    """Safety net for legacy data that may contain dicts instead of strings.
+
+    Handles cases where consensus fields were stored as structured objects
+    before the sanitization was added to debate_engine.
+    """
+    if not items:
+        return []
+    result = []
+    for item in items:
+        if isinstance(item, str):
+            result.append(item)
+        elif isinstance(item, dict):
+            # Convert dict to readable string by joining all values
+            parts = [str(v) for v in item.values() if v]
+            result.append(" — ".join(parts) if parts else str(item))
+        else:
+            result.append(str(item))
+    return result
+
+
 @router.post("/start", response_model=DebateStartResponse)
 async def start_debate(
     data: DebateStartRequest,
@@ -739,13 +760,14 @@ async def get_debate(
         ))
 
     consensus = None
-    if session.consensus_summary:
+    if session.consensus_summary or session.consensus_recommendation:
         consensus = ConsensusResult(
-            summary=session.consensus_summary,
-            agreements=session.consensus_agreements or [],
-            disagreements=session.consensus_disagreements or [],
+            summary=session.consensus_summary or "",
+            agreements=_ensure_string_list(session.consensus_agreements),
+            disagreements=_ensure_string_list(session.consensus_disagreements),
             confidence=session.consensus_confidence,  # Can be None
             recommendation=session.consensus_recommendation or "",
+            key_uncertainties=_ensure_string_list(session.consensus_key_uncertainties),
         )
 
     return DebateSessionResponse(
@@ -1046,7 +1068,12 @@ from pydantic import BaseModel
 from datetime import datetime
 
 from app.services.database import get_db
-from app.models.database import WorkflowPromptTemplate, PromptPreset
+from app.models.database import WorkflowPromptTemplate, PromptPreset, SemanticModelConfig
+from app.models.schemas import (
+    SemanticModelConfigResponse,
+    SemanticModelConfigCreate,
+    SemanticModelConfigUpdate,
+)
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -1208,6 +1235,147 @@ async def update_prompt_preset(
     await db.commit()
     await db.refresh(preset)
     return preset
+
+
+# ========== Semantic Model Config ==========
+
+@router.get("/semantic-model", response_model=SemanticModelConfigResponse)
+async def get_semantic_model_config(db: AsyncSession = Depends(get_db)):
+    """Get the semantic model configuration (singleton)."""
+    result = await db.execute(
+        select(SemanticModelConfig).where(SemanticModelConfig.is_active == True).limit(1)
+    )
+    config = result.scalar_one_or_none()
+    if not config:
+        raise HTTPException(
+            status_code=404,
+            detail="Semantic model not configured. Please configure it in Settings."
+        )
+    return config
+
+
+@router.put("/semantic-model", response_model=SemanticModelConfigResponse)
+async def upsert_semantic_model_config(
+    data: SemanticModelConfigCreate,
+    db: AsyncSession = Depends(get_db),
+):
+    """Create or update the semantic model configuration (singleton).
+    If a config exists, it will be updated. Otherwise, a new one is created.
+    """
+    result = await db.execute(
+        select(SemanticModelConfig).limit(1)
+    )
+    config = result.scalar_one_or_none()
+
+    if config:
+        # Update existing
+        config.provider = data.provider
+        config.api_format = data.api_format
+        config.base_url = data.base_url
+        # Only update api_key if provided (non-empty string)
+        if data.api_key and data.api_key.strip():
+            config.api_key = data.api_key
+        config.model = data.model
+        config.max_tokens = data.max_tokens
+        config.temperature = data.temperature
+        config.question_intent_timeout = data.question_intent_timeout
+        config.topic_extraction_timeout = data.topic_extraction_timeout
+        config.cross_compare_timeout = data.cross_compare_timeout
+        config.is_active = True
+    else:
+        # Create new - api_key is required
+        if not data.api_key or not data.api_key.strip():
+            raise HTTPException(status_code=400, detail="api_key is required for new configuration")
+        config = SemanticModelConfig(
+            provider=data.provider,
+            api_format=data.api_format,
+            base_url=data.base_url,
+            api_key=data.api_key,
+            model=data.model,
+            max_tokens=data.max_tokens,
+            temperature=data.temperature,
+            question_intent_timeout=data.question_intent_timeout,
+            topic_extraction_timeout=data.topic_extraction_timeout,
+            cross_compare_timeout=data.cross_compare_timeout,
+            is_active=True,
+        )
+        db.add(config)
+
+    await db.commit()
+    await db.refresh(config)
+    return config
+
+
+@router.patch("/semantic-model", response_model=SemanticModelConfigResponse)
+async def patch_semantic_model_config(
+    data: SemanticModelConfigUpdate,
+    db: AsyncSession = Depends(get_db),
+):
+    """Partially update semantic model configuration."""
+    result = await db.execute(
+        select(SemanticModelConfig).where(SemanticModelConfig.is_active == True).limit(1)
+    )
+    config = result.scalar_one_or_none()
+    if not config:
+        raise HTTPException(status_code=404, detail="Semantic model not configured.")
+
+    update_data = data.model_dump(exclude_unset=True)
+    if "provider" in update_data and update_data["provider"] is not None:
+        config.provider = update_data["provider"]
+    if "api_format" in update_data and update_data["api_format"] is not None:
+        config.api_format = update_data["api_format"]
+    if "base_url" in update_data and update_data["base_url"] is not None:
+        config.base_url = update_data["base_url"]
+    if "api_key" in update_data and update_data["api_key"] is not None:
+        config.api_key = update_data["api_key"]
+    if "model" in update_data and update_data["model"] is not None:
+        config.model = update_data["model"]
+    if "max_tokens" in update_data and update_data["max_tokens"] is not None:
+        config.max_tokens = update_data["max_tokens"]
+    if "temperature" in update_data and update_data["temperature"] is not None:
+        config.temperature = update_data["temperature"]
+    if "question_intent_timeout" in update_data and update_data["question_intent_timeout"] is not None:
+        config.question_intent_timeout = update_data["question_intent_timeout"]
+    if "topic_extraction_timeout" in update_data and update_data["topic_extraction_timeout"] is not None:
+        config.topic_extraction_timeout = update_data["topic_extraction_timeout"]
+    if "cross_compare_timeout" in update_data and update_data["cross_compare_timeout"] is not None:
+        config.cross_compare_timeout = update_data["cross_compare_timeout"]
+    if "is_active" in update_data and update_data["is_active"] is not None:
+        config.is_active = update_data["is_active"]
+
+    await db.commit()
+    await db.refresh(config)
+    return config
+
+
+@router.post("/semantic-model/test")
+async def test_semantic_model(db: AsyncSession = Depends(get_db)):
+    """Test semantic model connectivity."""
+    result = await db.execute(
+        select(SemanticModelConfig).where(SemanticModelConfig.is_active == True).limit(1)
+    )
+    config = result.scalar_one_or_none()
+    if not config:
+        raise HTTPException(status_code=404, detail="Semantic model not configured.")
+
+    from app.services.llm_adapter import create_adapter
+
+    try:
+        adapter = create_adapter(
+            provider=config.provider.value,
+            api_key=config.api_key,
+            base_url=config.base_url,
+            model=config.model,
+        )
+        response_text = ""
+        async for token in adapter.stream_completion(
+            messages=[{"role": "user", "content": "Say 'OK' if you can hear me."}],
+            max_tokens=50,
+        ):
+            response_text += token
+        return {"status": "success", "response": response_text[:100]}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Connection failed: {str(e)}")
 ```
 
 
@@ -1318,7 +1486,7 @@ async def health_check():
 
 ```python
 from .database import Base, Actor, DebateSession, DebateSessionActor, Round, Message
-from .database import ProviderType, SessionStatus
+from .database import ProviderType, SessionStatus, SemanticModelConfig
 
 __all__ = [
     "Base",
@@ -1329,6 +1497,7 @@ __all__ = [
     "Message",
     "ProviderType",
     "SessionStatus",
+    "SemanticModelConfig",
 ]
 ```
 
@@ -1420,6 +1589,7 @@ class DebateSession(Base):
     consensus_disagreements = Column(JSON, default=list)
     consensus_confidence = Column(Float)
     consensus_recommendation = Column(Text)
+    consensus_key_uncertainties = Column(JSON, default=list)
 
     # Stats
     total_tokens = Column(Integer, default=0)
@@ -1583,6 +1753,36 @@ class SemanticComparison(Base):
 
     # Relationships
     session = relationship("DebateSession", backref="semantic_comparisons")
+
+
+class SemanticModelConfig(Base):
+    """
+    语义分析专用模型配置 - 全局单例。
+    独立于 judge/debate actors，使用独立的 API 配置，
+    避免与主流程竞争 API 限速。
+    """
+    __tablename__ = "semantic_model_configs"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+
+    # API Configuration - 与 Actor 表结构对齐
+    provider = Column(SQLEnum(ProviderType), nullable=False)
+    api_format = Column(String(50), default="openai_compatible")
+    base_url = Column(String(255))
+    api_key = Column(String(255), nullable=False)
+    model = Column(String(100), nullable=False)
+    max_tokens = Column(Integer, default=2048)
+    temperature = Column(Float, default=0.3)
+
+    # Timeout 配置（秒）
+    question_intent_timeout = Column(Integer, default=60)
+    topic_extraction_timeout = Column(Integer, default=90)
+    cross_compare_timeout = Column(Integer, default=90)
+
+    # Meta
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 ```
 
 
@@ -1738,6 +1938,7 @@ class ConsensusResult(BaseModel):
     disagreements: list[str]
     confidence: Optional[float] = None
     recommendation: str
+    key_uncertainties: list[str] = Field(default_factory=list)
 
 
 class DebateSessionResponse(BaseModel):
@@ -1888,6 +2089,54 @@ class SemanticAnalysisResult(BaseModel):
     """Complete semantic analysis result for a session"""
     question_intent: Optional[QuestionIntentResponse] = None
     comparisons: list[SemanticComparisonResponse] = Field(default_factory=list)
+
+
+# ========== Semantic Model Config Schemas ==========
+
+class SemanticModelConfigResponse(BaseModel):
+    id: str
+    provider: ProviderType
+    api_format: str
+    base_url: Optional[str] = None
+    model: str
+    max_tokens: int
+    temperature: float
+    question_intent_timeout: int
+    topic_extraction_timeout: int
+    cross_compare_timeout: int
+    is_active: bool
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class SemanticModelConfigCreate(BaseModel):
+    provider: ProviderType
+    api_format: str = "openai_compatible"
+    base_url: Optional[str] = None
+    api_key: str = ""  # 空字符串 = 保留现有 key（仅对 update 生效）
+    model: str
+    max_tokens: int = 2048
+    temperature: float = Field(default=0.3, ge=0.0, le=2.0)
+    question_intent_timeout: int = Field(default=60, ge=10, le=300)
+    topic_extraction_timeout: int = Field(default=90, ge=10, le=300)
+    cross_compare_timeout: int = Field(default=90, ge=10, le=300)
+
+
+class SemanticModelConfigUpdate(BaseModel):
+    provider: Optional[ProviderType] = None
+    api_format: Optional[str] = None
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None  # None means keep existing
+    model: Optional[str] = None
+    max_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    question_intent_timeout: Optional[int] = None
+    topic_extraction_timeout: Optional[int] = None
+    cross_compare_timeout: Optional[int] = None
+    is_active: Optional[bool] = None
 ```
 
 
@@ -2182,7 +2431,7 @@ async def check_convergence(
 ```python
 import logging
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy import select
+from sqlalchemy import select, text
 from app.core.config import get_settings
 
 logger = logging.getLogger('magi.database')
@@ -2221,8 +2470,45 @@ async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
+    # Migrate existing tables: add missing columns
+    await _migrate_add_columns()
+
     # Seed default workflow prompts and presets
     await _seed_default_prompts()
+
+
+async def _migrate_add_columns():
+    """Add missing columns to existing tables.
+
+    SQLAlchemy's create_all only creates new tables, it does NOT alter
+    existing tables to add new columns. This function uses raw ALTER TABLE
+    statements to add any missing columns.
+
+    Each migration is idempotent - it checks if the column exists before
+    attempting to add it, so it's safe to run on every startup.
+    """
+    # Define migrations: (table_name, column_name, column_type, default_value)
+    migrations = [
+        ("debate_sessions", "consensus_key_uncertainties", "TEXT", "'[]'"),
+    ]
+
+    async with engine.begin() as conn:
+        for table, column, col_type, default in migrations:
+            # Check if column exists by querying table_info
+            result = await conn.execute(
+                text(f"PRAGMA table_info({table})")
+            )
+            rows = result.fetchall()
+            existing_columns = {row[1] for row in rows}
+
+            if column not in existing_columns:
+                logger.info(f"Migrating: ALTER TABLE {table} ADD COLUMN {column}")
+                await conn.execute(
+                    text(f"ALTER TABLE {table} ADD COLUMN {column} {col_type} DEFAULT {default}")
+                )
+                logger.info(f"Migration complete: {table}.{column}")
+            else:
+                logger.debug(f"Column {table}.{column} already exists, skipping")
 
 
 async def _seed_default_prompts():
@@ -2244,147 +2530,148 @@ async def _seed_default_prompts():
             WorkflowPromptTemplate(
                 key="initial_answer",
                 name="初始回答提示词",
-                description="用于生成初始回答的系统提示词模板",
-                template_text="""你是 {{actor_name}}，一名专业的分析者，正在参与一个多模型互评系统。
+                description="引导模型给出可被质疑的高质量初始回答",
+                template_text="""{{actor_name}}，你正在参与一个多专家互评流程。你的回答将被其他专家审查和质疑，所以请确保每一个重要判断都有支撑。
 
-请针对以下问题给出你的专业回答。你的回答应该：
-1. 结构清晰，逻辑严谨
-2. 提供具体的论据和例子
-3. 考虑多种可能性
+## 问题
 
-问题：{{question}}
+{{question}}
 
-请给出你的回答：""",
+## 要求
+
+- 对于涉及数字、比例、时间估算的判断，请说明推导依据或假设前提
+- 如果某些方面你不确定，明确标注不确定程度，不要用虚假的精确性掩盖不确定性
+- 你的深度合理视角比面面俱到更有价值""",
                 required_variables=["question", "actor_name"],
             ),
             WorkflowPromptTemplate(
                 key="peer_review",
                 name="互评提示词",
-                description="用于模型互相评审的回答",
-                template_text="""你是一名专业的评审者，请对以下回答进行评审。
+                description="引导模型进行对抗性交叉审查而非礼貌性评审",
+                template_text="""原始问题：{{question}}
 
-原始问题：{{question}}
-
-你是 {{self_actor_name}}，下面是你的回答：
+你是 {{self_actor_name}}，以下是你自己的回答：
 
 {{self_answer_block}}
 
-其他参与者的回答：
+以下是其他参与者的回答：
 
 {{peer_answer_blocks}}
 
-## 重要说明
+---
 
-- 引用自己的回答时，请说"我的回答"或"{{self_actor_name}} 的回答"
-- 引用其他参与者时，请使用他们的 actor_name 属性值
-- 不要把自己的回答称为"你的回答"
+请对所有回答（包括你自己的）进行严格的交叉审查。重点关注：
 
-请从以下角度进行评审：
-1. 各回答的优点和亮点
-2. 各回答的不足和可能的错误
-3. 改进建议
+1. **论证链验证**：哪些结论缺少推导过程？哪些因果关系是假设而非论证？
+2. **数字与估算**：方案中出现的数字（比例、时间、成本、指标阈值等）是否有合理依据？如果是拍脑袋的数字请直接指出。
+3. **盲区与遗漏**：每个回答忽略了什么重要方面？有什么隐含假设没有被检验？
+4. **真正的分歧**：你和其他参与者在哪些核心判断上存在实质性不同（而非措辞不同）？请明确阐述你为什么坚持自己的判断。
 
-请给出你的评审意见：""",
+不要礼貌性地列举优缺点。如果你认为某个观点是错的，直接说为什么错。如果你被说服了某个观点比你的更好，也直接承认。
+
+引用自己时说"我"，引用他人时使用其 actor_name。""",
                 required_variables=["question", "self_actor_name", "self_answer_block", "peer_answer_blocks"],
             ),
             WorkflowPromptTemplate(
                 key="revision",
                 name="修订提示词",
-                description="根据互评意见修订回答",
-                template_text="""请根据其他参与者的评审意见，修订你的原始回答。
+                description="根据互评意见重写回答，区分四种情况处理",
+                template_text="""原始问题：{{question}}
 
-原始问题：{{question}}
-
-你是 {{self_actor_name}}，你的原始回答：
+你是 {{self_actor_name}}，以下是你的上一轮回答：
 
 {{self_previous_answer_block}}
 
-其他参与者对你的评审意见：
+以下是其他参与者对你的评审意见：
 
 {{peer_review_blocks}}
 
-## 重要说明
+---
 
-- 引用自己的上一轮回答时，请说"我的上一轮回答"或"{{self_actor_name}} 的上一轮回答"
-- 不要把自己的回答称为"你的回答"
-- 引用评审者时，请使用 reviewer_name 属性值
+请基于这些评审意见重写你的回答。注意：
 
-请根据这些意见修订你的回答：
-1. 接纳合理的批评和建议
-2. 保持你独特的视角
-3. 提供更全面准确的答案
+- 对于你被指出的**事实性错误或逻辑漏洞**：必须修正，不要辩解
+- 对于你**同意**的批评：直接整合到修订中，不需要解释"我接受了某某的建议"
+- 对于你**不同意**的批评：保留你的观点，但必须补充反驳理由，说明为什么你的判断更合理
+- 对于**被质疑的数字或估算**：要么补充推导依据，要么修改为更诚实的表述（如用范围代替精确值）
 
-请给出修订后的回答：""",
+输出修订后的完整回答，不要输出修改说明或对比表。
+
+引用自己时说"我"，引用评审者时使用其 reviewer_name。""",
                 required_variables=["question", "self_actor_name", "self_previous_answer_block", "peer_review_blocks"],
             ),
             WorkflowPromptTemplate(
                 key="final_answer",
                 name="最终回答提示词",
-                description="综合各模型回答，生成面向用户的最终回答",
-                template_text="""你是 {{self_actor_name}}，一个综合决策助手，需要基于多轮互评的结果，输出一篇面向用户的最终回答。
+                description="综合各专家回答生成独立成文的面向用户的最终回答",
+                template_text="""## 任务
+
+基于以下多位专家的讨论结果，撰写一篇直接回答用户问题的文章。
 
 ## 原始问题
 
 {{question}}
 
-## 各参与者的最终回答
+## 各专家的最终回答
 
 {{actor_answer_blocks}}
 
-## 收敛分析结果
+## 收敛分析
 
 {{convergence_info}}
 
-## 要求
+## 写作要求
 
-请直接回答用户的问题，要求：
-1. 优先采用已达成共识的观点
-2. 对仍有分歧的地方说明条件与不确定性
-3. 如果收敛度较低，给出分情境建议
-4. 使用清晰、自然的语言，不要使用 JSON 格式
-5. 直接给出最终回答，不要解释过程
-6. 引用参与者观点时，使用 actor_name 属性值
-""",
+你是 {{self_actor_name}}，请以你的身份直接输出最终回答。
+
+- 写一篇**独立成文**的回答。读者不需要知道这背后有多个模型参与讨论
+- 在有共识的部分直接给出结论，不需要说"各方一致认为"
+- 在有分歧的部分，呈现为"不同条件下的不同策略"或"需要权衡的取舍"，而非"A模型认为X，B模型认为Y"
+- 如果某些结论只有部分专家支持且理由充分，可以作为"值得考虑的替代方案"呈现
+- 不要输出 JSON""",
                 required_variables=["question", "self_actor_name", "actor_answer_blocks", "convergence_info"],
             ),
             WorkflowPromptTemplate(
                 key="summary",
                 name="总结提示词",
-                description="总结模型生成最终综合结论",
-                template_text="""你是 {{self_actor_name}}，一个公正的综合者，需要根据多轮互评的结果生成最终的综合结论。
+                description="对讨论进行结构化标注，输出共识/分歧/不确定性",
+                template_text="""你需要对一场多专家讨论进行结构化标注。
 
-原始问题：{{question}}
+## 原始问题
 
-完整的互评历史：
+{{question}}
+
+## 完整讨论历史
 
 {{history_blocks}}
 
-## 重要说明
+---
 
-- 引用参与者观点时，请使用 actor_name 属性值
-- 引用自己的分析时，请说"我认为"或"经综合分析"
+请分析这场讨论，提取以下结构化信息。注意：你不需要重新回答问题，只需要标注讨论的结果。
 
-请根据以上信息，生成一个综合性的最终回答。你的回答应该：
-1. 整合各参与者的核心观点
-2. 指出达成的共识
-3. 指出仍存在的分歧
-4. 给出你的综合建议
+引用参与者时使用其 actor_name。
 
 请以 JSON 格式返回：
 {
-  "summary": "综合总结",
-  "agreements": ["共识点1", "共识点2"],
-  "disagreements": ["分歧点1"],
-  "confidence": <你对结论的信心程度，0.0-1.0之间的小数，如果不确定则省略此字段>,
-  "recommendation": "最终建议"
+  "agreements": [
+    "各方达成共识的具体观点（每条一个独立的共识点，不要笼统描述）"
+  ],
+  "disagreements": [
+    "仍存在实质分歧的具体观点（说明谁持什么立场）"
+  ],
+  "confidence": 0.0到1.0之间的数字，表示这场讨论的整体结论可靠程度。如果讨论质量不足以判断，省略此字段,
+  "key_uncertainties": [
+    "讨论中暴露出的关键不确定性或需要额外数据才能判断的问题"
+  ],
+  "recommendation": "一句话核心建议（不超过100字）"
 }""",
                 required_variables=["question", "self_actor_name", "history_blocks"],
             ),
             WorkflowPromptTemplate(
                 key="convergence_check",
                 name="收敛检查提示词",
-                description="检查各回答是否已收敛",
-                template_text="""你是一个收敛判断器，需要判断以下回答是否已经收敛（达成足够共识）。
+                description="判断各回答是否已达成足够共识",
+                template_text="""判断以下回答是否已达成足够共识，不需要更多讨论轮次。
 
 原始问题：{{question}}
 
@@ -2392,90 +2679,71 @@ async def _seed_default_prompts():
 
 {{latest_answer_blocks}}
 
-请判断这些回答是否已收敛。收敛的标准是：
-1. 核心观点基本一致
-2. 主要分歧已经缩小到次要细节
-3. 不太可能通过更多轮次获得显著改进
+判断标准：
+- 核心结论和推荐方向是否一致（措辞不同不算分歧）
+- 剩余分歧是否属于"偏好差异"或"互补方案"而非"对立观点"
+- 再多一轮讨论是否有可能改变任何参与者的核心立场
 
-## 重要说明
-- 引用参与者时，请使用 actor_name 属性值
+引用参与者时使用其 actor_name。
 
-请以 JSON 格式返回：
+以 JSON 返回：
 {
   "converged": true/false,
   "score": 0.0-1.0,
-  "reason": "判断理由",
-  "agreements": ["已达成共识的点"],
-  "disagreements": ["仍存在分歧的点"]
+  "reason": "一句话判断理由",
+  "agreements": ["已达成共识的核心观点"],
+  "disagreements": ["仍存分歧的观点及各方立场"]
 }""",
                 required_variables=["question", "latest_answer_blocks"],
             ),
-            # Semantic analysis prompts
             WorkflowPromptTemplate(
                 key="question_intent_analysis",
                 name="问题意图分析提示词",
                 description="分析用户问题的意图和提取比较维度",
-                template_text="""你是一个问题分析专家。请分析以下问题，提取其核心意图和比较维度。
+                template_text="""分析这个问题的核心意图，提取适合用于比较多位专家回答差异的维度。
 
 问题：{{question}}
 
-请以 JSON 格式返回：
+以 JSON 返回：
 {
-  "question_type": "问题类型（如 investment_decision, analysis, comparison 等）",
-  "user_goal": "用户的核心目标",
-  "time_horizons": ["短期", "中期", "长期"],
+  "question_type": "问题类型的英文标签",
+  "user_goal": "用户想要什么",
+  "time_horizons": ["涉及的时间维度"],
   "comparison_axes": [
-    {"axis_id": "维度ID", "label": "维度名称"}
+    {"axis_id": "英文标识", "label": "中文名称"}
   ]
 }
 
-要求：
-1. question_type 应该是问题的核心类型
-2. user_goal 应该简洁地描述用户想要达到的目的
-3. time_horizons 列出问题涉及的时间维度
-4. comparison_axes 列出 3-5 个最核心的比较维度，用于后续比较多模型回答
+comparison_axes 是后续用于比较不同专家回答差异的维度，选择 3-5 个最能揭示观点分歧的维度。不要选择所有专家必然一致的维度。
 
-只返回 JSON，不要其他文字。""",
+只返回 JSON。""",
                 required_variables=["question"],
             ),
             WorkflowPromptTemplate(
                 key="semantic_extraction",
                 name="语义主题提取提示词",
-                description="从模型回答中提取语义主题和立场",
-                template_text="""你是一个语义分析专家。请分析以下回答，提取其核心主题和立场。
+                description="从模型回答中提取核心观点并按比较维度归类",
+                template_text="""从以下回答中提取核心观点，按给定的比较维度归类。
 
 问题：{{question}}
-
 回答：{{answer}}
+比较维度：{{comparison_axes}}
 
-比较维度：
-{{comparison_axes}}
-
-请以 JSON 格式返回该回答的主题：
+以 JSON 返回：
 {
   "topics": [
     {
-      "topic_id": "主题标识（英文，如 energy_substitution）",
-      "axis_id": "对应的比较维度ID（必须从给定的比较维度列表中选择）",
-      "label": "主题名称（中文）",
-      "summary": "观点摘要（一句话）",
-      "stance": "立场标签（如：保守、激进、中立、实用等）",
-      "time_horizon": "时间维度（short/medium/long）",
-      "risk_level": "风险偏好（low/medium/high）",
-      "novelty": "观点新颖度（low/medium/high）",
-      "quotes": ["原文中支持该观点的关键引用"]
+      "topic_id": "英文标识",
+      "axis_id": "必须从上述比较维度中选择",
+      "label": "中文主题名",
+      "summary": "该回答在这个维度上的核心观点（一句话）",
+      "stance": "立场标签",
+      "quotes": ["原文中的关键句"]
     }
   ]
 }
 
-要求：
-1. axis_id 必须严格从给定的比较维度列表中选择，不能自己编造
-2. 每个主题应该对应一个比较维度
-3. summary 应该简洁精炼
-4. quotes 应该是原文中的关键句子
-5. 最多提取 5 个最核心的主题
-
-只返回 JSON，不要其他文字。""",
+最多 5 个主题。axis_id 必须严格匹配给定的比较维度，不要编造新维度。只返回 JSON。""",
                 required_variables=["question", "answer", "comparison_axes"],
             ),
             WorkflowPromptTemplate(
@@ -2510,7 +2778,12 @@ async def _seed_default_prompts():
             ),
         ]
 
-        # Only add templates that don't exist, or update if variables changed
+        # --- Prompt version tracking ---
+        # When prompt content changes significantly (not just typo fixes),
+        # increment this version to force-update existing installations.
+        # This ensures users get the improved prompts on next restart.
+        PROMPT_SEED_VERSION = 2  # v1 = original, v2 = adversarial review rewrite
+
         added_count = 0
         for wp in workflow_prompts:
             if wp.key not in existing_keys:
@@ -2518,7 +2791,6 @@ async def _seed_default_prompts():
                 added_count += 1
                 logger.info(f"Added missing template: {wp.key}")
             else:
-                # Check if required_variables mismatch - force update if stale
                 result = await db.execute(
                     select(WorkflowPromptTemplate)
                     .where(WorkflowPromptTemplate.key == wp.key)
@@ -2527,12 +2799,23 @@ async def _seed_default_prompts():
                 if existing:
                     existing_vars = set(existing.required_variables or [])
                     new_vars = set(wp.required_variables or [])
+                    needs_update = False
+
                     if existing_vars != new_vars:
                         logger.warning(
                             f"Template '{wp.key}' has stale variables: "
-                            f"{list(existing_vars)} → {list(new_vars)}. "
-                            f"Force updating template_text and required_variables."
+                            f"{list(existing_vars)} → {list(new_vars)}."
                         )
+                        needs_update = True
+
+                    # Check if description changed (used as version marker)
+                    if existing.description != wp.description:
+                        logger.info(
+                            f"Template '{wp.key}' description changed, updating."
+                        )
+                        needs_update = True
+
+                    if needs_update:
                         existing.required_variables = wp.required_variables
                         existing.template_text = wp.template_text
                         existing.name = wp.name
@@ -2549,49 +2832,49 @@ async def _seed_default_prompts():
         prompt_presets = [
             PromptPreset(
                 key="conservative",
-                name="保守分析型",
-                description="谨慎、全面，优先考虑风险和边界情况",
-                system_prompt="你是一名谨慎且全面的分析师。你优先进行风险评估和全面考虑所有可能性。你对大胆的主张持怀疑态度，倾向于选择保守、经过验证的解决方案。",
-                review_prompt="请以批判性的眼光评审这些回答，重点关注风险、边界情况和潜在问题。指出可能不成立的假设。",
-                revision_prompt="请修订你的回答以解决合理的担忧，同时保持你谨慎的视角。",
+                name="风险优先型",
+                description="倾向于先识别风险和失败模式，再讨论机会",
+                system_prompt="你倾向于先识别风险和失败模式，再讨论机会。你会追问「如果这个假设不成立会怎样」，优先考虑最坏情况下的应对方案。你不会因为一个方案听起来合理就接受它——你需要看到它在边界条件下的表现。",
+                review_prompt="审查时重点关注：被忽略的风险、过于乐观的假设、缺乏降级方案的设计。对「这不太可能发生」式的风险排除提出质疑。",
+                revision_prompt="修订时优先补充风险分析和应对方案。如果被指出过于悲观，用数据说明你担忧的合理性。",
                 personality="conservative",
             ),
             PromptPreset(
                 key="innovative",
-                name="创新探索型",
-                description="拥抱新方法，探索创意解决方案",
-                system_prompt="你是一名创新型思考者，拥抱新方法和创意解决方案。你喜欢探索非传统的想法，突破边界。你相信最好的解决方案往往来自意想不到的方向。",
-                review_prompt="请评审这些回答并识别创新的机会。指出传统思维可能在哪些方面限制了思考。",
-                revision_prompt="请修订你的回答以融入创意洞察，同时保持实用性。",
+                name="非共识探索型",
+                description="质疑行业共识和最佳实践，寻找非显而易见的方案",
+                system_prompt="你倾向于质疑「行业共识」和「最佳实践」，寻找非显而易见的方案。当别人都往一个方向走的时候，你会思考反方向是否有被忽视的可能性。你相信真正有价值的洞察往往让人不舒服。",
+                review_prompt="审查时重点关注：各回答中被当作不言自明的前提假设是否真的成立。指出「大家都这么说」但缺乏第一性原理推导的结论。",
+                revision_prompt="修订时如果你的非常规观点被合理挑战，要么提供更强的论证，要么诚实承认这只是一个值得探索的方向而非确定结论。",
                 personality="innovative",
             ),
             PromptPreset(
                 key="academic",
-                name="学术严谨型",
-                description="注重精确、严谨、证据支撑",
-                system_prompt="你是一名具有深厚专业知识的学术研究者。你重视精确性、引用和逻辑严谨性。你以学术的方式交流，始终追求基于证据的结论。",
-                review_prompt="请评审这些回答的逻辑一致性、证据支持和学术严谨性。识别任何逻辑谬误或缺乏支持的主张。",
-                revision_prompt="请修订你的回答使其更加精确和基于证据。",
+                name="证据严格型",
+                description="要求所有论断都有明确的逻辑链或证据支撑",
+                system_prompt="你要求所有论断都有明确的逻辑链或证据支撑。你不接受「业界普遍认为」、「通常来说」式的论证——你需要看到具体的数据、案例或推导过程。你区分「已验证的结论」和「合理的假设」，并对两者使用不同的确信度表述。",
+                review_prompt="审查时重点关注：哪些结论缺乏证据支撑、哪些因果推断存在逻辑跳跃、哪些数字是编造的而非推导的。",
+                revision_prompt="修订时对被质疑的论断补充推导过程或降低确信度表述。将「会导致X」改为「在Y条件下可能导致X」。",
                 personality="academic",
             ),
             PromptPreset(
                 key="practical",
-                name="实用主义型",
-                description="聚焦实际应用，追求简单高效",
-                system_prompt="你是一名专注于实际应用的务实问题解决者。你重视简单性、效率和可执行的解决方案。你倾向于可以快速有效实施的方案。",
-                review_prompt="请评审这些回答的实际可应用性。识别过于复杂的解决方案并提出简化建议。",
-                revision_prompt="请修订你的回答使其更具可操作性和可实施性。",
+                name="可执行优先型",
+                description="优先关注方案的可执行性和落地路径",
+                system_prompt="你优先关注方案的可执行性：谁来做、多久能做完、需要什么资源、最可能卡在哪里。你对「理论上可行但实操地狱」的方案保持警惕。你倾向于用80%的精力解决那个最关键的20%问题。",
+                review_prompt="审查时重点关注：方案是否可执行、资源估算是否合理、有没有被忽视的实施障碍、团队能力是否匹配。",
+                revision_prompt="修订时补充具体的实施路径和资源需求。如果被指出过于简化，补充分阶段实施计划。",
                 personality="practical",
             ),
             PromptPreset(
                 key="synthesizer",
-                name="综合总结型",
-                description="适合作为总结模型，综合各方观点",
-                system_prompt="你是一名公正的多模型辩论综合者。你的角色是将不同的观点综合成连贯的共识报告。你尊重所有视角，提供平衡、公正的判断。",
+                name="综合裁决型",
+                description="适合作为裁决模型，综合各方观点形成结构化结论",
+                system_prompt="你是一名公正的多专家讨论裁决者。你的工作是找出真正的共识和真正的分歧——而非把所有观点糊弄成一团「大家说得都有道理」。如果专家们在关键判断上存在对立，你要明确指出而非调和。",
                 review_prompt="",
                 revision_prompt="",
                 personality="neutral",
-                custom_instructions="始终提供平衡、公正的判断，尊重所有观点。",
+                custom_instructions="关注观点之间的实质性差异，区分「措辞不同」和「判断不同」。",
             ),
         ]
 
@@ -2601,6 +2884,22 @@ async def _seed_default_prompts():
                 db.add(pp)
                 added_count += 1
                 logger.info(f"Added missing preset: {pp.key}")
+            else:
+                # Check if description changed (version marker)
+                result = await db.execute(
+                    select(PromptPreset).where(PromptPreset.key == pp.key)
+                )
+                existing_preset = result.scalar_one_or_none()
+                if existing_preset and existing_preset.description != pp.description:
+                    existing_preset.name = pp.name
+                    existing_preset.description = pp.description
+                    existing_preset.system_prompt = pp.system_prompt
+                    existing_preset.review_prompt = pp.review_prompt
+                    existing_preset.revision_prompt = pp.revision_prompt
+                    existing_preset.personality = pp.personality
+                    existing_preset.custom_instructions = pp.custom_instructions or ""
+                    added_count += 1
+                    logger.info(f"Updated preset: {pp.key}")
 
         if added_count > 0:
             await db.commit()
@@ -2661,6 +2960,25 @@ if not logger.handlers:
 logger.propagate = False
 
 
+def _sanitize_string_list(items: list) -> list[str]:
+    """Ensure all items in list are strings. LLM sometimes returns dicts.
+
+    This handles cases where the LLM returns structured objects like:
+    {"topic": "...", "detail": "..."} instead of plain strings.
+    """
+    result = []
+    for item in items:
+        if isinstance(item, str):
+            result.append(item)
+        elif isinstance(item, dict):
+            # Convert dict to readable string by joining all values
+            parts = [str(v) for v in item.values() if v]
+            result.append(" — ".join(parts) if parts else str(item))
+        else:
+            result.append(str(item))
+    return result
+
+
 class DebateEngine:
     """Core debate orchestration engine"""
 
@@ -2682,6 +3000,7 @@ class DebateEngine:
         self.step_number = 0  # Global step counter for phases
         self.question_intent = None  # Store question intent analysis result
         self.latest_semantic_comparisons = []  # Store latest semantic comparisons
+        self.semantic_model_config = None  # Loaded from DB in _run_semantic_analysis
 
     def _check_cancelled(self) -> bool:
         """Check if the debate should be cancelled."""
@@ -3020,34 +3339,33 @@ class DebateEngine:
                 await self._emit({"event": "debate_error", "data": {"message": f"Actor {actor.name} failed: {str(e)}"}})
                 raise
 
-        # Run all actors in parallel with real streaming
-        tasks = [actor_response_stream(actor) for actor in self.actors]
+        # Run all actors in parallel with real streaming using as_completed
+        # to commit each actor's message immediately when done
+        tasks = [asyncio.create_task(actor_response_stream(actor)) for actor in self.actors]
         logger.info(f"Created {len(tasks)} streaming tasks for actors")
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Store messages AFTER all parallel tasks complete (sequential DB writes)
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.error(f"Actor {self.actors[i].name} failed: {result}")
-            elif isinstance(result, tuple):
-                actor_id, full_response = result
-                message = Message(
-                    round_id=db_round.id,
-                    actor_id=actor_id,
-                    role="answer",
-                    content=full_response,
-                )
-                self.db.add(message)
-                # Track for later rounds
-                self.actor_responses[actor_id].append({
-                    "role": "answer",
-                    "content": full_response,
-                    "cycle": 0,
-                })
-
-        # Commit all messages at once
-        await self.db.commit()
+        for coro in asyncio.as_completed(tasks):
+            try:
+                result = await coro
+                if isinstance(result, tuple):
+                    actor_id, full_response = result
+                    # Commit immediately when this actor completes
+                    message = Message(
+                        round_id=db_round.id,
+                        actor_id=actor_id,
+                        role="answer",
+                        content=full_response,
+                    )
+                    self.db.add(message)
+                    await self.db.commit()
+                    # Track for later rounds
+                    self.actor_responses[actor_id].append({
+                        "role": "answer",
+                        "content": full_response,
+                        "cycle": 0,
+                    })
+            except Exception as e:
+                logger.error(f"Actor task failed: {e}")
 
     async def _run_review_round(self, cycle: int, db_round: DBRound):
         """Run review round where each actor critiques others' answers"""
@@ -3143,27 +3461,29 @@ class DebateEngine:
 
             return actor.id, full_response
 
-        tasks = [actor_review_stream(actor) for actor in self.actors]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        tasks = [asyncio.create_task(actor_review_stream(actor)) for actor in self.actors]
 
-        # Store messages AFTER all parallel tasks complete
-        for result in results:
-            if isinstance(result, tuple):
-                actor_id, full_response = result
-                message = Message(
-                    round_id=db_round.id,
-                    actor_id=actor_id,
-                    role="review",
-                    content=full_response,
-                )
-                self.db.add(message)
-                self.actor_responses[actor_id].append({
-                    "role": "review",
-                    "content": full_response,
-                    "cycle": cycle,
-                })
-
-        await self.db.commit()
+        for coro in asyncio.as_completed(tasks):
+            try:
+                result = await coro
+                if isinstance(result, tuple):
+                    actor_id, full_response = result
+                    # Commit immediately when this actor completes
+                    message = Message(
+                        round_id=db_round.id,
+                        actor_id=actor_id,
+                        role="review",
+                        content=full_response,
+                    )
+                    self.db.add(message)
+                    await self.db.commit()
+                    self.actor_responses[actor_id].append({
+                        "role": "review",
+                        "content": full_response,
+                        "cycle": cycle,
+                    })
+            except Exception as e:
+                logger.error(f"Review task failed: {e}")
 
     async def _run_revision_round(self, cycle: int, review_round: DBRound, db_round: DBRound):
         """Run revision round where actors improve their answers"""
@@ -3266,27 +3586,29 @@ class DebateEngine:
 
             return actor.id, full_response
 
-        tasks = [actor_revision_stream(actor) for actor in self.actors]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        tasks = [asyncio.create_task(actor_revision_stream(actor)) for actor in self.actors]
 
-        # Store messages AFTER all parallel tasks complete
-        for result in results:
-            if isinstance(result, tuple):
-                actor_id, full_response = result
-                message = Message(
-                    round_id=db_round.id,
-                    actor_id=actor_id,
-                    role="revision",
-                    content=full_response,
-                )
-                self.db.add(message)
-                self.actor_responses[actor_id].append({
-                    "role": "revision",
-                    "content": full_response,
-                    "cycle": cycle,
-                })
-
-        await self.db.commit()
+        for coro in asyncio.as_completed(tasks):
+            try:
+                result = await coro
+                if isinstance(result, tuple):
+                    actor_id, full_response = result
+                    # Commit immediately when this actor completes
+                    message = Message(
+                        round_id=db_round.id,
+                        actor_id=actor_id,
+                        role="revision",
+                        content=full_response,
+                    )
+                    self.db.add(message)
+                    await self.db.commit()
+                    self.actor_responses[actor_id].append({
+                        "role": "revision",
+                        "content": full_response,
+                        "cycle": cycle,
+                    })
+            except Exception as e:
+                logger.error(f"Revision task failed: {e}")
 
     async def _check_convergence(self) -> ConvergenceResult:
         """Check if responses have converged."""
@@ -3354,17 +3676,38 @@ class DebateEngine:
             bg_semantic_service = SemanticService(bg_db, bg_prompt_service)
 
             try:
-                # Get judge actor for semantic analysis
-                result = await bg_db.execute(
-                    select(Actor).where(Actor.id == self.session.judge_actor_id)
-                )
-                judge = result.scalar_one_or_none()
+                # Load semantic model config from DB
+                from app.models.database import SemanticModelConfig
 
-                if not judge:
-                    logger.warning("Judge actor not found for semantic analysis, skipping")
+                result = await bg_db.execute(
+                    select(SemanticModelConfig).where(SemanticModelConfig.is_active == True).limit(1)
+                )
+                semantic_config = result.scalar_one_or_none()
+
+                if not semantic_config:
+                    logger.warning("Semantic model not configured, skipping semantic analysis")
+                    await self._emit({
+                        "event": "semantic_skipped",
+                        "data": {
+                            "reason": "semantic_model_not_configured",
+                            "message": "语义分析模型未配置，请在设置中配置后重试",
+                        }
+                    })
                     return
 
-                adapter = self.get_adapter(judge)
+                # Create independent adapter for semantic analysis
+                from app.services.llm_adapter import create_adapter as create_llm_adapter
+                adapter = create_llm_adapter(
+                    provider=semantic_config.provider.value,
+                    api_key=semantic_config.api_key,
+                    base_url=semantic_config.base_url,
+                    model=semantic_config.model,
+                )
+
+                # Store timeout configs for use in this method
+                intent_timeout = float(semantic_config.question_intent_timeout)
+                extraction_timeout = float(semantic_config.topic_extraction_timeout)
+                compare_timeout = float(semantic_config.cross_compare_timeout)
 
                 # Step 1: Analyze question intent (only once) - with timeout
                 if not self.question_intent:
@@ -3375,7 +3718,7 @@ class DebateEngine:
                                 question=self.session.question,
                                 adapter=adapter,
                             ),
-                            timeout=60.0  # 60 second timeout
+                            timeout=intent_timeout
                         )
                         # Save to database
                         await bg_semantic_service.save_question_intent(
@@ -3438,7 +3781,7 @@ class DebateEngine:
                                 actor_id=actor.id,
                                 adapter=adapter,
                             ),
-                            timeout=30.0  # 30 second timeout per actor
+                            timeout=extraction_timeout
                         )
                         return actor.id, topics
                     except asyncio.TimeoutError:
@@ -3483,7 +3826,7 @@ class DebateEngine:
                                 actors=self.actors,
                                 adapter=adapter,
                             ),
-                            timeout=60.0  # 60 second timeout
+                            timeout=compare_timeout
                         )
 
                         # Save to database
@@ -3830,11 +4173,12 @@ The previous response could not be parsed. Please provide ONLY a valid JSON obje
                 logger.info(f"Using convergence score {fallback_confidence} as fallback confidence")
 
             consensus = {
-                "summary": full_response,
+                "summary": "",
                 "agreements": convergence_result.agreements if convergence_result else [],
                 "disagreements": convergence_result.disagreements if convergence_result else [],
                 "confidence": fallback_confidence,
-                "recommendation": full_response,
+                "recommendation": full_response[:200] if full_response else "",
+                "key_uncertainties": [],
                 "confidence_unavailable": fallback_confidence is None,
             }
             logger.warning(f"Summary JSON parse failed after retry, fallback confidence: {fallback_confidence}")
@@ -3848,10 +4192,11 @@ The previous response could not be parsed. Please provide ONLY a valid JSON obje
         )
         self.db.add(message)
 
-        # Store consensus (only store confidence if valid)
-        self.session.consensus_summary = consensus.get("summary", "")
-        self.session.consensus_agreements = consensus.get("agreements", [])
-        self.session.consensus_disagreements = consensus.get("disagreements", [])
+        # Store consensus
+        # New prompt schema: no "summary" field, use "recommendation" as summary fallback
+        self.session.consensus_summary = consensus.get("summary", "") or consensus.get("recommendation", "")
+        self.session.consensus_agreements = _sanitize_string_list(consensus.get("agreements", []))
+        self.session.consensus_disagreements = _sanitize_string_list(consensus.get("disagreements", []))
         # Store confidence as-is (could be None if unavailable)
         confidence_value = consensus.get("confidence")
         if confidence_value is not None:
@@ -3859,6 +4204,7 @@ The previous response could not be parsed. Please provide ONLY a valid JSON obje
         else:
             self.session.consensus_confidence = None
         self.session.consensus_recommendation = consensus.get("recommendation", "")
+        self.session.consensus_key_uncertainties = _sanitize_string_list(consensus.get("key_uncertainties", []))
         await self.db.commit()
 
         await self._emit({
@@ -6146,7 +6492,7 @@ function ActorFormModal({ actorId, onClose, onSave }: ActorFormModalProps) {
 ```tsx
 'use client'
 
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useMemo } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Send, Settings, Users, History, Loader2, AlertCircle } from 'lucide-react'
 import { useActorStore, useDebateStore } from '@/stores'
@@ -6200,6 +6546,8 @@ export default function Arena() {
   const semanticComparisons = useDebateStore((state) => state.semanticComparisons)
   const selectedTopicId = useDebateStore((state) => state.selectedTopicId)
   const selectTopic = useDebateStore((state) => state.selectTopic)
+  const semanticSkipped = useDebateStore((state) => state.semanticSkipped)
+  const semanticSkipReason = useDebateStore((state) => state.semanticSkipReason)
 
   // Progress state
   const progress = useDebateStore((state) => state.progress)
@@ -6250,7 +6598,22 @@ export default function Arena() {
     loadRecentSessions()
   }
 
-  const handleSelectSession = (sessionId: string) => {
+  const handleSelectSession = async (sessionId: string) => {
+    // Check if this session is still actively running on the backend
+    try {
+      const sessionData = await apiClient.getDebate(sessionId)
+      if (['initializing', 'debating', 'judging'].includes(sessionData.status)) {
+        // Active session - use live debate view, resume SSE
+        setQuestion(sessionData.question)
+        const resumeDebate = useDebateStore.getState().resumeDebate
+        resumeDebate(sessionData)
+        setView('debate')
+        return
+      }
+    } catch {
+      // If fetch fails, fall through to detail view
+    }
+    // Completed/stopped session - use detail view
     setSelectedSessionId(sessionId)
     setView('sessionDetail')
   }
@@ -6259,6 +6622,24 @@ export default function Arena() {
   const judgeActor = actors.find((a) => a.id === judgeActorId)
   const nonJudgeActors = actors.filter((a) => !a.is_meta_judge)
   const judgeActors = actors.filter((a) => a.is_meta_judge)
+
+  // Support resume: use currentSession data when resuming, otherwise use local state
+  // These must be at top level (not inside conditionals) to satisfy React hooks rules
+  const debateActors = useMemo(() => {
+    if (currentSession?.actors) {
+      return currentSession.actors.filter(a => !a.is_meta_judge)
+    }
+    return selectedActorObjects
+  }, [currentSession, selectedActorObjects])
+
+  const debateJudgeActor = useMemo(() => {
+    if (currentSession?.judge_actor) {
+      return currentSession.judge_actor
+    }
+    return judgeActor
+  }, [currentSession, judgeActor])
+
+  const debateQuestion = currentSession?.question || question
 
   if (view === 'actors') {
     return <ActorManager onBack={() => setView('arena')} />
@@ -6313,7 +6694,7 @@ export default function Arena() {
         <main className="flex-1 overflow-hidden">
           <div className="h-full max-w-[1600px] mx-auto px-6 py-4 flex flex-col">
             {/* Question - collapsible for long questions */}
-            <QuestionBox question={question} />
+            <QuestionBox question={debateQuestion} />
 
             {/* Status - fixed */}
             <div className="mb-4 flex items-center gap-4 shrink-0">
@@ -6349,19 +6730,21 @@ export default function Arena() {
             {status !== 'idle' && (
               <div className="flex-1 min-h-0">
                 <DebateView
-                  actors={selectedActorObjects}
-                  judgeActor={judgeActor}
+                  actors={debateActors}
+                  judgeActor={debateJudgeActor}
                   phaseHistory={phaseHistory}
                   currentPhaseRecord={currentPhaseRecord}
                   selectedDiffPhaseId={selectedDiffPhaseId}
                   onSelectDiffPhase={selectDiffPhase}
                   status={status}
                   currentPhase={currentPhase}
-                  question={question}
+                  question={debateQuestion}
                   semanticComparisons={semanticComparisons}
                   selectedTopicId={selectedTopicId}
                   onSelectTopic={selectTopic}
-                  consensus={currentSession?.consensus}  // Pass consensus to DebateView
+                  consensus={currentSession?.consensus}
+                  semanticSkipped={semanticSkipped}
+                  semanticSkipReason={semanticSkipReason}
                 />
               </div>
             )}
@@ -6582,8 +6965,23 @@ export default function Arena() {
 
 import { motion } from 'framer-motion'
 import { Consensus } from '@/types'
-import { Check, X, Lightbulb } from 'lucide-react'
+import { Check, X, Lightbulb, HelpCircle } from 'lucide-react'
 import MarkdownBlock from './MarkdownBlock'
+
+/**
+ * Safely convert a value to string for rendering.
+ * Handles cases where LLM returns structured objects instead of plain strings.
+ */
+function safeString(val: unknown): string {
+  if (typeof val === 'string') return val
+  if (val && typeof val === 'object') {
+    // Handle dict-like objects from malformed LLM output
+    const values = Object.values(val).filter(Boolean)
+    if (values.length > 0) return values.join(' — ')
+    return JSON.stringify(val)
+  }
+  return String(val ?? '')
+}
 
 interface ConsensusViewProps {
   consensus: Consensus
@@ -6593,6 +6991,12 @@ export default function ConsensusView({ consensus }: ConsensusViewProps) {
   const confidencePercent = consensus.confidence !== null && consensus.confidence !== undefined
     ? Math.round(consensus.confidence * 100)
     : null
+
+  // Only show summary if it's a meaningful standalone text (not just a copy of recommendation)
+  const showSummary = consensus.summary
+    && consensus.summary.length > 0
+    && consensus.summary.length < 300
+    && consensus.summary !== consensus.recommendation
 
   return (
     <motion.div
@@ -6623,8 +7027,19 @@ export default function ConsensusView({ consensus }: ConsensusViewProps) {
       </div>
 
       <div className="p-6 space-y-6">
-        {/* Summary - only show if it's significantly different from final_answer content */}
-        {consensus.summary && consensus.summary.length < 500 && (
+        {/* Recommendation - always show if present */}
+        {consensus.recommendation && (
+          <div className="bg-accent-blue/5 border border-accent-blue/20 rounded-xl p-4">
+            <h4 className="text-text-secondary text-sm mb-2 flex items-center gap-2">
+              <Lightbulb className="w-4 h-4 text-accent-blue" />
+              核心建议
+            </h4>
+            <MarkdownBlock content={consensus.recommendation} />
+          </div>
+        )}
+
+        {/* Summary - only if it's a meaningful separate text */}
+        {showSummary && (
           <div>
             <h4 className="text-text-secondary text-sm mb-2">概要</h4>
             <MarkdownBlock content={consensus.summary} />
@@ -6636,13 +7051,13 @@ export default function ConsensusView({ consensus }: ConsensusViewProps) {
           <div>
             <h4 className="text-text-secondary text-sm mb-2 flex items-center gap-2">
               <Check className="w-4 h-4 text-accent-green" />
-              Agreements
+              共识观点
             </h4>
             <ul className="space-y-2">
               {consensus.agreements.map((agreement, i) => (
                 <li key={i} className="flex items-start gap-2">
                   <span className="text-accent-green mt-1">•</span>
-                  <MarkdownBlock content={agreement} className="flex-1" />
+                  <MarkdownBlock content={safeString(agreement)} className="flex-1" />
                 </li>
               ))}
             </ul>
@@ -6654,27 +7069,34 @@ export default function ConsensusView({ consensus }: ConsensusViewProps) {
           <div>
             <h4 className="text-text-secondary text-sm mb-2 flex items-center gap-2">
               <X className="w-4 h-4 text-accent-orange" />
-              Disagreements
+              仍存分歧
             </h4>
             <ul className="space-y-2">
               {consensus.disagreements.map((disagreement, i) => (
                 <li key={i} className="flex items-start gap-2">
                   <span className="text-accent-orange mt-1">•</span>
-                  <MarkdownBlock content={disagreement} className="flex-1" />
+                  <MarkdownBlock content={safeString(disagreement)} className="flex-1" />
                 </li>
               ))}
             </ul>
           </div>
         )}
 
-        {/* Recommendation */}
-        {consensus.recommendation && (
-          <div className="bg-bg-tertiary rounded-xl p-4">
+        {/* Key Uncertainties - new section */}
+        {consensus.key_uncertainties && consensus.key_uncertainties.length > 0 && (
+          <div>
             <h4 className="text-text-secondary text-sm mb-2 flex items-center gap-2">
-              <Lightbulb className="w-4 h-4 text-accent-blue" />
-              Recommendation
+              <HelpCircle className="w-4 h-4 text-accent-purple" />
+              关键不确定性
             </h4>
-            <MarkdownBlock content={consensus.recommendation} />
+            <ul className="space-y-2">
+              {consensus.key_uncertainties.map((uncertainty, i) => (
+                <li key={i} className="flex items-start gap-2">
+                  <span className="text-accent-purple mt-1">•</span>
+                  <MarkdownBlock content={safeString(uncertainty)} className="flex-1" />
+                </li>
+              ))}
+            </ul>
           </div>
         )}
       </div>
@@ -6689,7 +7111,7 @@ export default function ConsensusView({ consensus }: ConsensusViewProps) {
 ```tsx
 'use client'
 
-import { useState, useMemo, useEffect } from 'react'
+import { useState, useMemo, useEffect, useRef } from 'react'
 import { motion } from 'framer-motion'
 import { Actor, LivePhaseRecord, TopicComparison, Consensus } from '@/types'
 import ReviewChatView from './ReviewChatView'
@@ -6711,6 +7133,8 @@ interface DebateViewProps {
   selectedTopicId?: string | null
   onSelectTopic?: (topicId: string | null) => void
   consensus?: Consensus | null  // Add consensus prop
+  semanticSkipped?: boolean
+  semanticSkipReason?: string | null
 }
 
 type SidebarTab = 'monitor' | 'semantic' | 'diff'
@@ -6729,6 +7153,8 @@ export default function DebateView({
   selectedTopicId = null,
   onSelectTopic,
   consensus,
+  semanticSkipped = false,
+  semanticSkipReason = null,
 }: DebateViewProps) {
   // Sidebar tab state
   const [sidebarTab, setSidebarTab] = useState<SidebarTab>('monitor')
@@ -6761,11 +7187,21 @@ export default function DebateView({
     return semanticComparisons.size > 0
   }, [semanticComparisons])
 
+  // Track previous status to only auto-switch once on transition to completed
+  const prevStatusRef = useRef(status)
+
   // Auto-switch to semantic tab when debate completes and semantic data is available
+  // Only do this when transitioning from non-completed to completed (live session)
+  // Don't auto-switch when opening a completed session from history
   useEffect(() => {
-    if (status === 'completed' && hasSemanticData && sidebarTab === 'monitor') {
+    const wasNotCompleted = prevStatusRef.current !== 'completed'
+    const isNowCompleted = status === 'completed'
+
+    if (wasNotCompleted && isNowCompleted && hasSemanticData && sidebarTab === 'monitor') {
       setSidebarTab('semantic')
     }
+
+    prevStatusRef.current = status
   }, [status, hasSemanticData, sidebarTab])
 
   return (
@@ -6846,6 +7282,8 @@ export default function DebateView({
               status={status}
               currentPhase={currentPhase}
               currentPhaseRecord={currentPhaseRecord}
+              semanticSkipped={semanticSkipped}
+              semanticSkipReason={semanticSkipReason}
             />
           ) : (
             <DiffSidebar
@@ -7575,8 +8013,8 @@ export default function MiniMagiMonitor({
           50%, 100% { fill: rgba(254, 194, 0, 0.3); stroke: rgba(254, 194, 0, 0.3); }
         }
 
-        .state-thinking .node-fill { animation: flash-fill-blue 0.4s steps(1, end) infinite; }
-        .state-thinking .node-text { animation: flash-text-dark 0.4s steps(1, end) infinite; }
+        .state-thinking .node-fill { animation: flash-fill-blue 0.8s steps(1, end) infinite; }
+        .state-thinking .node-text { animation: flash-text-dark 0.8s steps(1, end) infinite; }
 
         .state-done .node-fill { fill: #67ff8c; }
         .state-done .node-text { fill: #0a1f2e; }
@@ -7584,13 +8022,105 @@ export default function MiniMagiMonitor({
         .state-error .node-fill { fill: #e30000; }
         .state-error .node-text { fill: #0a1f2e; }
 
-        .state-judge_active .node-fill { animation: flash-fill-purple 0.4s steps(1, end) infinite; }
-        .state-judge_active .node-text { animation: flash-text-dark 0.4s steps(1, end) infinite; }
+        .state-judge_active .node-fill { animation: flash-fill-purple 0.8s steps(1, end) infinite; }
+        .state-judge_active .node-text { animation: flash-text-dark 0.8s steps(1, end) infinite; }
 
         .shingi-box { opacity: 0; }
         .shingi-box.active { opacity: 1; }
         .shingi-box.active rect { animation: flash-shingi 1s steps(1, end) infinite; }
         .shingi-box.active text { animation: flash-shingi 1s steps(1, end) infinite; stroke: none; }
+
+        /* Judge flow node */
+        .judge-flow-node {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 8px;
+          padding: 4px 12px;
+          margin: 0 auto;
+          position: relative;
+        }
+
+        .judge-flow-arrow {
+          width: 1px;
+          height: 16px;
+          background: #f26600;
+          margin: 0 auto;
+          position: relative;
+        }
+        .judge-flow-arrow::after {
+          content: '';
+          position: absolute;
+          bottom: -3px;
+          left: 50%;
+          transform: translateX(-50%);
+          width: 0;
+          height: 0;
+          border-left: 4px solid transparent;
+          border-right: 4px solid transparent;
+          border-top: 5px solid #f26600;
+        }
+
+        .judge-node-box {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          padding: 4px 16px;
+          border: 1.5px solid rgba(242, 102, 0, 0.4);
+          border-radius: 4px;
+          background: transparent;
+          transition: all 0.3s ease;
+        }
+
+        .judge-node-box.judge-idle {
+          border-color: rgba(242, 102, 0, 0.25);
+          opacity: 0.5;
+        }
+
+        .judge-node-box.judge-active {
+          border-color: #9333ea;
+          background: rgba(147, 51, 234, 0.1);
+          animation: judge-pulse 0.8s steps(1, end) infinite;
+        }
+
+        .judge-node-box.judge-done {
+          border-color: #67ff8c;
+          background: rgba(103, 255, 140, 0.08);
+        }
+
+        @keyframes judge-pulse {
+          0%, 49.9% { border-color: #9333ea; background: rgba(147, 51, 234, 0.15); }
+          50%, 100% { border-color: rgba(147, 51, 234, 0.4); background: rgba(147, 51, 234, 0.05); }
+        }
+
+        .judge-dot {
+          width: 6px;
+          height: 6px;
+          border-radius: 50%;
+          flex-shrink: 0;
+        }
+        .judge-dot.dot-idle { background: rgba(242, 102, 0, 0.3); }
+        .judge-dot.dot-active { background: #9333ea; animation: flash-fill-purple 0.8s steps(1, end) infinite; }
+        .judge-dot.dot-done { background: #67ff8c; }
+
+        .judge-name {
+          font-family: 'Noto Serif JP', serif;
+          font-size: 11px;
+          font-weight: 900;
+          letter-spacing: 0.08em;
+          color: rgba(242, 102, 0, 0.6);
+          transition: color 0.3s ease;
+        }
+        .judge-active .judge-name { color: #9333ea; }
+        .judge-done .judge-name { color: #67ff8c; }
+
+        .judge-status-label {
+          font-size: 10px;
+          color: #56565A;
+          letter-spacing: 0.05em;
+        }
+        .judge-active .judge-status-label { color: rgba(147, 51, 234, 0.8); }
+        .judge-done .judge-status-label { color: rgba(103, 255, 140, 0.6); }
       `}</style>
 
       {/* SVG Monitor - faithful reproduction of START.HTML layout */}
@@ -7711,17 +8241,19 @@ export default function MiniMagiMonitor({
                 <polygon className="node-stroke" points="835,275 660,275 535,400 535,470 835,470" />
                 <text x="685" y="395" textAnchor="middle" className="node-text node-text-base" fontSize="24">{actorCLabel}</text>
               </g>
-
-              {/* JUDGE label next to 審議中 box */}
-              <g className={`state-${judgeState}`}>
-                <rect x="710" y="255" width="120" height="30" rx="4" className="node-fill node-fill-base" />
-                <rect x="710" y="255" width="120" height="30" rx="4" fill="none" stroke="#f26600" strokeWidth="2" />
-                <text x="770" y="275" textAnchor="middle" className="node-text node-text-base" fontSize="14">{judgeLabel}</text>
-              </g>
             </>
           )}
         </svg>
       </div>
+
+      {/* Judge flow node - only in 3-actor mode */}
+      {actorC && judgeActor && (
+        <JudgeFlowNode
+          judgeActor={judgeActor}
+          judgeState={judgeState}
+          currentPhase={currentPhase}
+        />
+      )}
 
       {/* Phase status bar */}
       <div className="px-3 py-2 border-t border-[#f26600]/30 text-center">
@@ -7732,6 +8264,49 @@ export default function MiniMagiMonitor({
             {completedCount}/{totalActors} 模型完成
           </p>
         )}
+      </div>
+    </div>
+  )
+}
+
+function JudgeFlowNode({
+  judgeActor,
+  judgeState,
+  currentPhase,
+}: {
+  judgeActor: Actor
+  judgeState: NodeState
+  currentPhase: string
+}) {
+  // Determine display state class
+  const stateClass =
+    judgeState === 'judge_active' ? 'judge-active' :
+    judgeState === 'done' ? 'judge-done' :
+    'judge-idle'
+
+  const dotClass =
+    judgeState === 'judge_active' ? 'dot-active' :
+    judgeState === 'done' ? 'dot-done' :
+    'dot-idle'
+
+  const statusText =
+    judgeState === 'judge_active'
+      ? (currentPhase === 'final_answer' ? '最終回答生成中' : '共識裁決中')
+      : judgeState === 'done'
+      ? '完了'
+      : '待機中'
+
+  const label = judgeActor.name.slice(0, 12).toUpperCase()
+
+  return (
+    <div className="shrink-0 px-3 py-1">
+      {/* Arrow */}
+      <div className="judge-flow-arrow" />
+      {/* Node */}
+      <div className={`judge-node-box ${stateClass}`}>
+        <div className={`judge-dot ${dotClass}`} />
+        <span className="judge-name">{label}</span>
+        <span className="judge-status-label">{statusText}</span>
       </div>
     </div>
   )
@@ -8072,6 +8647,7 @@ const MessageCard = memo(function MessageCard({
 }) {
   // Don't render Markdown during streaming - use plain text for performance
   const isStreaming = message.status === 'streaming'
+  const isPending = message.status === 'pending'
 
   return (
     <motion.div
@@ -8096,11 +8672,17 @@ const MessageCard = memo(function MessageCard({
         {isStreaming && (
           <span className="text-xs text-accent-blue animate-pulse">streaming...</span>
         )}
+        {isPending && (
+          <span className="text-xs text-text-tertiary">等待中</span>
+        )}
       </div>
 
-      {/* Content - plain text during streaming, Markdown when done */}
+      {/* Content - plain text during streaming, Markdown when done, placeholder for pending */}
       <div className="px-4 py-4">
-        {isStreaming ? (
+        {isPending ? (
+          // Placeholder for pending actors
+          <div className="text-text-tertiary text-sm">等待开始...</div>
+        ) : isStreaming ? (
           // Plain text during streaming for performance
           <div className="whitespace-pre-wrap break-words text-text-primary">
             {message.content}
@@ -8285,7 +8867,36 @@ export default function ReviewChatView({
     return allRecords
       .filter((record) => record.phase !== 'summary')
       .map((record) => {
-        const messages = Object.values(record.messages) as LiveMessage[]
+        let messages = Object.values(record.messages) as LiveMessage[]
+
+        // For current streaming phase in initial/review/revision, add placeholder cards for pending actors
+        const isCurrentStreamingPhase =
+          status === 'streaming' &&
+          currentPhaseRecord?.id === record.id &&
+          ['initial', 'review', 'revision'].includes(record.phase)
+
+        if (isCurrentStreamingPhase) {
+          // Get existing actor IDs
+          const existingActorIds = new Set(messages.map(m => m.actorId))
+
+          // Create placeholder messages for actors not yet started
+          const placeholders: LiveMessage[] = actors
+            .filter(a => !existingActorIds.has(a.id))
+            .map(actor => ({
+              actorId: actor.id,
+              actorName: actor.name,
+              actorIcon: actor.icon,
+              actorColor: actor.display_color,
+              phase: record.phase,
+              step: record.step,
+              cycle: record.cycle,
+              content: '',
+              status: 'pending' as const,
+            }))
+
+          messages = [...messages, ...placeholders]
+        }
+
         const sortedMessages = messages.sort((a, b) => {
           const aIndex = actors.findIndex((act) => act.id === a.actorId)
           const bIndex = actors.findIndex((act) => act.id === b.actorId)
@@ -8297,7 +8908,7 @@ export default function ReviewChatView({
           messages: sortedMessages,
         }
       })
-  }, [phaseHistory, currentPhaseRecord, actors])
+  }, [phaseHistory, currentPhaseRecord, actors, status])
 
   return (
     <div ref={scrollRef} className="space-y-6 overflow-y-auto h-full pb-8 pr-2">
@@ -8435,6 +9046,8 @@ interface SemanticSidebarProps {
   status?: string
   currentPhase?: string
   currentPhaseRecord?: LivePhaseRecord | null
+  semanticSkipped?: boolean
+  semanticSkipReason?: string | null
 }
 
 const phaseLabels: Record<string, string> = {
@@ -8485,6 +9098,8 @@ export default function SemanticSidebar({
   status = 'idle',
   currentPhase = '',
   currentPhaseRecord = null,
+  semanticSkipped = false,
+  semanticSkipReason = null,
 }: SemanticSidebarProps) {
   const [showRawDiff, setShowRawDiff] = useState(false)
   const [hasUserSelectedPhase, setHasUserSelectedPhase] = useState(false)
@@ -8497,8 +9112,16 @@ export default function SemanticSidebar({
       if (!['initial', 'revision'].includes(record.phase)) {
         return false
       }
-      // Check if this phase has semantic data using the record's id as phase_id
-      return semanticComparisons.has(record.id)
+      // Check exact match first, then prefix match for cycle variants
+      // This handles the case where hydrated records don't have cycle info
+      // but live SSE events include cycle in the phase_id
+      if (semanticComparisons.has(record.id)) return true
+      // Check if any key starts with the base phase id (handles cycle mismatch)
+      const baseId = `${record.step}:${record.phase}`
+      for (const key of semanticComparisons.keys()) {
+        if (key === baseId || key.startsWith(baseId + ':')) return true
+      }
+      return false
     })
   }, [phaseHistory, semanticComparisons])
 
@@ -8513,19 +9136,37 @@ export default function SemanticSidebar({
 
   // Get the selected phase comparisons
   const selectedComparisons = useMemo(() => {
-    if (!selectedDiffPhaseId) {
-      // Default to the most recent phase with comparisons
-      for (let i = phaseHistory.length - 1; i >= 0; i--) {
-        const record = phaseHistory[i]
-        if (semanticComparisons.has(record.id)) {
-          return semanticComparisons.get(record.id) || []
+    // Helper to find comparisons by phase_id with prefix matching
+    const findComparisons = (phaseId: string): TopicComparison[] => {
+      // Try exact match first
+      if (semanticComparisons.has(phaseId)) {
+        return semanticComparisons.get(phaseId) || []
+      }
+      // Try prefix match for cycle variants
+      // e.g., "4:revision" matches "4:revision:1"
+      const baseId = phaseId.split(':').slice(0, 2).join(':')
+      for (const [key, value] of semanticComparisons.entries()) {
+        if (key === baseId || key.startsWith(baseId + ':')) {
+          return value
         }
       }
       return []
     }
 
-    // Use the phase_id (record.id) directly to lookup comparisons
-    return semanticComparisons.get(selectedDiffPhaseId) || []
+    if (!selectedDiffPhaseId) {
+      // Default to the most recent phase with comparisons
+      for (let i = phaseHistory.length - 1; i >= 0; i--) {
+        const record = phaseHistory[i]
+        const comparisons = findComparisons(record.id)
+        if (comparisons.length > 0) {
+          return comparisons
+        }
+      }
+      return []
+    }
+
+    // Use the phase_id (record.id) with prefix matching
+    return findComparisons(selectedDiffPhaseId)
   }, [phaseHistory, selectedDiffPhaseId, semanticComparisons])
 
   // Auto-select the highest salience topic (only if user hasn't selected)
@@ -8633,7 +9274,28 @@ export default function SemanticSidebar({
       <div className="flex-1 overflow-y-auto p-3 min-h-0">
         {!selectedComparisons.length ? (
           <div className="text-text-tertiary text-xs text-center py-8 space-y-4">
-            {isLiveWaiting ? (
+            {semanticSkipped ? (
+              <>
+                <div className="text-accent-orange text-sm">⚠️ 语义分析已跳过</div>
+                <div className="text-text-tertiary text-xs mt-2">
+                  {semanticSkipReason || '语义分析模型未配置'}
+                </div>
+                <div className="mt-4 p-3 bg-accent-orange/10 border border-accent-orange/20 rounded-lg">
+                  <p className="text-xs text-text-secondary">
+                    请前往 <span className="text-accent-blue">设置 → 语义分析模型</span> 配置专用模型，
+                    即可在下次互评中启用语义图谱功能。
+                  </p>
+                </div>
+                {onSwitchToDiffTab && (
+                  <button
+                    onClick={onSwitchToDiffTab}
+                    className="px-4 py-2 bg-accent-blue/20 text-accent-blue rounded-lg hover:bg-accent-blue/30 transition-colors mt-4"
+                  >
+                    查看原文差异对比
+                  </button>
+                )}
+              </>
+            ) : isLiveWaiting ? (
               <>
                 {/* Live waiting state - show skeleton */}
                 <div className="text-text-secondary">语义图谱构建中...</div>
@@ -8872,17 +9534,45 @@ function ActorPositionCard({ position }: { position: ActorPosition }) {
 'use client'
 
 import { useState, useEffect, useMemo } from 'react'
-import { motion } from 'framer-motion'
-import { ArrowLeft, Loader2, AlertCircle } from 'lucide-react'
+import { Loader2, AlertCircle, Square } from 'lucide-react'
 import { apiClient } from '@/lib/apiClient'
-import { DebateSession, Actor, SemanticAnalysisResult, TopicComparison } from '@/types'
+import { DebateSession, SemanticAnalysisResult, Consensus } from '@/types'
 import {
   hydrateSessionToPhaseHistory,
   hydrateSemanticToMap,
   hydrateConsensus,
 } from '@/lib/sessionHydrator'
+import { useDebateStore } from '@/stores/debateStore'
 import DebateView from './DebateView'
 import QuestionBox from './QuestionBox'
+
+/**
+ * Safely convert a value to string for rendering.
+ * Handles cases where LLM returns structured objects instead of plain strings.
+ */
+function safeString(val: unknown): string {
+  if (typeof val === 'string') return val
+  if (val && typeof val === 'object') {
+    const values = Object.values(val).filter(Boolean)
+    if (values.length > 0) return values.join(' — ')
+    return JSON.stringify(val)
+  }
+  return String(val ?? '')
+}
+
+/**
+ * Sanitize consensus data to ensure all array fields contain strings.
+ * This handles legacy data where arrays may contain dict objects.
+ */
+function sanitizeConsensus(consensus: Consensus | null): Consensus | null {
+  if (!consensus) return null
+  return {
+    ...consensus,
+    agreements: (consensus.agreements || []).map(safeString),
+    disagreements: (consensus.disagreements || []).map(safeString),
+    key_uncertainties: (consensus.key_uncertainties || []).map(safeString),
+  }
+}
 
 interface SessionDetailViewProps {
   sessionId: string
@@ -8896,6 +9586,42 @@ export default function SessionDetailView({ sessionId, onBack }: SessionDetailVi
   const [error, setError] = useState<string | null>(null)
   const [selectedDiffPhaseId, setSelectedDiffPhaseId] = useState<string | null>(null)
   const [selectedTopicId, setSelectedTopicId] = useState<string | null>(null)
+  const [stopping, setStopping] = useState(false)
+
+  // Get live state from store
+  const resumeDebate = useDebateStore((s) => s.resumeDebate)
+  const disconnectStream = useDebateStore((s) => s.disconnectStream)
+  const storeSessionId = useDebateStore((s) => s.currentSessionId)
+  const storeSession = useDebateStore((s) => s.currentSession)
+  const storePhaseHistory = useDebateStore((s) => s.phaseHistory)
+  const storeCurrentPhaseRecord = useDebateStore((s) => s.currentPhaseRecord)
+  const storeStatus = useDebateStore((s) => s.status)
+  const storeCurrentPhase = useDebateStore((s) => s.currentPhase)
+  const storeSemanticComparisons = useDebateStore((s) => s.semanticComparisons)
+  const storeSemanticSkipped = useDebateStore((s) => s.semanticSkipped)
+  const storeSemanticSkipReason = useDebateStore((s) => s.semanticSkipReason)
+
+  // Check if session is active (in progress)
+  const isActiveSession = useMemo(() => {
+    return session && ['initializing', 'debating', 'judging'].includes(session.status)
+  }, [session])
+
+  // Check if store is attached to this session
+  const isStoreAttached = storeSessionId === sessionId
+
+  // Resume debate if active and not yet attached
+  useEffect(() => {
+    if (session && isActiveSession && !isStoreAttached) {
+      resumeDebate(session)
+    }
+  }, [session, isActiveSession, isStoreAttached, resumeDebate])
+
+  // Auto-refresh when live session completes
+  useEffect(() => {
+    if (isStoreAttached && storeStatus === 'completed') {
+      loadSession()
+    }
+  }, [isStoreAttached, storeStatus])
 
   useEffect(() => {
     loadSession()
@@ -8919,34 +9645,72 @@ export default function SessionDetailView({ sessionId, onBack }: SessionDetailVi
     }
   }
 
+  const handleStop = async () => {
+    if (!session || stopping) return
+    if (!confirm('确定要终止这个任务吗？')) return
+
+    setStopping(true)
+    try {
+      await apiClient.stopDebate(sessionId)
+      if (isStoreAttached) {
+        disconnectStream()
+      }
+      await loadSession()
+    } catch (err) {
+      setError((err as Error).message)
+    } finally {
+      setStopping(false)
+    }
+  }
+
+  // Effective values - use store data if attached, otherwise use local data
+  const effectiveSession = isStoreAttached && storeSession ? storeSession : session
+
   // Convert historical data to live format
-  const phaseHistory = useMemo(() => {
+  const localPhaseHistory = useMemo(() => {
     if (!session) return []
     return hydrateSessionToPhaseHistory(session)
   }, [session])
 
+  const effectivePhaseHistory = isStoreAttached ? storePhaseHistory : localPhaseHistory
+
   // Convert semantic data to comparisons map
-  const semanticComparisons = useMemo(() => {
+  const localSemanticComparisons = useMemo(() => {
     return hydrateSemanticToMap(semantic)
   }, [semantic])
 
+  const effectiveSemanticComparisons = isStoreAttached ? storeSemanticComparisons : localSemanticComparisons
+
   // Get consensus
-  const consensus = useMemo(() => {
+  const localConsensus = useMemo(() => {
     if (!session) return null
     return hydrateConsensus(session)
   }, [session])
 
+  // Sanitize consensus to ensure string arrays (handles legacy data with dict objects)
+  const sanitizedConsensus = useMemo(() => {
+    const c = effectiveSession?.consensus || localConsensus
+    return sanitizeConsensus(c)
+  }, [effectiveSession, localConsensus])
+
+  // Get effective status and phase
+  const effectiveStatus = isStoreAttached ? storeStatus : (session?.status === 'completed' ? 'completed' : 'idle')
+  const effectiveCurrentPhase = isStoreAttached ? storeCurrentPhase : 'completed'
+  const effectiveCurrentPhaseRecord = isStoreAttached ? storeCurrentPhaseRecord : null
+  const effectiveSemanticSkipped = isStoreAttached ? storeSemanticSkipped : false
+  const effectiveSemanticSkipReason = isStoreAttached ? storeSemanticSkipReason : null
+
   // Get actors (non-judge for debate view)
   const debateActors = useMemo(() => {
-    if (!session) return []
-    return session.actors.filter(a => !a.is_meta_judge)
-  }, [session])
+    if (!effectiveSession) return []
+    return effectiveSession.actors.filter(a => !a.is_meta_judge)
+  }, [effectiveSession])
 
   // Get judge actor
   const judgeActor = useMemo(() => {
-    if (!session) return undefined
-    return session.judge_actor
-  }, [session])
+    if (!effectiveSession) return undefined
+    return effectiveSession.judge_actor
+  }, [effectiveSession])
 
   const formatDate = (dateStr: string) => {
     return new Date(dateStr).toLocaleString('zh-CN', {
@@ -9014,7 +9778,18 @@ export default function SessionDetailView({ sessionId, onBack }: SessionDetailVi
             ← Back
           </button>
           <h1 className="text-lg font-semibold tracking-wider text-accent-orange">互评详情</h1>
-          <div className="w-16" />
+          <div className="w-16 flex justify-end">
+            {isActiveSession && (
+              <button
+                onClick={handleStop}
+                disabled={stopping}
+                className="flex items-center gap-2 px-3 py-1.5 bg-accent-red/20 text-accent-red rounded-lg hover:bg-accent-red/30 transition-colors text-sm disabled:opacity-50"
+              >
+                <Square className="w-4 h-4" />
+                {stopping ? '终止中...' : '终止任务'}
+              </button>
+            )}
+          </div>
         </div>
       </header>
 
@@ -9023,18 +9798,18 @@ export default function SessionDetailView({ sessionId, onBack }: SessionDetailVi
         <div className="h-full max-w-[1600px] mx-auto px-6 py-4 flex flex-col">
           {/* Question */}
           <div className="mb-4 shrink-0">
-            <QuestionBox question={session.question} className="mb-0" />
-            <p className="text-text-tertiary text-sm mt-2">{formatDate(session.created_at)}</p>
+            <QuestionBox question={effectiveSession?.question || ''} className="mb-0" />
+            <p className="text-text-tertiary text-sm mt-2">{effectiveSession ? formatDate(effectiveSession.created_at) : ''}</p>
           </div>
 
           {/* Status */}
           <div className="mb-4 shrink-0">
             <span className={`px-3 py-1 rounded-full text-sm ${
-              session.status === 'completed' ? 'bg-accent-green/20 text-accent-green' :
-              session.status === 'debating' ? 'bg-accent-blue/20 text-accent-blue' :
+              effectiveSession?.status === 'completed' ? 'bg-accent-green/20 text-accent-green' :
+              effectiveSession?.status === 'debating' ? 'bg-accent-blue/20 text-accent-blue' :
               'bg-text-tertiary/20 text-text-tertiary'
             }`}>
-              {session.status === 'completed' ? '已完成' : session.status}
+              {effectiveSession?.status === 'completed' ? '已完成' : effectiveSession?.status || ''}
             </span>
           </div>
 
@@ -9043,17 +9818,19 @@ export default function SessionDetailView({ sessionId, onBack }: SessionDetailVi
             <DebateView
               actors={debateActors}
               judgeActor={judgeActor}
-              phaseHistory={phaseHistory}
-              currentPhaseRecord={null}
+              phaseHistory={effectivePhaseHistory}
+              currentPhaseRecord={effectiveCurrentPhaseRecord}
               selectedDiffPhaseId={selectedDiffPhaseId}
               onSelectDiffPhase={setSelectedDiffPhaseId}
-              status="completed"
-              currentPhase="completed"
-              question={session.question}
-              semanticComparisons={semanticComparisons}
+              status={effectiveStatus}
+              currentPhase={effectiveCurrentPhase}
+              question={effectiveSession?.question || ''}
+              semanticComparisons={effectiveSemanticComparisons}
               selectedTopicId={selectedTopicId}
               onSelectTopic={setSelectedTopicId}
-              consensus={consensus}
+              consensus={sanitizedConsensus}
+              semanticSkipped={effectiveSemanticSkipped}
+              semanticSkipReason={effectiveSemanticSkipReason}
             />
           </div>
         </div>
@@ -9216,7 +9993,7 @@ interface PromptPreset {
   updated_at: string | null
 }
 
-type SettingsTab = 'workflow' | 'presets'
+type SettingsTab = 'workflow' | 'presets' | 'semantic'
 
 interface SettingsViewProps {
   onBack: () => void
@@ -9230,6 +10007,34 @@ export default function SettingsView({ onBack }: SettingsViewProps) {
   const [saving, setSaving] = useState<string | null>(null)
   const [editedPrompts, setEditedPrompts] = useState<Record<string, string>>({})
   const [editedPresets, setEditedPresets] = useState<Record<string, Partial<PromptPreset>>>({})
+
+  const [semanticConfig, setSemanticConfig] = useState<{
+    provider: string
+    api_format: string
+    base_url: string
+    api_key: string
+    model: string
+    max_tokens: number
+    temperature: number
+    question_intent_timeout: number
+    topic_extraction_timeout: number
+    cross_compare_timeout: number
+    is_configured: boolean
+  }>({
+    provider: 'custom',
+    api_format: 'openai_compatible',
+    base_url: '',
+    api_key: '',
+    model: '',
+    max_tokens: 2048,
+    temperature: 0.3,
+    question_intent_timeout: 60,
+    topic_extraction_timeout: 90,
+    cross_compare_timeout: 90,
+    is_configured: false,
+  })
+  const [semanticTesting, setSemanticTesting] = useState(false)
+  const [semanticTestResult, setSemanticTestResult] = useState<string | null>(null)
 
   useEffect(() => {
     loadData()
@@ -9251,6 +10056,26 @@ export default function SettingsView({ onBack }: SettingsViewProps) {
         initialEdits[p.key] = p.template_text
       })
       setEditedPrompts(initialEdits)
+
+      // Load semantic model config (may 404 if not configured)
+      try {
+        const sc = await apiClient.getSemanticModelConfig()
+        setSemanticConfig({
+          provider: sc.provider,
+          api_format: sc.api_format,
+          base_url: sc.base_url || '',
+          api_key: '',  // Never show existing key
+          model: sc.model,
+          max_tokens: sc.max_tokens,
+          temperature: sc.temperature,
+          question_intent_timeout: sc.question_intent_timeout,
+          topic_extraction_timeout: sc.topic_extraction_timeout,
+          cross_compare_timeout: sc.cross_compare_timeout,
+          is_configured: true,
+        })
+      } catch {
+        // 404 = not configured, keep defaults
+      }
     } catch (err) {
       console.error('Failed to load settings:', err)
     } finally {
@@ -9289,6 +10114,43 @@ export default function SettingsView({ onBack }: SettingsViewProps) {
       console.error('Failed to save:', err)
     } finally {
       setSaving(null)
+    }
+  }
+
+  const saveSemanticConfig = async () => {
+    setSaving('semantic')
+    try {
+      await apiClient.upsertSemanticModelConfig({
+        provider: semanticConfig.provider as import('@/types').ProviderType,
+        api_format: semanticConfig.api_format,
+        base_url: semanticConfig.base_url || undefined,
+        api_key: semanticConfig.api_key,
+        model: semanticConfig.model,
+        max_tokens: semanticConfig.max_tokens,
+        temperature: semanticConfig.temperature,
+        question_intent_timeout: semanticConfig.question_intent_timeout,
+        topic_extraction_timeout: semanticConfig.topic_extraction_timeout,
+        cross_compare_timeout: semanticConfig.cross_compare_timeout,
+      })
+      await loadData()
+      setSemanticTestResult(null)
+    } catch (err) {
+      console.error('Failed to save semantic config:', err)
+    } finally {
+      setSaving(null)
+    }
+  }
+
+  const testSemanticConfig = async () => {
+    setSemanticTesting(true)
+    setSemanticTestResult(null)
+    try {
+      const result = await apiClient.testSemanticModel()
+      setSemanticTestResult(`✅ ${result.response}`)
+    } catch (err) {
+      setSemanticTestResult(`❌ ${(err as Error).message}`)
+    } finally {
+      setSemanticTesting(false)
     }
   }
 
@@ -9343,6 +10205,16 @@ export default function SettingsView({ onBack }: SettingsViewProps) {
               }`}
             >
               Actor 预设
+            </button>
+            <button
+              onClick={() => setTab('semantic')}
+              className={`pb-3 px-4 transition-colors ${
+                tab === 'semantic'
+                  ? 'text-accent-blue border-b-2 border-accent-blue'
+                  : 'text-text-secondary hover:text-text-primary'
+              }`}
+            >
+              语义分析模型
             </button>
           </div>
 
@@ -9405,7 +10277,7 @@ export default function SettingsView({ onBack }: SettingsViewProps) {
                 </motion.div>
               ))}
             </div>
-          ) : (
+          ) : tab === 'presets' ? (
             /* Prompt Presets */
             <div className="space-y-6">
               {promptPresets.map((preset) => (
@@ -9535,6 +10407,150 @@ export default function SettingsView({ onBack }: SettingsViewProps) {
                   )}
                 </motion.div>
               ))}
+            </div>
+          ) : (
+            /* Semantic Model Config */
+            <div className="space-y-6">
+              <motion.div
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                className="bg-bg-secondary border border-border rounded-2xl p-6"
+              >
+                <div className="flex items-start justify-between mb-4">
+                  <div>
+                    <h3 className="text-lg font-medium">语义分析专用模型</h3>
+                    <p className="text-text-tertiary text-sm mt-1">
+                      独立于主流程的轻量模型，用于提取语义主题和生成分歧图谱。
+                      建议使用响应速度快的小模型，避免与主流程竞争 API 限速。
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {semanticConfig.is_configured && (
+                      <button
+                        onClick={testSemanticConfig}
+                        disabled={semanticTesting}
+                        className="flex items-center gap-2 px-4 py-2 bg-bg-tertiary text-text-secondary rounded-xl hover:bg-bg-tertiary/80 disabled:opacity-50 transition-colors"
+                      >
+                        {semanticTesting ? '测试中...' : '测试连接'}
+                      </button>
+                    )}
+                    <button
+                      onClick={saveSemanticConfig}
+                      disabled={saving === 'semantic' || !semanticConfig.model || !semanticConfig.api_key}
+                      className="flex items-center gap-2 px-4 py-2 bg-accent-blue text-white rounded-xl hover:bg-blue-600 disabled:opacity-50 transition-colors"
+                    >
+                      <Save className="w-4 h-4" />
+                      {saving === 'semantic' ? 'Saving...' : 'Save'}
+                    </button>
+                  </div>
+                </div>
+
+                {semanticTestResult && (
+                  <div className="mb-4 p-3 bg-bg-tertiary rounded-xl text-sm text-text-secondary">
+                    {semanticTestResult}
+                  </div>
+                )}
+
+                {!semanticConfig.is_configured && (
+                  <div className="mb-4 p-3 bg-accent-orange/10 border border-accent-orange/20 rounded-xl text-sm text-accent-orange">
+                    ⚠️ 语义分析模型尚未配置。配置后互评将自动启用语义图谱功能。
+                  </div>
+                )}
+
+                <div className="space-y-4">
+                  {/* Provider & Model */}
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="text-text-secondary text-sm block mb-1">Provider</label>
+                      <select
+                        value={semanticConfig.provider}
+                        onChange={(e) => setSemanticConfig(prev => ({ ...prev, provider: e.target.value }))}
+                        className="w-full px-4 py-2 bg-bg-tertiary border border-border rounded-xl focus:outline-none focus:border-accent-blue"
+                      >
+                        <option value="openai">OpenAI</option>
+                        <option value="anthropic">Anthropic</option>
+                        <option value="custom">Custom</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-text-secondary text-sm block mb-1">Model</label>
+                      <input
+                        type="text"
+                        value={semanticConfig.model}
+                        onChange={(e) => setSemanticConfig(prev => ({ ...prev, model: e.target.value }))}
+                        className="w-full px-4 py-2 bg-bg-tertiary border border-border rounded-xl focus:outline-none focus:border-accent-blue"
+                        placeholder="gpt-4o-mini"
+                      />
+                    </div>
+                  </div>
+
+                  {/* API Key */}
+                  <div>
+                    <label className="text-text-secondary text-sm block mb-1">
+                      API Key {semanticConfig.is_configured && <span className="text-text-tertiary">(留空保留现有)</span>}
+                    </label>
+                    <input
+                      type="password"
+                      value={semanticConfig.api_key}
+                      onChange={(e) => setSemanticConfig(prev => ({ ...prev, api_key: e.target.value }))}
+                      className="w-full px-4 py-2 bg-bg-tertiary border border-border rounded-xl focus:outline-none focus:border-accent-blue"
+                      placeholder={semanticConfig.is_configured ? '留空保留现有 key' : 'sk-...'}
+                    />
+                  </div>
+
+                  {/* Base URL */}
+                  <div>
+                    <label className="text-text-secondary text-sm block mb-1">Base URL（Custom provider 必填）</label>
+                    <input
+                      type="text"
+                      value={semanticConfig.base_url}
+                      onChange={(e) => setSemanticConfig(prev => ({ ...prev, base_url: e.target.value }))}
+                      className="w-full px-4 py-2 bg-bg-tertiary border border-border rounded-xl focus:outline-none focus:border-accent-blue"
+                      placeholder="https://api.siliconflow.cn/v1"
+                    />
+                  </div>
+
+                  {/* Timeout Configuration */}
+                  <div className="border-t border-border pt-4">
+                    <h4 className="text-text-primary font-medium mb-3">超时配置（秒）</h4>
+                    <div className="grid grid-cols-3 gap-4">
+                      <div>
+                        <label className="text-text-tertiary text-xs block mb-1">问题意图分析</label>
+                        <input
+                          type="number"
+                          min={10}
+                          max={300}
+                          value={semanticConfig.question_intent_timeout}
+                          onChange={(e) => setSemanticConfig(prev => ({ ...prev, question_intent_timeout: Number(e.target.value) }))}
+                          className="w-full px-3 py-2 bg-bg-tertiary border border-border rounded-lg focus:outline-none focus:border-accent-blue text-sm"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-text-tertiary text-xs block mb-1">主题提取（每模型）</label>
+                        <input
+                          type="number"
+                          min={10}
+                          max={300}
+                          value={semanticConfig.topic_extraction_timeout}
+                          onChange={(e) => setSemanticConfig(prev => ({ ...prev, topic_extraction_timeout: Number(e.target.value) }))}
+                          className="w-full px-3 py-2 bg-bg-tertiary border border-border rounded-lg focus:outline-none focus:border-accent-blue text-sm"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-text-tertiary text-xs block mb-1">跨模型比较</label>
+                        <input
+                          type="number"
+                          min={10}
+                          max={300}
+                          value={semanticConfig.cross_compare_timeout}
+                          onChange={(e) => setSemanticConfig(prev => ({ ...prev, cross_compare_timeout: Number(e.target.value) }))}
+                          className="w-full px-3 py-2 bg-bg-tertiary border border-border rounded-lg focus:outline-none focus:border-accent-blue text-sm"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </motion.div>
             </div>
           )}
         </div>
@@ -9890,6 +10906,24 @@ class ApiClient {
     return this.request<import('@/types').SemanticAnalysisResult>(`/api/debate/${sessionId}/semantic`)
   }
 
+  // Semantic Model Config
+  async getSemanticModelConfig() {
+    return this.request<import('@/types').SemanticModelConfig>('/api/settings/semantic-model')
+  }
+
+  async upsertSemanticModelConfig(data: import('@/types').SemanticModelConfigCreate) {
+    return this.request<import('@/types').SemanticModelConfig>('/api/settings/semantic-model', {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    })
+  }
+
+  async testSemanticModel() {
+    return this.request<{ status: string; response: string }>('/api/settings/semantic-model/test', {
+      method: 'POST',
+    })
+  }
+
   // SSE Stream URL
   getStreamUrl(sessionId: string) {
     return `${API_BASE}/api/debate/${sessionId}/stream`
@@ -10116,6 +11150,7 @@ export function hydrateConsensus(session: DebateSession): Consensus | null {
     disagreements: session.consensus.disagreements,
     confidence: session.consensus.confidence,
     recommendation: session.consensus.recommendation,
+    key_uncertainties: session.consensus.key_uncertainties,
   }
 }
 
@@ -10319,8 +11354,9 @@ export const useActorStore = create<ActorState>((set, get) => ({
 
 ```typescript
 import { create } from 'zustand'
-import { DebateSession, SessionListItem, Consensus, LivePhaseRecord, LiveMessage, LivePhaseType, ConvergenceData, TopicComparison, QuestionIntent } from '@/types'
+import { DebateSession, SessionListItem, Consensus, LivePhaseRecord, LiveMessage, LivePhaseType, ConvergenceData, TopicComparison, QuestionIntent, Actor } from '@/types'
 import { apiClient } from '@/lib/apiClient'
+import { hydrateSessionToPhaseHistory } from '@/lib/sessionHydrator'
 
 interface ProgressState {
   startedAt: number | null
@@ -10356,6 +11392,8 @@ interface DebateState {
   questionIntent: QuestionIntent | null
   semanticComparisons: Map<string, TopicComparison[]>  // phaseId -> comparisons
   selectedTopicId: string | null
+  semanticSkipped: boolean
+  semanticSkipReason: string | null
 
   // Progress tracking
   progress: ProgressState
@@ -10365,7 +11403,8 @@ interface DebateState {
 
   fetchSessions: () => Promise<void>
   startDebate: (question: string, actorIds: string[], judgeActorId: string, config?: { max_rounds?: number }) => Promise<string>
-  streamDebate: (sessionId: string) => void
+  streamDebate: (sessionId: string, options?: { preserveState?: boolean }) => void
+  resumeDebate: (session: DebateSession) => void
   stopDebate: () => Promise<void>
   disconnectStream: () => void
 
@@ -10408,6 +11447,21 @@ function makePhaseId(step: number, phase: LivePhaseType, cycle?: number): string
   return `${step}:${phase}${cycle !== undefined ? `:${cycle}` : ''}`
 }
 
+// Helper to find actor metadata from currentSession
+function findActorMetadata(session: DebateSession | null, actorId: string): { name: string; icon: string; color: string } {
+  // Look in actors array
+  const actor = session?.actors.find((a: Actor) => a.id === actorId)
+  if (actor) {
+    return { name: actor.name, icon: actor.icon, color: actor.display_color }
+  }
+  // Look in judge_actor
+  if (session?.judge_actor && session.judge_actor.id === actorId) {
+    return { name: session.judge_actor.name, icon: session.judge_actor.icon, color: session.judge_actor.display_color }
+  }
+  // Fallback
+  return { name: 'Unknown', icon: '🤖', color: '#9333EA' }
+}
+
 export const useDebateStore = create<DebateState>((set, get) => ({
   currentSessionId: null,
   currentSession: null,
@@ -10424,6 +11478,8 @@ export const useDebateStore = create<DebateState>((set, get) => ({
   questionIntent: null,
   semanticComparisons: new Map(),
   selectedTopicId: null,
+  semanticSkipped: false,
+  semanticSkipReason: null,
   progress: {
     startedAt: null,
     currentPhaseStartedAt: null,
@@ -10476,6 +11532,8 @@ export const useDebateStore = create<DebateState>((set, get) => ({
       questionIntent: null,
       semanticComparisons: new Map(),
       selectedTopicId: null,
+      semanticSkipped: false,
+      semanticSkipReason: null,
       error: null,
       progress: {
         startedAt: Date.now(),
@@ -10494,36 +11552,52 @@ export const useDebateStore = create<DebateState>((set, get) => ({
     return data.session_id
   },
 
-  streamDebate: (sessionId) => {
+  streamDebate: (sessionId, options) => {
+    const preserveState = options?.preserveState ?? false
+
     // Reset expectedClose flag for new stream
     expectedClose = false
 
-    set({
-      status: 'connecting',
-      error: null,
-      streamingContent: new Map(),
-      activeActors: new Set(),
-      currentRound: 0,
-      currentPhase: '',
-      currentCycle: 0,
-      convergenceResult: null,
-      phaseHistory: [],
-      currentPhaseRecord: null,
-      selectedDiffPhaseId: null,
-      questionIntent: null,
-      semanticComparisons: new Map(),
-      selectedTopicId: null,
-      progress: {
-        startedAt: Date.now(),
-        currentPhaseStartedAt: null,
-        completedSteps: 0,
-        estimatedTotalSteps: 9,
-        currentStepProgress: 0,
-        phaseTimings: new Map(),
-        totalActorsInPhase: 0,
-        completedActorsInPhase: 0,
-      },
-    })
+    // Clear token buffer state
+    clearTokenBufferState()
+
+    if (!preserveState) {
+      // Full reset when not preserving state
+      set({
+        status: 'connecting',
+        error: null,
+        streamingContent: new Map(),
+        activeActors: new Set(),
+        currentRound: 0,
+        currentPhase: '',
+        currentCycle: 0,
+        convergenceResult: null,
+        phaseHistory: [],
+        currentPhaseRecord: null,
+        selectedDiffPhaseId: null,
+        questionIntent: null,
+        semanticComparisons: new Map(),
+        selectedTopicId: null,
+        semanticSkipped: false,
+        semanticSkipReason: null,
+        progress: {
+          startedAt: Date.now(),
+          currentPhaseStartedAt: null,
+          completedSteps: 0,
+          estimatedTotalSteps: 9,
+          currentStepProgress: 0,
+          phaseTimings: new Map(),
+          totalActorsInPhase: 0,
+          completedActorsInPhase: 0,
+        },
+      })
+    } else {
+      // Only reset connection-related state when preserving
+      set({
+        status: 'connecting',
+        error: null,
+      })
+    }
 
     if (eventSource) {
       eventSource.close()
@@ -10617,15 +11691,32 @@ export const useDebateStore = create<DebateState>((set, get) => ({
       const cycle = data.cycle
 
       const phaseId = makePhaseId(step, phase, cycle)
-      const newRecord: LivePhaseRecord = {
-        id: phaseId,
-        step,
-        phase,
-        cycle,
-        messages: {},
-      }
 
       set((state) => {
+        // Check if this phase already exists (for resume mode)
+        const existingRecord = state.phaseHistory.find((r) => r.id === phaseId)
+        if (existingRecord) {
+          // Reuse existing record, just update currentPhaseRecord
+          return {
+            currentPhase: phase,
+            currentRound: data.round || cycle || 1,
+            currentCycle: cycle || 0,
+            currentPhaseRecord: existingRecord,
+            // Clear legacy streaming state for new phase
+            streamingContent: new Map(),
+            activeActors: new Set(),
+          }
+        }
+
+        // Create new record if not exists
+        const newRecord: LivePhaseRecord = {
+          id: phaseId,
+          step,
+          phase,
+          cycle,
+          messages: {},
+        }
+
         const newHistory = [...state.phaseHistory, newRecord]
 
         // Update progress
@@ -10762,9 +11853,25 @@ export const useDebateStore = create<DebateState>((set, get) => ({
 
               bufferedTokens.forEach((tokens, actorId) => {
                 if (updatedMessages[actorId]) {
+                  // Update existing message
                   updatedMessages[actorId] = {
                     ...updatedMessages[actorId],
                     content: updatedMessages[actorId].content + tokens,
+                  }
+                  hasUpdates = true
+                } else {
+                  // Create new message if actor_start was missed (resume mode)
+                  const metadata = findActorMetadata(state.currentSession, actorId)
+                  updatedMessages[actorId] = {
+                    actorId,
+                    actorName: metadata.name,
+                    actorIcon: metadata.icon,
+                    actorColor: metadata.color,
+                    phase: phaseRecord.phase,
+                    step: phaseRecord.step,
+                    cycle: phaseRecord.cycle,
+                    content: tokens,
+                    status: 'streaming' as const,
                   }
                   hasUpdates = true
                 }
@@ -10794,7 +11901,7 @@ export const useDebateStore = create<DebateState>((set, get) => ({
       const actorId = data.actor_id as string
 
       // Flush any remaining tokens for this actor before marking as done
-      const remainingTokens = tokenBuffer.get(actorId)
+      const remainingTokens = tokenBuffer.get(actorId) || ''
       if (remainingTokens) {
         tokenBuffer.delete(actorId)
       }
@@ -10813,12 +11920,31 @@ export const useDebateStore = create<DebateState>((set, get) => ({
 
         // Update phase history
         const phaseRecord = state.currentPhaseRecord
-        if (phaseRecord && phaseRecord.messages[actorId]) {
-          const updatedMessage: LiveMessage = {
-            ...phaseRecord.messages[actorId],
-            status: 'done',
-            // Include remaining buffered tokens
-            content: phaseRecord.messages[actorId].content + (remainingTokens || ''),
+        if (phaseRecord) {
+          const existingMessage = phaseRecord.messages[actorId]
+          let updatedMessage: LiveMessage
+
+          if (existingMessage) {
+            // Update existing message
+            updatedMessage = {
+              ...existingMessage,
+              status: 'done',
+              content: existingMessage.content + (remainingTokens || ''),
+            }
+          } else {
+            // Create new message if actor_start was missed (resume mode)
+            const metadata = findActorMetadata(state.currentSession, actorId)
+            updatedMessage = {
+              actorId,
+              actorName: metadata.name,
+              actorIcon: metadata.icon,
+              actorColor: metadata.color,
+              phase: phaseRecord.phase,
+              step: phaseRecord.step,
+              cycle: phaseRecord.cycle,
+              content: remainingTokens || '',
+              status: 'done' as const,
+            }
           }
 
           const updatedRecord: LivePhaseRecord = {
@@ -11067,6 +12193,15 @@ export const useDebateStore = create<DebateState>((set, get) => ({
       })
     })
 
+    eventSource.addEventListener('semantic_skipped', (e: MessageEvent) => {
+      console.log('[SSE] semantic_skipped:', e.data)
+      const data = JSON.parse(e.data)
+      set({
+        semanticSkipped: true,
+        semanticSkipReason: data.message || '语义分析已跳过',
+      })
+    })
+
     eventSource.addEventListener('complete', async (e: MessageEvent) => {
       console.log('[SSE] complete:', e.data)
       expectedClose = true
@@ -11190,6 +12325,8 @@ export const useDebateStore = create<DebateState>((set, get) => ({
       questionIntent: null,
       semanticComparisons: new Map(),
       selectedTopicId: null,
+      semanticSkipped: false,
+      semanticSkipReason: null,
       error: null,
       progress: {
         startedAt: null,
@@ -11202,6 +12339,118 @@ export const useDebateStore = create<DebateState>((set, get) => ({
         completedActorsInPhase: 0,
       },
     })
+  },
+
+  resumeDebate: (session) => {
+    // Clear old reconnect timeout and token buffer
+    if (reconnectTimeoutId) {
+      clearTimeout(reconnectTimeoutId)
+      reconnectTimeoutId = null
+    }
+    reconnectAttempt = 0
+    clearTokenBufferState()
+
+    // Close old EventSource if exists
+    if (eventSource) {
+      eventSource.close()
+      eventSource = null
+    }
+
+    // Hydrate phaseHistory from session
+    const phaseHistory = hydrateSessionToPhaseHistory(session)
+
+    // Get the last round to construct currentPhaseRecord
+    let currentPhaseRecord: LivePhaseRecord | null = null
+    const lastRound = session.rounds[session.rounds.length - 1]
+
+    if (lastRound) {
+      const phaseId = `${lastRound.round_number}:${lastRound.phase}`
+      // Check if this phase already exists in phaseHistory
+      const existingRecord = phaseHistory.find(r => r.id === phaseId)
+
+      if (existingRecord) {
+        currentPhaseRecord = existingRecord
+      } else if (lastRound.phase === 'summary') {
+        // Summary is skipped in hydrator, create it here
+        const actorMap = new Map(session.actors.map(a => [a.id, a]))
+        if (session.judge_actor) {
+          actorMap.set(session.judge_actor.id, session.judge_actor)
+        }
+
+        const messages: Record<string, LiveMessage> = {}
+        for (const msg of lastRound.messages) {
+          const actor = actorMap.get(msg.actor_id)
+          messages[msg.actor_id] = {
+            actorId: msg.actor_id,
+            actorName: actor?.name || msg.actor_name || 'Unknown',
+            actorIcon: actor?.icon || '🤖',
+            actorColor: actor?.display_color || '#9333EA',
+            phase: 'summary',
+            step: lastRound.round_number,
+            content: msg.content,
+            status: 'done',
+          }
+        }
+
+        currentPhaseRecord = {
+          id: phaseId,
+          step: lastRound.round_number,
+          phase: 'summary',
+          messages,
+        }
+        phaseHistory.push(currentPhaseRecord)
+      }
+    }
+
+    // Calculate progress
+    const maxRounds = session.max_rounds || 3
+    const estimatedTotalSteps = 1 + 2 * maxRounds + 2
+    const completedSteps = phaseHistory.length
+
+    // Calculate current phase actor progress
+    let totalActorsInPhase = 0
+    let completedActorsInPhase = 0
+    let currentStepProgress = 0
+
+    if (currentPhaseRecord) {
+      const phase = currentPhaseRecord.phase
+      // Calculate expected actors for this phase
+      if (phase === 'initial' || phase === 'review' || phase === 'revision') {
+        totalActorsInPhase = session.actors.filter(a => !a.is_meta_judge).length
+      } else if (phase === 'final_answer' || phase === 'summary') {
+        totalActorsInPhase = session.judge_actor ? 1 : 0
+      }
+      completedActorsInPhase = Object.values(currentPhaseRecord.messages).filter(
+        (m: LiveMessage) => m.status === 'done'
+      ).length
+      currentStepProgress = totalActorsInPhase > 0 ? completedActorsInPhase / totalActorsInPhase : 0
+    }
+
+    // Set store state
+    set({
+      currentSessionId: session.id,
+      currentSession: session,
+      phaseHistory,
+      currentPhaseRecord,
+      currentPhase: currentPhaseRecord?.phase || '',
+      currentRound: currentPhaseRecord?.step || 0,
+      currentCycle: currentPhaseRecord?.cycle || 0,
+      status: 'connecting',
+      error: null,
+      progress: {
+        startedAt: new Date(session.created_at).getTime(),
+        currentPhaseStartedAt: Date.now(),
+        completedSteps,
+        estimatedTotalSteps,
+        currentStepProgress,
+        phaseTimings: new Map(),
+        totalActorsInPhase,
+        completedActorsInPhase,
+      },
+    })
+
+    // Start SSE connection with preserveState
+    get().streamDebate(session.id, { preserveState: true })
   },
 
   setSession: (session) => set({ currentSession: session }),
@@ -11261,6 +12510,8 @@ export const useDebateStore = create<DebateState>((set, get) => ({
       questionIntent: null,
       semanticComparisons: new Map(),
       selectedTopicId: null,
+      semanticSkipped: false,
+      semanticSkipReason: null,
       status: 'idle',
       error: null,
       progress: {
@@ -11362,6 +12613,7 @@ export interface Consensus {
   disagreements: string[]
   confidence: number | null
   recommendation: string
+  key_uncertainties?: string[]
 }
 
 export interface DebateSession {
@@ -11399,7 +12651,7 @@ export interface LiveMessage {
   step: number
   cycle?: number
   content: string
-  status: 'streaming' | 'done'
+  status: 'pending' | 'streaming' | 'done'
 }
 
 export interface ConvergenceData {
@@ -11497,6 +12749,37 @@ export interface TopicComparison {
 export interface SemanticAnalysisResult {
   question_intent?: QuestionIntent
   comparisons: TopicComparison[]
+}
+
+// ========== Semantic Model Config Types ==========
+
+export interface SemanticModelConfig {
+  id: string
+  provider: ProviderType
+  api_format: string
+  base_url?: string
+  model: string
+  max_tokens: number
+  temperature: number
+  question_intent_timeout: number
+  topic_extraction_timeout: number
+  cross_compare_timeout: number
+  is_active: boolean
+  created_at: string
+  updated_at?: string
+}
+
+export interface SemanticModelConfigCreate {
+  provider: ProviderType
+  api_format: string
+  base_url?: string
+  api_key: string
+  model: string
+  max_tokens?: number
+  temperature?: number
+  question_intent_timeout?: number
+  topic_extraction_timeout?: number
+  cross_compare_timeout?: number
 }
 ```
 

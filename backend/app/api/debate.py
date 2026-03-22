@@ -36,6 +36,27 @@ from app.services.task_manager import task_manager
 router = APIRouter(prefix="/api/debate", tags=["debate"])
 
 
+def _ensure_string_list(items) -> list[str]:
+    """Safety net for legacy data that may contain dicts instead of strings.
+
+    Handles cases where consensus fields were stored as structured objects
+    before the sanitization was added to debate_engine.
+    """
+    if not items:
+        return []
+    result = []
+    for item in items:
+        if isinstance(item, str):
+            result.append(item)
+        elif isinstance(item, dict):
+            # Convert dict to readable string by joining all values
+            parts = [str(v) for v in item.values() if v]
+            result.append(" — ".join(parts) if parts else str(item))
+        else:
+            result.append(str(item))
+    return result
+
+
 @router.post("/start", response_model=DebateStartResponse)
 async def start_debate(
     data: DebateStartRequest,
@@ -276,11 +297,11 @@ async def get_debate(
     if session.consensus_summary or session.consensus_recommendation:
         consensus = ConsensusResult(
             summary=session.consensus_summary or "",
-            agreements=session.consensus_agreements or [],
-            disagreements=session.consensus_disagreements or [],
+            agreements=_ensure_string_list(session.consensus_agreements),
+            disagreements=_ensure_string_list(session.consensus_disagreements),
             confidence=session.consensus_confidence,  # Can be None
             recommendation=session.consensus_recommendation or "",
-            key_uncertainties=session.consensus_key_uncertainties or [],
+            key_uncertainties=_ensure_string_list(session.consensus_key_uncertainties),
         )
 
     return DebateSessionResponse(

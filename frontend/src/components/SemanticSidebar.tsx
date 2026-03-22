@@ -82,8 +82,16 @@ export default function SemanticSidebar({
       if (!['initial', 'revision'].includes(record.phase)) {
         return false
       }
-      // Check if this phase has semantic data using the record's id as phase_id
-      return semanticComparisons.has(record.id)
+      // Check exact match first, then prefix match for cycle variants
+      // This handles the case where hydrated records don't have cycle info
+      // but live SSE events include cycle in the phase_id
+      if (semanticComparisons.has(record.id)) return true
+      // Check if any key starts with the base phase id (handles cycle mismatch)
+      const baseId = `${record.step}:${record.phase}`
+      for (const key of semanticComparisons.keys()) {
+        if (key === baseId || key.startsWith(baseId + ':')) return true
+      }
+      return false
     })
   }, [phaseHistory, semanticComparisons])
 
@@ -98,19 +106,37 @@ export default function SemanticSidebar({
 
   // Get the selected phase comparisons
   const selectedComparisons = useMemo(() => {
-    if (!selectedDiffPhaseId) {
-      // Default to the most recent phase with comparisons
-      for (let i = phaseHistory.length - 1; i >= 0; i--) {
-        const record = phaseHistory[i]
-        if (semanticComparisons.has(record.id)) {
-          return semanticComparisons.get(record.id) || []
+    // Helper to find comparisons by phase_id with prefix matching
+    const findComparisons = (phaseId: string): TopicComparison[] => {
+      // Try exact match first
+      if (semanticComparisons.has(phaseId)) {
+        return semanticComparisons.get(phaseId) || []
+      }
+      // Try prefix match for cycle variants
+      // e.g., "4:revision" matches "4:revision:1"
+      const baseId = phaseId.split(':').slice(0, 2).join(':')
+      for (const [key, value] of semanticComparisons.entries()) {
+        if (key === baseId || key.startsWith(baseId + ':')) {
+          return value
         }
       }
       return []
     }
 
-    // Use the phase_id (record.id) directly to lookup comparisons
-    return semanticComparisons.get(selectedDiffPhaseId) || []
+    if (!selectedDiffPhaseId) {
+      // Default to the most recent phase with comparisons
+      for (let i = phaseHistory.length - 1; i >= 0; i--) {
+        const record = phaseHistory[i]
+        const comparisons = findComparisons(record.id)
+        if (comparisons.length > 0) {
+          return comparisons
+        }
+      }
+      return []
+    }
+
+    // Use the phase_id (record.id) with prefix matching
+    return findComparisons(selectedDiffPhaseId)
   }, [phaseHistory, selectedDiffPhaseId, semanticComparisons])
 
   // Auto-select the highest salience topic (only if user hasn't selected)

@@ -1,6 +1,7 @@
 import { create } from 'zustand'
-import { DebateSession, SessionListItem, Consensus, LivePhaseRecord, LiveMessage, LivePhaseType, ConvergenceData, TopicComparison, QuestionIntent } from '@/types'
+import { DebateSession, SessionListItem, Consensus, LivePhaseRecord, LiveMessage, LivePhaseType, ConvergenceData, TopicComparison, QuestionIntent, Actor } from '@/types'
 import { apiClient } from '@/lib/apiClient'
+import { hydrateSessionToPhaseHistory } from '@/lib/sessionHydrator'
 
 interface ProgressState {
   startedAt: number | null
@@ -47,7 +48,8 @@ interface DebateState {
 
   fetchSessions: () => Promise<void>
   startDebate: (question: string, actorIds: string[], judgeActorId: string, config?: { max_rounds?: number }) => Promise<string>
-  streamDebate: (sessionId: string) => void
+  streamDebate: (sessionId: string, options?: { preserveState?: boolean }) => void
+  resumeDebate: (session: DebateSession) => void
   stopDebate: () => Promise<void>
   disconnectStream: () => void
 
@@ -88,6 +90,21 @@ function clearTokenBufferState() {
 // Helper to create a phase record ID
 function makePhaseId(step: number, phase: LivePhaseType, cycle?: number): string {
   return `${step}:${phase}${cycle !== undefined ? `:${cycle}` : ''}`
+}
+
+// Helper to find actor metadata from currentSession
+function findActorMetadata(session: DebateSession | null, actorId: string): { name: string; icon: string; color: string } {
+  // Look in actors array
+  const actor = session?.actors.find((a: Actor) => a.id === actorId)
+  if (actor) {
+    return { name: actor.name, icon: actor.icon, color: actor.display_color }
+  }
+  // Look in judge_actor
+  if (session?.judge_actor && session.judge_actor.id === actorId) {
+    return { name: session.judge_actor.name, icon: session.judge_actor.icon, color: session.judge_actor.display_color }
+  }
+  // Fallback
+  return { name: 'Unknown', icon: '🤖', color: '#9333EA' }
 }
 
 export const useDebateStore = create<DebateState>((set, get) => ({
@@ -180,38 +197,52 @@ export const useDebateStore = create<DebateState>((set, get) => ({
     return data.session_id
   },
 
-  streamDebate: (sessionId) => {
+  streamDebate: (sessionId, options) => {
+    const preserveState = options?.preserveState ?? false
+
     // Reset expectedClose flag for new stream
     expectedClose = false
 
-    set({
-      status: 'connecting',
-      error: null,
-      streamingContent: new Map(),
-      activeActors: new Set(),
-      currentRound: 0,
-      currentPhase: '',
-      currentCycle: 0,
-      convergenceResult: null,
-      phaseHistory: [],
-      currentPhaseRecord: null,
-      selectedDiffPhaseId: null,
-      questionIntent: null,
-      semanticComparisons: new Map(),
-      selectedTopicId: null,
-      semanticSkipped: false,
-      semanticSkipReason: null,
-      progress: {
-        startedAt: Date.now(),
-        currentPhaseStartedAt: null,
-        completedSteps: 0,
-        estimatedTotalSteps: 9,
-        currentStepProgress: 0,
-        phaseTimings: new Map(),
-        totalActorsInPhase: 0,
-        completedActorsInPhase: 0,
-      },
-    })
+    // Clear token buffer state
+    clearTokenBufferState()
+
+    if (!preserveState) {
+      // Full reset when not preserving state
+      set({
+        status: 'connecting',
+        error: null,
+        streamingContent: new Map(),
+        activeActors: new Set(),
+        currentRound: 0,
+        currentPhase: '',
+        currentCycle: 0,
+        convergenceResult: null,
+        phaseHistory: [],
+        currentPhaseRecord: null,
+        selectedDiffPhaseId: null,
+        questionIntent: null,
+        semanticComparisons: new Map(),
+        selectedTopicId: null,
+        semanticSkipped: false,
+        semanticSkipReason: null,
+        progress: {
+          startedAt: Date.now(),
+          currentPhaseStartedAt: null,
+          completedSteps: 0,
+          estimatedTotalSteps: 9,
+          currentStepProgress: 0,
+          phaseTimings: new Map(),
+          totalActorsInPhase: 0,
+          completedActorsInPhase: 0,
+        },
+      })
+    } else {
+      // Only reset connection-related state when preserving
+      set({
+        status: 'connecting',
+        error: null,
+      })
+    }
 
     if (eventSource) {
       eventSource.close()
@@ -305,15 +336,32 @@ export const useDebateStore = create<DebateState>((set, get) => ({
       const cycle = data.cycle
 
       const phaseId = makePhaseId(step, phase, cycle)
-      const newRecord: LivePhaseRecord = {
-        id: phaseId,
-        step,
-        phase,
-        cycle,
-        messages: {},
-      }
 
       set((state) => {
+        // Check if this phase already exists (for resume mode)
+        const existingRecord = state.phaseHistory.find((r) => r.id === phaseId)
+        if (existingRecord) {
+          // Reuse existing record, just update currentPhaseRecord
+          return {
+            currentPhase: phase,
+            currentRound: data.round || cycle || 1,
+            currentCycle: cycle || 0,
+            currentPhaseRecord: existingRecord,
+            // Clear legacy streaming state for new phase
+            streamingContent: new Map(),
+            activeActors: new Set(),
+          }
+        }
+
+        // Create new record if not exists
+        const newRecord: LivePhaseRecord = {
+          id: phaseId,
+          step,
+          phase,
+          cycle,
+          messages: {},
+        }
+
         const newHistory = [...state.phaseHistory, newRecord]
 
         // Update progress
@@ -450,9 +498,25 @@ export const useDebateStore = create<DebateState>((set, get) => ({
 
               bufferedTokens.forEach((tokens, actorId) => {
                 if (updatedMessages[actorId]) {
+                  // Update existing message
                   updatedMessages[actorId] = {
                     ...updatedMessages[actorId],
                     content: updatedMessages[actorId].content + tokens,
+                  }
+                  hasUpdates = true
+                } else {
+                  // Create new message if actor_start was missed (resume mode)
+                  const metadata = findActorMetadata(state.currentSession, actorId)
+                  updatedMessages[actorId] = {
+                    actorId,
+                    actorName: metadata.name,
+                    actorIcon: metadata.icon,
+                    actorColor: metadata.color,
+                    phase: phaseRecord.phase,
+                    step: phaseRecord.step,
+                    cycle: phaseRecord.cycle,
+                    content: tokens,
+                    status: 'streaming' as const,
                   }
                   hasUpdates = true
                 }
@@ -482,7 +546,7 @@ export const useDebateStore = create<DebateState>((set, get) => ({
       const actorId = data.actor_id as string
 
       // Flush any remaining tokens for this actor before marking as done
-      const remainingTokens = tokenBuffer.get(actorId)
+      const remainingTokens = tokenBuffer.get(actorId) || ''
       if (remainingTokens) {
         tokenBuffer.delete(actorId)
       }
@@ -501,12 +565,31 @@ export const useDebateStore = create<DebateState>((set, get) => ({
 
         // Update phase history
         const phaseRecord = state.currentPhaseRecord
-        if (phaseRecord && phaseRecord.messages[actorId]) {
-          const updatedMessage: LiveMessage = {
-            ...phaseRecord.messages[actorId],
-            status: 'done',
-            // Include remaining buffered tokens
-            content: phaseRecord.messages[actorId].content + (remainingTokens || ''),
+        if (phaseRecord) {
+          const existingMessage = phaseRecord.messages[actorId]
+          let updatedMessage: LiveMessage
+
+          if (existingMessage) {
+            // Update existing message
+            updatedMessage = {
+              ...existingMessage,
+              status: 'done',
+              content: existingMessage.content + (remainingTokens || ''),
+            }
+          } else {
+            // Create new message if actor_start was missed (resume mode)
+            const metadata = findActorMetadata(state.currentSession, actorId)
+            updatedMessage = {
+              actorId,
+              actorName: metadata.name,
+              actorIcon: metadata.icon,
+              actorColor: metadata.color,
+              phase: phaseRecord.phase,
+              step: phaseRecord.step,
+              cycle: phaseRecord.cycle,
+              content: remainingTokens || '',
+              status: 'done' as const,
+            }
           }
 
           const updatedRecord: LivePhaseRecord = {
@@ -901,6 +984,118 @@ export const useDebateStore = create<DebateState>((set, get) => ({
         completedActorsInPhase: 0,
       },
     })
+  },
+
+  resumeDebate: (session) => {
+    // Clear old reconnect timeout and token buffer
+    if (reconnectTimeoutId) {
+      clearTimeout(reconnectTimeoutId)
+      reconnectTimeoutId = null
+    }
+    reconnectAttempt = 0
+    clearTokenBufferState()
+
+    // Close old EventSource if exists
+    if (eventSource) {
+      eventSource.close()
+      eventSource = null
+    }
+
+    // Hydrate phaseHistory from session
+    const phaseHistory = hydrateSessionToPhaseHistory(session)
+
+    // Get the last round to construct currentPhaseRecord
+    let currentPhaseRecord: LivePhaseRecord | null = null
+    const lastRound = session.rounds[session.rounds.length - 1]
+
+    if (lastRound) {
+      const phaseId = `${lastRound.round_number}:${lastRound.phase}`
+      // Check if this phase already exists in phaseHistory
+      const existingRecord = phaseHistory.find(r => r.id === phaseId)
+
+      if (existingRecord) {
+        currentPhaseRecord = existingRecord
+      } else if (lastRound.phase === 'summary') {
+        // Summary is skipped in hydrator, create it here
+        const actorMap = new Map(session.actors.map(a => [a.id, a]))
+        if (session.judge_actor) {
+          actorMap.set(session.judge_actor.id, session.judge_actor)
+        }
+
+        const messages: Record<string, LiveMessage> = {}
+        for (const msg of lastRound.messages) {
+          const actor = actorMap.get(msg.actor_id)
+          messages[msg.actor_id] = {
+            actorId: msg.actor_id,
+            actorName: actor?.name || msg.actor_name || 'Unknown',
+            actorIcon: actor?.icon || '🤖',
+            actorColor: actor?.display_color || '#9333EA',
+            phase: 'summary',
+            step: lastRound.round_number,
+            content: msg.content,
+            status: 'done',
+          }
+        }
+
+        currentPhaseRecord = {
+          id: phaseId,
+          step: lastRound.round_number,
+          phase: 'summary',
+          messages,
+        }
+        phaseHistory.push(currentPhaseRecord)
+      }
+    }
+
+    // Calculate progress
+    const maxRounds = session.max_rounds || 3
+    const estimatedTotalSteps = 1 + 2 * maxRounds + 2
+    const completedSteps = phaseHistory.length
+
+    // Calculate current phase actor progress
+    let totalActorsInPhase = 0
+    let completedActorsInPhase = 0
+    let currentStepProgress = 0
+
+    if (currentPhaseRecord) {
+      const phase = currentPhaseRecord.phase
+      // Calculate expected actors for this phase
+      if (phase === 'initial' || phase === 'review' || phase === 'revision') {
+        totalActorsInPhase = session.actors.filter(a => !a.is_meta_judge).length
+      } else if (phase === 'final_answer' || phase === 'summary') {
+        totalActorsInPhase = session.judge_actor ? 1 : 0
+      }
+      completedActorsInPhase = Object.values(currentPhaseRecord.messages).filter(
+        (m: LiveMessage) => m.status === 'done'
+      ).length
+      currentStepProgress = totalActorsInPhase > 0 ? completedActorsInPhase / totalActorsInPhase : 0
+    }
+
+    // Set store state
+    set({
+      currentSessionId: session.id,
+      currentSession: session,
+      phaseHistory,
+      currentPhaseRecord,
+      currentPhase: currentPhaseRecord?.phase || '',
+      currentRound: currentPhaseRecord?.step || 0,
+      currentCycle: currentPhaseRecord?.cycle || 0,
+      status: 'connecting',
+      error: null,
+      progress: {
+        startedAt: new Date(session.created_at).getTime(),
+        currentPhaseStartedAt: Date.now(),
+        completedSteps,
+        estimatedTotalSteps,
+        currentStepProgress,
+        phaseTimings: new Map(),
+        totalActorsInPhase,
+        completedActorsInPhase,
+      },
+    })
+
+    // Start SSE connection with preserveState
+    get().streamDebate(session.id, { preserveState: true })
   },
 
   setSession: (session) => set({ currentSession: session }),

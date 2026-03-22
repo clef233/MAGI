@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useMemo } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Send, Settings, Users, History, Loader2, AlertCircle } from 'lucide-react'
 import { useActorStore, useDebateStore } from '@/stores'
@@ -106,7 +106,22 @@ export default function Arena() {
     loadRecentSessions()
   }
 
-  const handleSelectSession = (sessionId: string) => {
+  const handleSelectSession = async (sessionId: string) => {
+    // Check if this session is still actively running on the backend
+    try {
+      const sessionData = await apiClient.getDebate(sessionId)
+      if (['initializing', 'debating', 'judging'].includes(sessionData.status)) {
+        // Active session - use live debate view, resume SSE
+        setQuestion(sessionData.question)
+        const resumeDebate = useDebateStore.getState().resumeDebate
+        resumeDebate(sessionData)
+        setView('debate')
+        return
+      }
+    } catch {
+      // If fetch fails, fall through to detail view
+    }
+    // Completed/stopped session - use detail view
     setSelectedSessionId(sessionId)
     setView('sessionDetail')
   }
@@ -115,6 +130,24 @@ export default function Arena() {
   const judgeActor = actors.find((a) => a.id === judgeActorId)
   const nonJudgeActors = actors.filter((a) => !a.is_meta_judge)
   const judgeActors = actors.filter((a) => a.is_meta_judge)
+
+  // Support resume: use currentSession data when resuming, otherwise use local state
+  // These must be at top level (not inside conditionals) to satisfy React hooks rules
+  const debateActors = useMemo(() => {
+    if (currentSession?.actors) {
+      return currentSession.actors.filter(a => !a.is_meta_judge)
+    }
+    return selectedActorObjects
+  }, [currentSession, selectedActorObjects])
+
+  const debateJudgeActor = useMemo(() => {
+    if (currentSession?.judge_actor) {
+      return currentSession.judge_actor
+    }
+    return judgeActor
+  }, [currentSession, judgeActor])
+
+  const debateQuestion = currentSession?.question || question
 
   if (view === 'actors') {
     return <ActorManager onBack={() => setView('arena')} />
@@ -169,7 +202,7 @@ export default function Arena() {
         <main className="flex-1 overflow-hidden">
           <div className="h-full max-w-[1600px] mx-auto px-6 py-4 flex flex-col">
             {/* Question - collapsible for long questions */}
-            <QuestionBox question={question} />
+            <QuestionBox question={debateQuestion} />
 
             {/* Status - fixed */}
             <div className="mb-4 flex items-center gap-4 shrink-0">
@@ -205,19 +238,19 @@ export default function Arena() {
             {status !== 'idle' && (
               <div className="flex-1 min-h-0">
                 <DebateView
-                  actors={selectedActorObjects}
-                  judgeActor={judgeActor}
+                  actors={debateActors}
+                  judgeActor={debateJudgeActor}
                   phaseHistory={phaseHistory}
                   currentPhaseRecord={currentPhaseRecord}
                   selectedDiffPhaseId={selectedDiffPhaseId}
                   onSelectDiffPhase={selectDiffPhase}
                   status={status}
                   currentPhase={currentPhase}
-                  question={question}
+                  question={debateQuestion}
                   semanticComparisons={semanticComparisons}
                   selectedTopicId={selectedTopicId}
                   onSelectTopic={selectTopic}
-                  consensus={currentSession?.consensus}  // Pass consensus to DebateView
+                  consensus={currentSession?.consensus}
                   semanticSkipped={semanticSkipped}
                   semanticSkipReason={semanticSkipReason}
                 />

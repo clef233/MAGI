@@ -108,7 +108,7 @@ export interface LiveMessage {
   step: number
   cycle?: number
   content: string
-  status: 'streaming' | 'done'
+  status: 'pending' | 'streaming' | 'done'
 }
 
 export interface ConvergenceData {
