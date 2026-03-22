@@ -159,6 +159,8 @@ export const useDebateStore = create<DebateState>((set, get) => ({
         estimatedTotalSteps,
         currentStepProgress: 0,
         phaseTimings: new Map(),
+        totalActorsInPhase: 0,
+        completedActorsInPhase: 0,
       },
     })
 
@@ -193,6 +195,8 @@ export const useDebateStore = create<DebateState>((set, get) => ({
         estimatedTotalSteps: 9,
         currentStepProgress: 0,
         phaseTimings: new Map(),
+        totalActorsInPhase: 0,
+        completedActorsInPhase: 0,
       },
     })
 
@@ -799,6 +803,8 @@ export const useDebateStore = create<DebateState>((set, get) => ({
         estimatedTotalSteps: 9,
         currentStepProgress: 0,
         phaseTimings: new Map(),
+        totalActorsInPhase: 0,
+        completedActorsInPhase: 0,
       },
     })
   },

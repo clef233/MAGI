@@ -173,9 +173,11 @@ export default function SessionDetailView({ sessionId, onBack }: SessionDetailVi
               actors={debateActors}
               judgeActor={judgeActor}
               phaseHistory={phaseHistory}
+              currentPhaseRecord={null}
               selectedDiffPhaseId={selectedDiffPhaseId}
               onSelectDiffPhase={setSelectedDiffPhaseId}
               status="completed"
+              currentPhase="completed"
               question={session.question}
               semanticComparisons={semanticComparisons}
               selectedTopicId={selectedTopicId}

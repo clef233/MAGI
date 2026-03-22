@@ -13,6 +13,9 @@ interface SemanticSidebarProps {
   onSelectTopic: (topicId: string | null) => void
   onShowRawDiff?: () => void
   onSwitchToDiffTab?: () => void  // Callback to switch to diff tab
+  status?: string
+  currentPhase?: string
+  currentPhaseRecord?: LivePhaseRecord | null
 }
 
 const phaseLabels: Record<string, string> = {
@@ -60,6 +63,9 @@ export default function SemanticSidebar({
   onSelectTopic,
   onShowRawDiff,
   onSwitchToDiffTab,
+  status = 'idle',
+  currentPhase = '',
+  currentPhaseRecord = null,
 }: SemanticSidebarProps) {
   const [showRawDiff, setShowRawDiff] = useState(false)
   const [hasUserSelectedPhase, setHasUserSelectedPhase] = useState(false)
@@ -136,6 +142,23 @@ export default function SemanticSidebar({
     }
   }, [selectedComparisons])
 
+  // Check if we're in a live session waiting for semantic data
+  const isLiveWaiting = useMemo(() => {
+    // Live session is streaming and current phase is one that should have semantic data
+    const isRelevantPhase = ['initial', 'revision'].includes(currentPhase)
+    const isStreaming = status === 'streaming'
+    const hasPhaseData = currentPhaseRecord && Object.keys(currentPhaseRecord.messages).length > 0
+    const allActorsDone = hasPhaseData && Object.values(currentPhaseRecord.messages).every(m => m.status === 'done')
+    const noSemanticData = comparablePhases.length === 0 || !semanticComparisons.has(selectedDiffPhaseId || '')
+
+    return isStreaming && isRelevantPhase && allActorsDone && noSemanticData
+  }, [status, currentPhase, currentPhaseRecord, comparablePhases, semanticComparisons, selectedDiffPhaseId])
+
+  // Check if this is a completed session with no semantic data
+  const isCompletedNoData = useMemo(() => {
+    return (status === 'completed' || status === 'idle') && comparablePhases.length === 0
+  }, [status, comparablePhases])
+
   // Handle phase selection
   const handlePhaseSelect = (phaseId: string) => {
     setHasUserSelectedPhase(true)
@@ -191,14 +214,56 @@ export default function SemanticSidebar({
       <div className="flex-1 overflow-y-auto p-3 min-h-0">
         {!selectedComparisons.length ? (
           <div className="text-text-tertiary text-xs text-center py-8 space-y-4">
-            {comparablePhases.length === 0 ? (
+            {isLiveWaiting ? (
               <>
-                <div className="text-text-secondary">当前阶段的语义图谱尚未生成</div>
-                <div>语义分析会在本轮回答完成后自动生成</div>
+                {/* Live waiting state - show skeleton */}
+                <div className="text-text-secondary">语义图谱构建中...</div>
+                <div className="text-text-tertiary text-xs">系统会在本轮回答完成后提炼共识与分歧维度</div>
+
+                {/* Skeleton placeholder */}
+                <div className="space-y-2 mt-4">
+                  {[1, 2, 3].map((i) => (
+                    <div
+                      key={i}
+                      className="h-10 bg-bg-tertiary rounded-lg animate-pulse"
+                      style={{ animationDelay: `${i * 0.15}s` }}
+                    />
+                  ))}
+                </div>
+
+                {/* CTA to switch to diff */}
                 {phaseHistory.some(r => ['initial', 'review', 'revision'].includes(r.phase) && Object.keys(r.messages).length >= 2) && onSwitchToDiffTab && (
                   <button
                     onClick={onSwitchToDiffTab}
-                    className="px-4 py-2 bg-accent-blue/20 text-accent-blue rounded-lg hover:bg-accent-blue/30 transition-colors"
+                    className="px-4 py-2 bg-accent-blue/20 text-accent-blue rounded-lg hover:bg-accent-blue/30 transition-colors mt-4"
+                  >
+                    先查看原文差异对比
+                  </button>
+                )}
+              </>
+            ) : isCompletedNoData ? (
+              <>
+                {/* Completed session with no data */}
+                <div className="text-text-secondary">本次记录没有可用的语义图谱数据</div>
+                <div className="text-text-tertiary text-xs">可能是会话未能正常完成</div>
+                {onSwitchToDiffTab && (
+                  <button
+                    onClick={onSwitchToDiffTab}
+                    className="px-4 py-2 bg-accent-blue/20 text-accent-blue rounded-lg hover:bg-accent-blue/30 transition-colors mt-4"
+                  >
+                    查看原文差异对比
+                  </button>
+                )}
+              </>
+            ) : comparablePhases.length === 0 ? (
+              <>
+                {/* No comparable phases yet */}
+                <div className="text-text-secondary">当前阶段的语义图谱尚未生成</div>
+                <div className="text-text-tertiary text-xs">语义分析会在本轮回答完成后自动生成</div>
+                {phaseHistory.some(r => ['initial', 'review', 'revision'].includes(r.phase) && Object.keys(r.messages).length >= 2) && onSwitchToDiffTab && (
+                  <button
+                    onClick={onSwitchToDiffTab}
+                    className="px-4 py-2 bg-accent-blue/20 text-accent-blue rounded-lg hover:bg-accent-blue/30 transition-colors mt-4"
                   >
                     查看原文差异对比
                   </button>
@@ -206,6 +271,7 @@ export default function SemanticSidebar({
               </>
             ) : (
               <>
+                {/* Selected phase has no data */}
                 <div>该阶段暂无语义分析结果</div>
                 {onSwitchToDiffTab && (
                   <button

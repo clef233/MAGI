@@ -12,12 +12,27 @@ interface ProgressProps {
   status: string
 }
 
-const phaseLabels: Record<string, string> = {
-  initial: '初始回答',
-  review: '互评',
-  revision: '修订',
-  final_answer: '最终回答',
-  summary: '总结',
+const phaseInfo: Record<string, { label: string; explanation: string }> = {
+  initial: {
+    label: '初始回答',
+    explanation: '每个模型先独立回答问题',
+  },
+  review: {
+    label: '互评',
+    explanation: '模型之间正在指出彼此的盲点与漏洞',
+  },
+  revision: {
+    label: '修订',
+    explanation: '模型正在根据批评修正观点',
+  },
+  final_answer: {
+    label: '最终回答',
+    explanation: '总结模型正在整合多方观点，输出面向用户的最终回答',
+  },
+  summary: {
+    label: '总结',
+    explanation: '系统正在生成结构化共识报告',
+  },
 }
 
 function formatDuration(ms: number): string {
@@ -65,7 +80,7 @@ export default function ProgressBar({
 
   if (status === 'idle' || status === 'completed') return null
 
-  const phaseLabel = phaseLabels[currentPhase] || currentPhase
+  const phaseData = phaseInfo[currentPhase] || { label: currentPhase, explanation: '' }
 
   return (
     <div className="flex items-center gap-4 text-sm">
@@ -82,7 +97,7 @@ export default function ProgressBar({
       {/* Progress text */}
       <div className="flex items-center gap-3 text-text-secondary">
         <span className="text-xs">{progress.percent}%</span>
-        <span className="text-xs">{phaseLabel}</span>
+        <span className="text-xs">{phaseData.label}</span>
         <span className="text-xs text-text-tertiary">
           {formatDuration(progress.elapsed)}
         </span>
@@ -92,6 +107,13 @@ export default function ProgressBar({
           </span>
         )}
       </div>
+
+      {/* Phase explanation - shown on a new line below the progress */}
+      {phaseData.explanation && (
+        <span className="text-xs text-text-tertiary hidden lg:inline">
+          {phaseData.explanation}
+        </span>
+      )}
     </div>
   )
 }

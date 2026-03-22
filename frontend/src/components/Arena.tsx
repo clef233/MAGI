@@ -44,6 +44,7 @@ export default function Arena() {
 
   // Phase history - changes frequently during streaming
   const phaseHistory = useDebateStore((state) => state.phaseHistory)
+  const currentPhaseRecord = useDebateStore((state) => state.currentPhaseRecord)
 
   // Diff selection - changes when user interacts with diff sidebar
   const selectedDiffPhaseId = useDebateStore((state) => state.selectedDiffPhaseId)
@@ -185,9 +186,11 @@ export default function Arena() {
                   actors={selectedActorObjects}
                   judgeActor={judgeActor}
                   phaseHistory={phaseHistory}
+                  currentPhaseRecord={currentPhaseRecord}
                   selectedDiffPhaseId={selectedDiffPhaseId}
                   onSelectDiffPhase={selectDiffPhase}
                   status={status}
+                  currentPhase={currentPhase}
                   question={question}
                   semanticComparisons={semanticComparisons}
                   selectedTopicId={selectedTopicId}

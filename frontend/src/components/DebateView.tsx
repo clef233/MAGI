@@ -6,14 +6,17 @@ import { Actor, LivePhaseRecord, TopicComparison, Consensus } from '@/types'
 import ReviewChatView from './ReviewChatView'
 import SemanticSidebar from './SemanticSidebar'
 import DiffSidebar from './DiffSidebar'
+import MiniMagiMonitor from './MiniMagiMonitor'
 
 interface DebateViewProps {
   actors: Actor[]
   judgeActor?: Actor
   phaseHistory: LivePhaseRecord[]
+  currentPhaseRecord?: LivePhaseRecord | null
   selectedDiffPhaseId: string | null
   onSelectDiffPhase: (phaseId: string | null) => void
   status: string
+  currentPhase: string
   question?: string
   semanticComparisons?: Map<string, TopicComparison[]>
   selectedTopicId?: string | null
@@ -27,9 +30,11 @@ export default function DebateView({
   actors,
   judgeActor,
   phaseHistory,
+  currentPhaseRecord,
   selectedDiffPhaseId,
   onSelectDiffPhase,
   status,
+  currentPhase,
   question = '',
   semanticComparisons = new Map(),
   selectedTopicId = null,
@@ -85,7 +90,18 @@ export default function DebateView({
       </div>
 
       {/* Right sidebar with tabs - scrolls independently */}
-      <div className="w-80 lg:w-[420px] shrink-0 border-l border-border">
+      <div className="w-80 lg:w-[420px] shrink-0 border-l border-border flex flex-col">
+        {/* Mini MAGI Monitor - always visible at top */}
+        <MiniMagiMonitor
+          status={status as 'idle' | 'connecting' | 'streaming' | 'completed' | 'error'}
+          currentPhase={currentPhase}
+          currentPhaseRecord={currentPhaseRecord || null}
+          phaseHistory={phaseHistory}
+          actors={actors}
+          judgeActor={judgeActor}
+          semanticComparisons={semanticComparisons}
+        />
+
         {/* Tab header */}
         <div className="flex border-b border-border bg-bg-secondary shrink-0">
           <button
@@ -111,7 +127,7 @@ export default function DebateView({
         </div>
 
         {/* Tab content */}
-        <div className="h-[calc(100%-40px)] overflow-hidden">
+        <div className="flex-1 overflow-hidden min-h-0">
           {sidebarTab === 'semantic' ? (
             <SemanticSidebar
               phaseHistory={phaseHistory}
@@ -121,6 +137,9 @@ export default function DebateView({
               selectedTopicId={selectedTopicId}
               onSelectTopic={onSelectTopic || (() => {})}
               onSwitchToDiffTab={() => setSidebarTab('diff')}
+              status={status}
+              currentPhase={currentPhase}
+              currentPhaseRecord={currentPhaseRecord}
             />
           ) : (
             <DiffSidebar
