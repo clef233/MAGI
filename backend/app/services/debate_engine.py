@@ -34,6 +34,7 @@ from app.services.prompt_service import PromptService, PromptError
 from app.services.convergence_service import check_convergence, ConvergenceResult
 from app.services.semantic_service import SemanticService
 from app.services.prompt_serializer import BlockPhase
+from app.services.utils import sanitize_string_list
 
 logger = logging.getLogger('magi.debate_engine')
 logger.setLevel(logging.DEBUG)
@@ -44,25 +45,6 @@ if not logger.handlers:
     file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
     logger.addHandler(file_handler)
 logger.propagate = False
-
-
-def _sanitize_string_list(items: list) -> list[str]:
-    """Ensure all items in list are strings. LLM sometimes returns dicts.
-
-    This handles cases where the LLM returns structured objects like:
-    {"topic": "...", "detail": "..."} instead of plain strings.
-    """
-    result = []
-    for item in items:
-        if isinstance(item, str):
-            result.append(item)
-        elif isinstance(item, dict):
-            # Convert dict to readable string by joining all values
-            parts = [str(v) for v in item.values() if v]
-            result.append(" — ".join(parts) if parts else str(item))
-        else:
-            result.append(str(item))
-    return result
 
 
 class DebateEngine:
@@ -1306,8 +1288,8 @@ The previous response could not be parsed. Please provide ONLY a valid JSON obje
         # Store consensus
         # New prompt schema: no "summary" field, use "recommendation" as summary fallback
         self.session.consensus_summary = consensus.get("summary", "") or consensus.get("recommendation", "")
-        self.session.consensus_agreements = _sanitize_string_list(consensus.get("agreements", []))
-        self.session.consensus_disagreements = _sanitize_string_list(consensus.get("disagreements", []))
+        self.session.consensus_agreements = sanitize_string_list(consensus.get("agreements", []))
+        self.session.consensus_disagreements = sanitize_string_list(consensus.get("disagreements", []))
         # Store confidence as-is (could be None if unavailable)
         confidence_value = consensus.get("confidence")
         if confidence_value is not None:
@@ -1315,7 +1297,7 @@ The previous response could not be parsed. Please provide ONLY a valid JSON obje
         else:
             self.session.consensus_confidence = None
         self.session.consensus_recommendation = consensus.get("recommendation", "")
-        self.session.consensus_key_uncertainties = _sanitize_string_list(consensus.get("key_uncertainties", []))
+        self.session.consensus_key_uncertainties = sanitize_string_list(consensus.get("key_uncertainties", []))
         await self.db.commit()
 
         await self._emit({
