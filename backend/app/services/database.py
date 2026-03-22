@@ -355,12 +355,6 @@ comparison_axes 是后续用于比较不同专家回答差异的维度，选择 
             ),
         ]
 
-        # --- Prompt version tracking ---
-        # When prompt content changes significantly (not just typo fixes),
-        # increment this version to force-update existing installations.
-        # This ensures users get the improved prompts on next restart.
-        PROMPT_SEED_VERSION = 2  # v1 = original, v2 = adversarial review rewrite
-
         added_count = 0
         for wp in workflow_prompts:
             if wp.key not in existing_keys:
