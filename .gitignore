@@ -70,3 +70,6 @@ coverage/
 *.bak
 *.tmp
 *.temp
+
+# Claude Code
+.claude/
