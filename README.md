@@ -19,33 +19,35 @@
 - **Python** 3.9+
 - **Node.js** 18+
 
-### 安装
+### 安装与启动
 
 **Windows：**
+首先
 ```
 双击 setup.bat
 ```
+等待安装依赖完成
+
+然后
+```
+双击 start.bat
+```
+---
 
 **Mac/Linux：**
 ```bash
 chmod +x setup.sh && ./setup.sh
 ```
+（未测试mac/linux环境）
 
-### 启动
-
-**Windows：**
-```
-双击 start.bat
-```
-
-**Mac/Linux：**
 ```bash
 chmod +x start.sh && ./start.sh
 ```
 
 启动后浏览器会自动打开 `http://localhost:3000`。
+---
 
-### 首次配置
+### ⚙️ 首次配置
 
 1. 打开页面后点击 **⚡ 快速配置**
 2. 选择 API 服务商（默认硅基流动）
@@ -56,6 +58,25 @@ chmod +x start.sh && ./start.sh
 
 > 💡 **硅基流动**注册地址：https://cloud.siliconflow.cn/
 > 注册后在「API 密钥」页面创建一个 Key 即可。
+>
+
+### ⚙️ 手动配置
+
+如果不使用快速配置，你可以手动管理：
+
+- **Actor 管理**：点击顶部导航的 `Actors` 创建/编辑模型
+- **提示词编辑**：点击右上角 ⚙️ Settings，可编辑所有工作流提示词和 Actor 预设
+- **语义分析模型**：在 Settings → 语义分析模型中单独配置
+
+### 支持的 API 格式
+
+| 服务商 | Provider 类型 | 说明 |
+|--------|-------------|------|
+| OpenAI | `openai` | 官方 API |
+| Anthropic | `anthropic` | Claude 系列 |
+| 硅基流动 | `custom` | Base URL: `https://api.siliconflow.cn/v1` |
+| DeepSeek | `custom` | Base URL: `https://api.deepseek.com/v1` |
+| 其他兼容 API | `custom` | 任何 OpenAI 格式兼容的 API |
 
 ## 📖 使用方法
 
@@ -89,23 +110,7 @@ MAGI/
 └── stop.bat          # Windows 停止脚本
 ```
 
-## ⚙️ 手动配置
 
-如果不使用快速配置，你可以手动管理：
-
-- **Actor 管理**：点击顶部导航的 `Actors` 创建/编辑模型
-- **提示词编辑**：点击右上角 ⚙️ Settings，可编辑所有工作流提示词和 Actor 预设
-- **语义分析模型**：在 Settings → 语义分析模型中单独配置
-
-### 支持的 API 格式
-
-| 服务商 | Provider 类型 | 说明 |
-|--------|-------------|------|
-| OpenAI | `openai` | 官方 API |
-| Anthropic | `anthropic` | Claude 系列 |
-| 硅基流动 | `custom` | Base URL: `https://api.siliconflow.cn/v1` |
-| DeepSeek | `custom` | Base URL: `https://api.deepseek.com/v1` |
-| 其他兼容 API | `custom` | 任何 OpenAI 格式兼容的 API |
 
 ## 📝 License
 
