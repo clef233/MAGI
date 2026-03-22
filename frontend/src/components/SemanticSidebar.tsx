@@ -88,8 +88,9 @@ export default function SemanticSidebar({
       if (semanticComparisons.has(record.id)) return true
       // Check if any key starts with the base phase id (handles cycle mismatch)
       const baseId = `${record.step}:${record.phase}`
-      for (const key of semanticComparisons.keys()) {
-        if (key === baseId || key.startsWith(baseId + ':')) return true
+      const keys = Array.from(semanticComparisons.keys())
+      for (let i = 0; i < keys.length; i++) {
+        if (keys[i] === baseId || keys[i].startsWith(baseId + ':')) return true
       }
       return false
     })
@@ -115,7 +116,9 @@ export default function SemanticSidebar({
       // Try prefix match for cycle variants
       // e.g., "4:revision" matches "4:revision:1"
       const baseId = phaseId.split(':').slice(0, 2).join(':')
-      for (const [key, value] of semanticComparisons.entries()) {
+      const entries = Array.from(semanticComparisons.entries())
+      for (let i = 0; i < entries.length; i++) {
+        const [key, value] = entries[i]
         if (key === baseId || key.startsWith(baseId + ':')) {
           return value
         }

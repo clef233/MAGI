@@ -223,24 +223,28 @@ async def check_convergence(
             converged = data.get("converged", False)
             score = data.get("score")
 
-            # Validate score - if not provided or invalid, mark as unavailable
-            if score is None:
-                score = None
-                converged = False
-            else:
+            # Validate score
+            if score is not None:
                 try:
                     score = float(score)
-                    # Apply threshold
+                    # Apply threshold to override converged flag
                     if score >= threshold:
                         converged = True
+                    elif score < threshold:
+                        converged = False
                 except (ValueError, TypeError):
                     score = None
-                    converged = False
+
+            # If score is unavailable, respect the LLM's converged judgment
+            # instead of forcing converged=False
+            score_note = ""
+            if score is None:
+                score_note = " (置信度不可用，基于LLM判断)"
 
             return ConvergenceResult(
                 converged=converged,
                 score=score if score is not None else 0.0,
-                reason=data.get("reason", "") + (" (置信度不可用)" if score is None else ""),
+                reason=data.get("reason", "") + score_note,
                 agreements=data.get("agreements", []),
                 disagreements=data.get("disagreements", []),
             )

@@ -215,7 +215,6 @@ export default function Arena() {
               {status === 'streaming' && (
                 <ProgressBar
                   startedAt={progress.startedAt}
-                  currentPhaseStartedAt={progress.currentPhaseStartedAt}
                   completedSteps={progress.completedSteps}
                   estimatedTotalSteps={progress.estimatedTotalSteps}
                   currentStepProgress={progress.currentStepProgress}

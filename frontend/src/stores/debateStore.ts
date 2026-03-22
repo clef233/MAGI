@@ -294,31 +294,9 @@ export const useDebateStore = create<DebateState>((set, get) => ({
               eventSource = null
             }
 
-            // Re-create EventSource - the existing event listeners from
-            // the outer streamDebate call are lost, so we need a fresh call.
-            // But we must preserve accumulated state.
-            // Strategy: save state, call streamDebate, restore state
-            const preserved = {
-              phaseHistory: get().phaseHistory,
-              currentPhaseRecord: get().currentPhaseRecord,
-              currentPhase: get().currentPhase,
-              currentRound: get().currentRound,
-              currentCycle: get().currentCycle,
-              convergenceResult: get().convergenceResult,
-              semanticComparisons: get().semanticComparisons,
-              questionIntent: get().questionIntent,
-              progress: get().progress,
-              currentSession: get().currentSession,
-            }
-
-            // streamDebate will reset and recreate EventSource + listeners
-            get().streamDebate(sid)
-
-            // Immediately restore accumulated state
-            // Use queueMicrotask to ensure this runs after streamDebate's synchronous set()
-            queueMicrotask(() => {
-              set(preserved)
-            })
+            // Re-create EventSource with preserveState flag
+            // This avoids resetting accumulated state
+            get().streamDebate(sid, { preserveState: true })
           }
         }, delay)
       } else {

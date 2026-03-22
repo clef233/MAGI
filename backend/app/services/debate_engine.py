@@ -1021,6 +1021,22 @@ class DebateEngine:
 
         actor_answer_blocks = self.prompt_service.build_latest_answer_blocks(actor_answers)
 
+        # Build review summary: extract key critiques from review rounds
+        review_summary_parts = []
+        for actor in self.actors:
+            responses = self.actor_responses.get(actor.id, [])
+            for r in responses:
+                if r.get("role") == "review":
+                    # Truncate long reviews to save tokens
+                    content = r["content"]
+                    if len(content) > 1500:
+                        content = content[:1500] + "\n...(已截断)"
+                    review_summary_parts.append(f"**{actor.name} 的互评意见：**\n{content}")
+
+        review_context = ""
+        if review_summary_parts:
+            review_context = "\n\n## 互评中的关键批评与反馈\n\n" + "\n\n---\n\n".join(review_summary_parts)
+
         # Build convergence info
         convergence_info = ""
         if convergence_result:
@@ -1039,6 +1055,11 @@ class DebateEngine:
 分析理由: {convergence_result.reason}
 """
 
+        # Combine convergence_info with review_context
+        full_context = convergence_info
+        if review_context:
+            full_context += "\n" + review_context
+
         # Create DB round for final_answer
         final_round = DBRound(
             session_id=self.session.id,
@@ -1056,7 +1077,7 @@ class DebateEngine:
             question=self.session.question,
             self_actor_name=judge.name,
             actor_answer_blocks=actor_answer_blocks,
-            convergence_info=convergence_info,
+            convergence_info=full_context,
         )
 
         # Emit actor_start with judge's info
