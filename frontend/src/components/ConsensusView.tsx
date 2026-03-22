@@ -43,11 +43,13 @@ export default function ConsensusView({ consensus }: ConsensusViewProps) {
       </div>
 
       <div className="p-6 space-y-6">
-        {/* Summary */}
-        <div>
-          <h4 className="text-text-secondary text-sm mb-2">Summary</h4>
-          <MarkdownBlock content={consensus.summary} />
-        </div>
+        {/* Summary - only show if it's significantly different from final_answer content */}
+        {consensus.summary && consensus.summary.length < 500 && (
+          <div>
+            <h4 className="text-text-secondary text-sm mb-2">概要</h4>
+            <MarkdownBlock content={consensus.summary} />
+          </div>
+        )}
 
         {/* Agreements */}
         {consensus.agreements.length > 0 && (

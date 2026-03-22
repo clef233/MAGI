@@ -22,23 +22,23 @@ const phaseInfo: Record<string, { label: string; explanation: string }> = {
     explanation: '模型正在根据批评修正观点',
   },
   semantic_pending: {
-    label: '语义图谱构建中',
+    label: '語義図譜構築中',
     explanation: '系统正在提炼核心共识与分歧维度',
   },
   final_answer: {
-    label: '最终回答生成中',
+    label: '最終回答生成中',
     explanation: '总结模型正在整合多方观点',
   },
   summary: {
-    label: '共识裁决中',
+    label: '共識裁決中',
     explanation: '系统正在生成结构化共识报告',
   },
   completed: {
-    label: '决议完成',
+    label: '決議完了',
     explanation: '本次互评已完成',
   },
   error: {
-    label: '系统异常',
+    label: '系統異常',
     explanation: '本次流程发生错误',
   },
 }
@@ -55,7 +55,6 @@ interface MiniMagiMonitorProps {
   semanticComparisons?: Map<string, unknown[]>
 }
 
-// Derive node state from real data
 function getNodeState(
   actorId: string,
   phaseRecord: LivePhaseRecord | null,
@@ -63,42 +62,21 @@ function getNodeState(
   currentPhase: string,
   status: string
 ): NodeState {
-  // If error state
-  if (status === 'error') {
-    return 'error'
-  }
+  if (status === 'error') return 'error'
+  if (status === 'completed') return 'done'
+  if (status === 'connecting') return 'idle'
+  if (status !== 'streaming' || !phaseRecord) return 'idle'
 
-  // If completed
-  if (status === 'completed') {
-    return 'done'
-  }
-
-  // If connecting
-  if (status === 'connecting') {
-    return 'idle'
-  }
-
-  // If not streaming or no phase record
-  if (status !== 'streaming' || !phaseRecord) {
-    return 'idle'
-  }
-
-  // For judge in final_answer or summary phase
   if (isJudge && (currentPhase === 'final_answer' || currentPhase === 'summary')) {
     const judgeMessage = phaseRecord.messages[actorId]
     if (judgeMessage) {
       return judgeMessage.status === 'streaming' ? 'judge_active' : 'done'
     }
-    // Judge hasn't started yet but we're in its phase
     return 'judge_active'
   }
 
-  // For non-judge actors
   const message = phaseRecord.messages[actorId]
-  if (!message) {
-    return 'idle'
-  }
-
+  if (!message) return 'idle'
   return message.status === 'streaming' ? 'thinking' : 'done'
 }
 
@@ -110,66 +88,49 @@ export default function MiniMagiMonitor({
   actors,
   judgeActor,
 }: MiniMagiMonitorProps) {
-  // Get non-judge actors
   const debateActors = useMemo(() => {
     return actors.filter(a => !a.is_meta_judge)
   }, [actors])
 
-  // Determine current phase info
   const phaseData = useMemo(() => {
-    // Check if we should show semantic pending state
-    // This happens when:
-    // 1. Current phase is initial or revision
-    // 2. Phase has ended (no actors streaming)
-    // 3. No semantic data yet
-    // 4. Status is still streaming
-
     const isWaitingForSemantic =
       status === 'streaming' &&
       ['initial', 'revision'].includes(currentPhase) &&
       currentPhaseRecord &&
       Object.values(currentPhaseRecord.messages).every(m => m.status === 'done')
 
-    if (isWaitingForSemantic) {
-      return phaseInfo['semantic_pending']
-    }
-
-    if (status === 'connecting') {
-      return phaseInfo['connecting']
-    }
-
-    if (status === 'error') {
-      return phaseInfo['error']
-    }
-
-    if (status === 'completed') {
-      return phaseInfo['completed']
-    }
-
+    if (isWaitingForSemantic) return phaseInfo['semantic_pending']
+    if (status === 'connecting') return phaseInfo['connecting']
+    if (status === 'error') return phaseInfo['error']
+    if (status === 'completed') return phaseInfo['completed']
     return phaseInfo[currentPhase] || { label: currentPhase, explanation: '' }
   }, [status, currentPhase, currentPhaseRecord])
 
-  // Get actor names for display
+  // Support 2 or 3 actors
   const actorA = debateActors[0]
   const actorB = debateActors[1]
+  const actorC = debateActors[2] || null // nullable third actor
 
-  // Calculate node states
+  const judgeState = useMemo(() => {
+    if (!judgeActor) return 'idle' as NodeState
+    return getNodeState(judgeActor.id, currentPhaseRecord, true, currentPhase, status)
+  }, [judgeActor, currentPhaseRecord, currentPhase, status])
+
   const actorAState = useMemo(() => {
-    if (!actorA) return 'idle'
+    if (!actorA) return 'idle' as NodeState
     return getNodeState(actorA.id, currentPhaseRecord, false, currentPhase, status)
   }, [actorA, currentPhaseRecord, currentPhase, status])
 
   const actorBState = useMemo(() => {
-    if (!actorB) return 'idle'
+    if (!actorB) return 'idle' as NodeState
     return getNodeState(actorB.id, currentPhaseRecord, false, currentPhase, status)
   }, [actorB, currentPhaseRecord, currentPhase, status])
 
-  const judgeState = useMemo(() => {
-    if (!judgeActor) return 'idle'
-    return getNodeState(judgeActor.id, currentPhaseRecord, true, currentPhase, status)
-  }, [judgeActor, currentPhaseRecord, currentPhase, status])
+  const actorCState = useMemo(() => {
+    if (!actorC) return 'idle' as NodeState
+    return getNodeState(actorC.id, currentPhaseRecord, false, currentPhase, status)
+  }, [actorC, currentPhaseRecord, currentPhase, status])
 
-  // Count completed actors in current phase
   const completedCount = useMemo(() => {
     if (!currentPhaseRecord) return 0
     return Object.values(currentPhaseRecord.messages).filter(m => m.status === 'done').length
@@ -180,196 +141,258 @@ export default function MiniMagiMonitor({
     return Object.keys(currentPhaseRecord.messages).length
   }, [currentPhaseRecord])
 
+  const isProcessing = status === 'streaming' || status === 'connecting'
+
+  // Derive judge label, actor labels
+  const judgeLabel = judgeActor ? judgeActor.name.slice(0, 10).toUpperCase() : 'JUDGE'
+  const actorALabel = actorA ? actorA.name.slice(0, 10).toUpperCase() : 'ACTOR A'
+  const actorBLabel = actorB ? actorB.name.slice(0, 10).toUpperCase() : 'ACTOR B'
+  const actorCLabel = actorC ? actorC.name.slice(0, 10).toUpperCase() : ''
+
+  // For 2 actors: classic MAGI triangle layout (judge top, A bottom-left, B bottom-right)
+  // For 3 actors: diamond layout (judge top, A left, B right, C bottom)
+
   return (
-    <div className="w-full bg-bg-secondary border-b border-border shrink-0">
+    <div className="h-full flex flex-col bg-[#000000] overflow-hidden">
+      {/* EVA font - loaded globally via globals.css, but ensure inline fallback */}
+      <style jsx global>{`
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Serif+JP:wght@900&display=swap');
+      `}</style>
       <style jsx>{`
-        .monitor-svg {
+        .magi-monitor-svg {
           font-family: 'Noto Serif JP', serif;
+          filter: drop-shadow(0 0 2px rgba(242, 102, 0, 0.4));
         }
-        .monitor-svg text {
+        .magi-monitor-svg text {
           font-weight: 900;
           user-select: none;
         }
         .node-stroke {
           fill: transparent;
-          stroke: var(--c-orange, #f26600);
-          stroke-width: 3;
+          stroke: #f26600;
+          stroke-width: 4;
           stroke-linejoin: miter;
         }
-        @keyframes pulse-blue {
-          0%, 100% { fill: rgba(84, 165, 217, 0.3); }
-          50% { fill: rgba(84, 165, 217, 0.6); }
+        .node-fill-base {
+          fill: transparent;
         }
-        @keyframes pulse-purple {
-          0%, 100% { fill: rgba(147, 51, 234, 0.3); }
-          50% { fill: rgba(147, 51, 234, 0.6); }
+        .header-text {
+          fill: #f26600;
+          letter-spacing: 0.1em;
         }
-        .state-thinking .node-fill {
-          fill: rgba(84, 165, 217, 0.5);
-          animation: pulse-blue 1.5s ease-in-out infinite;
+        .magi-text {
+          fill: #f26600;
+          letter-spacing: 0.25em;
         }
-        .state-thinking .node-text {
-          fill: #0a1f2e;
+        .node-text-base {
+          fill: transparent;
+          letter-spacing: 0.05em;
         }
-        .state-done .node-fill {
-          fill: rgba(103, 255, 140, 0.5);
+        .green-line {
+          stroke: #2b7a5f;
+          stroke-width: 3;
         }
-        .state-done .node-text {
-          fill: #0a1f2e;
+
+        /* --- State animations matching START.HTML exactly --- */
+        @keyframes flash-fill-blue {
+          0%, 49.9% { fill: #54a5d9; }
+          50%, 100% { fill: transparent; }
         }
-        .state-error .node-fill {
-          fill: rgba(227, 0, 0, 0.5);
+        @keyframes flash-text-dark {
+          0%, 49.9% { fill: #0a1f2e; }
+          50%, 100% { fill: transparent; }
         }
-        .state-error .node-text {
-          fill: #0a1f2e;
+        @keyframes flash-fill-purple {
+          0%, 49.9% { fill: #9333ea; }
+          50%, 100% { fill: transparent; }
         }
-        .state-judge_active .node-fill {
-          fill: rgba(147, 51, 234, 0.5);
-          animation: pulse-purple 1.5s ease-in-out infinite;
-        }
-        .state-judge_active .node-text {
-          fill: #0a1f2e;
-        }
-        @keyframes flash-status {
+        @keyframes flash-shingi {
           0%, 49.9% { fill: #fec200; stroke: #fec200; }
           50%, 100% { fill: rgba(254, 194, 0, 0.3); stroke: rgba(254, 194, 0, 0.3); }
         }
-        .status-active rect {
-          animation: flash-status 1s steps(1, end) infinite;
-        }
-        .status-active text {
-          animation: flash-status 1s steps(1, end) infinite;
-          stroke: none;
-        }
+
+        .state-thinking .node-fill { animation: flash-fill-blue 0.4s steps(1, end) infinite; }
+        .state-thinking .node-text { animation: flash-text-dark 0.4s steps(1, end) infinite; }
+
+        .state-done .node-fill { fill: #67ff8c; }
+        .state-done .node-text { fill: #0a1f2e; }
+
+        .state-error .node-fill { fill: #e30000; }
+        .state-error .node-text { fill: #0a1f2e; }
+
+        .state-judge_active .node-fill { animation: flash-fill-purple 0.4s steps(1, end) infinite; }
+        .state-judge_active .node-text { animation: flash-text-dark 0.4s steps(1, end) infinite; }
+
+        .shingi-box { opacity: 0; }
+        .shingi-box.active { opacity: 1; }
+        .shingi-box.active rect { animation: flash-shingi 1s steps(1, end) infinite; }
+        .shingi-box.active text { animation: flash-shingi 1s steps(1, end) infinite; stroke: none; }
       `}</style>
 
-      {/* Header with phase label */}
-      <div className="px-3 py-2 border-b border-border flex items-center justify-between">
-        <span className="text-xs text-accent-orange font-medium tracking-wider">MAGI</span>
-        <span className="text-xs text-text-secondary">{phaseData.label}</span>
-      </div>
-
-      {/* SVG Monitor */}
-      <div className="px-2 py-2">
+      {/* SVG Monitor - faithful reproduction of START.HTML layout */}
+      <div className="flex-1 flex items-center justify-center p-2">
         <svg
-          className="monitor-svg w-full"
-          viewBox="0 0 300 140"
+          className="magi-monitor-svg w-full h-full"
+          viewBox="0 0 960 540"
           preserveAspectRatio="xMidYMid meet"
         >
-          {/* Connection lines */}
-          <g stroke="#f26600" strokeWidth="4" opacity="0.6">
-            <line x1="150" y1="85" x2="185" y2="110" />
-            <line x1="150" y1="85" x2="115" y2="110" />
+          <defs>
+            <pattern id="mini-scanline" patternUnits="userSpaceOnUse" width="4" height="4">
+              <line x1="0" y1="0" x2="4" y2="0" stroke="rgba(0,0,0,0.15)" strokeWidth="2" />
+            </pattern>
+          </defs>
+
+          {/* Double border frame (from START.HTML) */}
+          <rect x="20" y="20" width="920" height="500" stroke="#f26600" strokeWidth="1.5" fill="none" />
+          <rect x="35" y="35" width="890" height="470" stroke="#f26600" strokeWidth="4" fill="none" />
+
+          {/* Left header: 提訴 */}
+          <g transform="translate(90, 80)">
+            <line x1="0" y1="0" x2="200" y2="0" className="green-line" />
+            <line x1="0" y1="8" x2="200" y2="8" className="green-line" />
+            <text x="100" y="80" fontSize="70" textAnchor="middle" className="header-text">提訴</text>
+            <line x1="0" y1="100" x2="200" y2="100" className="green-line" />
+            <line x1="0" y1="108" x2="200" y2="108" className="green-line" />
           </g>
 
-          {/* Center MAGI label */}
-          <text x="150" y="65" textAnchor="middle" fill="#f26600" fontSize="14" letterSpacing="0.15em">
-            MAGI
-          </text>
-
-          {/* Judge node (top) */}
-          <g className={`state-${judgeState}`} transform="translate(100, 10)">
-            <polygon
-              className="node-fill"
-              points="50,0 100,0 100,35 85,50 65,50 50,35"
-              fill="transparent"
-            />
-            <polygon
-              className="node-stroke"
-              points="50,0 100,0 100,35 85,50 65,50 50,35"
-            />
-            <text
-              x="75"
-              y="30"
-              textAnchor="middle"
-              className="node-text"
-              fontSize="10"
-              fill="transparent"
-            >
-              {judgeActor ? judgeActor.name.slice(0, 6).toUpperCase() : 'JUDGE'}
-            </text>
+          {/* Right header: 決議 */}
+          <g transform="translate(670, 80)">
+            <line x1="0" y1="0" x2="200" y2="0" className="green-line" />
+            <line x1="0" y1="8" x2="200" y2="8" className="green-line" />
+            <text x="100" y="80" fontSize="70" textAnchor="middle" className="header-text">決議</text>
+            <line x1="0" y1="100" x2="200" y2="100" className="green-line" />
+            <line x1="0" y1="108" x2="200" y2="108" className="green-line" />
           </g>
 
-          {/* Actor A node (bottom left) */}
-          <g className={`state-${actorAState}`} transform="translate(20, 85)">
-            <polygon
-              className="node-fill"
-              points="0,0 80,0 80,30 70,45 10,45 0,30"
-              fill="transparent"
-            />
-            <polygon
-              className="node-stroke"
-              points="0,0 80,0 80,30 70,45 10,45 0,30"
-            />
-            <text
-              x="40"
-              y="28"
-              textAnchor="middle"
-              className="node-text"
-              fontSize="9"
-              fill="transparent"
-            >
-              {actorA ? actorA.name.slice(0, 8).toUpperCase() : 'ACTOR A'}
-            </text>
-          </g>
-
-          {/* Actor B node (bottom right) */}
-          <g className={`state-${actorBState}`} transform="translate(200, 85)">
-            <polygon
-              className="node-fill"
-              points="0,0 80,0 80,30 70,45 10,45 0,30"
-              fill="transparent"
-            />
-            <polygon
-              className="node-stroke"
-              points="0,0 80,0 80,30 70,45 10,45 0,30"
-            />
-            <text
-              x="40"
-              y="28"
-              textAnchor="middle"
-              className="node-text"
-              fontSize="9"
-              fill="transparent"
-            >
-              {actorB ? actorB.name.slice(0, 8).toUpperCase() : 'ACTOR B'}
-            </text>
-          </g>
-
-          {/* Status box */}
+          {/* 審議中 box (top right) */}
           <g
-            className={`status-active`}
-            transform="translate(190, 10)"
-            style={{ opacity: status === 'streaming' || status === 'connecting' ? 1 : 0.7 }}
+            className={`shingi-box${isProcessing ? ' active' : ''}`}
+            transform="translate(710, 210)"
           >
-            <rect
-              x="0"
-              y="0"
-              width="100"
-              height="28"
-              strokeWidth="2"
-              fill="none"
-              stroke="#fec200"
+            <rect x="0" y="0" width="120" height="40" strokeWidth="2" fill="none" />
+            <text x="60" y="29" fontSize="25" textAnchor="middle" letterSpacing="0.1em">審議中</text>
+          </g>
+
+          {/* Connection lines between MAGI center and bottom nodes (thick, like START.HTML) */}
+          <g stroke="#f26600" strokeWidth="15">
+            {/* Center to bottom-left */}
+            <line x1="388" y1="258" x2="363" y2="338" />
+            {/* Center to bottom-right */}
+            <line x1="573" y1="258" x2="598" y2="338" />
+            {/* Bottom horizontal */}
+            <line x1="425" y1="430" x2="535" y2="430" />
+          </g>
+
+          {/* MAGI text (center) */}
+          <text x="480" y="350" textAnchor="middle" className="magi-text" fontSize="24">MAGI</text>
+
+          {/* ===== JUDGE NODE (top center) ===== */}
+          {/* Hexagonal shape from START.HTML, scaled down */}
+          <g className={`state-${judgeState}`}>
+            <polygon
+              className="node-fill node-fill-base"
+              points="355,70 605,70 605,225 540,290 420,290 355,225"
+            />
+            <polygon
+              fill="url(#mini-scanline)"
+              points="355,70 605,70 605,225 540,290 420,290 355,225"
+            />
+            <polygon
+              className="node-stroke"
+              points="355,70 605,70 605,225 540,290 420,290 355,225"
             />
             <text
-              x="50"
-              y="18"
-              fontSize="11"
+              x="480"
+              y="195"
               textAnchor="middle"
-              fill="#fec200"
-              letterSpacing="0.05em"
+              className="node-text node-text-base"
+              fontSize="28"
             >
-              {status === 'completed' ? '完了' : status === 'error' ? '異常' : '処理中'}
+              {judgeLabel}
             </text>
           </g>
+
+          {/* ===== ACTOR A NODE (bottom left) ===== */}
+          <g className={`state-${actorAState}`}>
+            <polygon
+              className="node-fill node-fill-base"
+              points="125,275 300,275 425,400 425,470 125,470"
+            />
+            <polygon
+              fill="url(#mini-scanline)"
+              points="125,275 300,275 425,400 425,470 125,470"
+            />
+            <polygon
+              className="node-stroke"
+              points="125,275 300,275 425,400 425,470 125,470"
+            />
+            <text
+              x="250"
+              y="395"
+              textAnchor="middle"
+              className="node-text node-text-base"
+              fontSize="24"
+            >
+              {actorALabel}
+            </text>
+          </g>
+
+          {/* ===== ACTOR B NODE (bottom right) ===== */}
+          <g className={`state-${actorBState}`}>
+            <polygon
+              className="node-fill node-fill-base"
+              points="835,275 660,275 535,400 535,470 835,470"
+            />
+            <polygon
+              fill="url(#mini-scanline)"
+              points="835,275 660,275 535,400 535,470 835,470"
+            />
+            <polygon
+              className="node-stroke"
+              points="835,275 660,275 535,400 535,470 835,470"
+            />
+            <text
+              x="685"
+              y="395"
+              textAnchor="middle"
+              className="node-text node-text-base"
+              fontSize="24"
+            >
+              {actorBLabel}
+            </text>
+          </g>
+
+          {/* ===== ACTOR C NODE (optional, bottom center) ===== */}
+          {actorC && (
+            <g className={`state-${actorCState}`}>
+              <polygon
+                className="node-fill node-fill-base"
+                points="380,455 580,455 580,510 380,510"
+              />
+              <polygon
+                className="node-stroke"
+                points="380,455 580,455 580,510 380,510"
+              />
+              <text
+                x="480"
+                y="492"
+                textAnchor="middle"
+                className="node-text node-text-base"
+                fontSize="18"
+              >
+                {actorCLabel}
+              </text>
+            </g>
+          )}
         </svg>
       </div>
 
-      {/* Phase explanation */}
-      <div className="px-3 pb-2">
-        <p className="text-xs text-text-tertiary text-center">{phaseData.explanation}</p>
+      {/* Phase status bar */}
+      <div className="px-3 py-2 border-t border-[#f26600]/30 text-center">
+        <p className="text-xs text-[#f26600] font-medium tracking-wider">{phaseData.label}</p>
+        <p className="text-xs text-[#86868B] mt-0.5">{phaseData.explanation}</p>
         {status === 'streaming' && totalActors > 0 && (
-          <p className="text-xs text-text-tertiary text-center mt-1">
+          <p className="text-xs text-[#56565A] mt-0.5">
             {completedCount}/{totalActors} 模型完成
           </p>
         )}

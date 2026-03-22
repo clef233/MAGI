@@ -713,6 +713,9 @@ class DebateEngine:
         """
         Run semantic analysis on the latest responses with parallel execution.
 
+        IMPORTANT: Uses an independent database session to avoid concurrent
+        access issues with the main debate flow's session.
+
         This method:
         1. Analyzes question intent (first time only)
         2. Extracts semantic topics from each actor's response (parallel)
@@ -726,208 +729,217 @@ class DebateEngine:
         """
         logger.info(f"Running semantic analysis for round {round_number}, phase {phase}, cycle {cycle}")
 
-        try:
-            # Get judge actor for semantic analysis
-            result = await self.db.execute(
-                select(Actor).where(Actor.id == self.session.judge_actor_id)
-            )
-            judge = result.scalar_one_or_none()
+        # Use independent db session to avoid SQLAlchemy concurrent access issues
+        from app.services.database import async_session_factory
+        async with async_session_factory() as bg_db:
+            # Create independent PromptService and SemanticService for this background task
+            bg_prompt_service = PromptService(bg_db)
+            await bg_prompt_service.load_templates()
+            await bg_prompt_service.load_presets()
+            bg_semantic_service = SemanticService(bg_db, bg_prompt_service)
 
-            if not judge:
-                logger.warning("Judge actor not found for semantic analysis, skipping")
-                return
+            try:
+                # Get judge actor for semantic analysis
+                result = await bg_db.execute(
+                    select(Actor).where(Actor.id == self.session.judge_actor_id)
+                )
+                judge = result.scalar_one_or_none()
 
-            adapter = self.get_adapter(judge)
+                if not judge:
+                    logger.warning("Judge actor not found for semantic analysis, skipping")
+                    return
 
-            # Step 1: Analyze question intent (only once) - with timeout
-            if not self.question_intent:
-                logger.info("Analyzing question intent...")
-                try:
-                    self.question_intent = await asyncio.wait_for(
-                        self.semantic_service.analyze_question_intent(
-                            question=self.session.question,
-                            adapter=adapter,
-                        ),
-                        timeout=60.0  # 60 second timeout
-                    )
-                    # Save to database
-                    await self.semantic_service.save_question_intent(
-                        session_id=self.session.id,
-                        result=self.question_intent,
-                    )
-                    logger.info(f"Question intent analyzed: {len(self.question_intent.comparison_axes)} axes")
-                except asyncio.TimeoutError:
-                    logger.warning("Question intent analysis timed out, using defaults")
-                    # Use default comparison axes
-                    self.question_intent = type('QuestionIntentResult', (), {
-                        'question_type': 'general',
-                        'user_goal': '',
-                        'time_horizons': [],
-                        'comparison_axes': [
-                            {"axis_id": "main_topic", "label": "核心观点"},
-                            {"axis_id": "approach", "label": "解决思路"},
-                        ]
-                    })()
-                except Exception as e:
-                    logger.error(f"Question intent analysis failed: {e}")
-                    # Use default comparison axes
-                    self.question_intent = type('QuestionIntentResult', (), {
-                        'question_type': 'general',
-                        'user_goal': '',
-                        'time_horizons': [],
-                        'comparison_axes': [
-                            {"axis_id": "main_topic", "label": "核心观点"},
-                            {"axis_id": "approach", "label": "解决思路"},
-                        ]
-                    })()
+                adapter = self.get_adapter(judge)
 
-            # Step 2: Extract semantic topics from each actor's latest response (parallel)
-            latest_answers = {}
-            for actor in self.actors:
-                responses = self.actor_responses.get(actor.id, [])
-                for r in reversed(responses):
-                    if r.get("role") in ["answer", "revision"]:
-                        latest_answers[actor.id] = r["content"]
-                        break
+                # Step 1: Analyze question intent (only once) - with timeout
+                if not self.question_intent:
+                    logger.info("Analyzing question intent...")
+                    try:
+                        self.question_intent = await asyncio.wait_for(
+                            bg_semantic_service.analyze_question_intent(
+                                question=self.session.question,
+                                adapter=adapter,
+                            ),
+                            timeout=60.0  # 60 second timeout
+                        )
+                        # Save to database
+                        await bg_semantic_service.save_question_intent(
+                            session_id=self.session.id,
+                            result=self.question_intent,
+                        )
+                        logger.info(f"Question intent analyzed: {len(self.question_intent.comparison_axes)} axes")
+                    except asyncio.TimeoutError:
+                        logger.warning("Question intent analysis timed out, using defaults")
+                        # Use default comparison axes
+                        self.question_intent = type('QuestionIntentResult', (), {
+                            'question_type': 'general',
+                            'user_goal': '',
+                            'time_horizons': [],
+                            'comparison_axes': [
+                                {"axis_id": "main_topic", "label": "核心观点"},
+                                {"axis_id": "approach", "label": "解决思路"},
+                            ]
+                        })()
+                    except Exception as e:
+                        logger.error(f"Question intent analysis failed: {e}")
+                        # Use default comparison axes
+                        self.question_intent = type('QuestionIntentResult', (), {
+                            'question_type': 'general',
+                            'user_goal': '',
+                            'time_horizons': [],
+                            'comparison_axes': [
+                                {"axis_id": "main_topic", "label": "核心观点"},
+                                {"axis_id": "approach", "label": "解决思路"},
+                            ]
+                        })()
 
-            if not latest_answers:
-                logger.warning("No answers found for semantic analysis")
-                return
+                # Step 2: Extract semantic topics from each actor's latest response (parallel)
+                latest_answers = {}
+                for actor in self.actors:
+                    responses = self.actor_responses.get(actor.id, [])
+                    for r in reversed(responses):
+                        if r.get("role") in ["answer", "revision"]:
+                            latest_answers[actor.id] = r["content"]
+                            break
 
-            # Parallel topic extraction using asyncio.gather with timeout
-            async def extract_topics_for_actor(actor: Actor):
-                content = latest_answers.get(actor.id, "")
-                if not content:
-                    return actor.id, []
+                if not latest_answers:
+                    logger.warning("No answers found for semantic analysis")
+                    return
 
-                logger.info(f"Extracting topics for actor {actor.name}...")
-                try:
-                    topics = await asyncio.wait_for(
-                        self.semantic_service.extract_semantic_topics(
-                            question=self.session.question,
-                            answer=content,
-                            comparison_axes=self.question_intent.comparison_axes,
-                            actor_id=actor.id,
-                            adapter=adapter,
-                        ),
-                        timeout=30.0  # 30 second timeout per actor
-                    )
-                    return actor.id, topics
-                except asyncio.TimeoutError:
-                    logger.warning(f"Topic extraction timed out for actor {actor.name}")
-                    return actor.id, []
-                except Exception as e:
-                    logger.error(f"Topic extraction failed for actor {actor.name}: {e}")
-                    return actor.id, []
+                # Parallel topic extraction using asyncio.gather with timeout
+                async def extract_topics_for_actor(actor: Actor):
+                    content = latest_answers.get(actor.id, "")
+                    if not content:
+                        return actor.id, []
 
-            extraction_tasks = [extract_topics_for_actor(actor) for actor in self.actors]
-            extraction_results = await asyncio.gather(*extraction_tasks, return_exceptions=True)
+                    logger.info(f"Extracting topics for actor {actor.name}...")
+                    try:
+                        topics = await asyncio.wait_for(
+                            bg_semantic_service.extract_semantic_topics(
+                                question=self.session.question,
+                                answer=content,
+                                comparison_axes=self.question_intent.comparison_axes,
+                                actor_id=actor.id,
+                                adapter=adapter,
+                            ),
+                            timeout=30.0  # 30 second timeout per actor
+                        )
+                        return actor.id, topics
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Topic extraction timed out for actor {actor.name}")
+                        return actor.id, []
+                    except Exception as e:
+                        logger.error(f"Topic extraction failed for actor {actor.name}: {e}")
+                        return actor.id, []
 
-            topics_by_actor = {}
-            for result in extraction_results:
-                if isinstance(result, tuple):
-                    actor_id, topics = result
-                    topics_by_actor[actor_id] = topics
-                    # Save to database
-                    if topics:
-                        try:
-                            await self.semantic_service.save_semantic_topics(
+                extraction_tasks = [extract_topics_for_actor(actor) for actor in self.actors]
+                extraction_results = await asyncio.gather(*extraction_tasks, return_exceptions=True)
+
+                topics_by_actor = {}
+                for result in extraction_results:
+                    if isinstance(result, tuple):
+                        actor_id, topics = result
+                        topics_by_actor[actor_id] = topics
+                        # Save to database
+                        if topics:
+                            try:
+                                await bg_semantic_service.save_semantic_topics(
+                                    session_id=self.session.id,
+                                    round_number=round_number,
+                                    phase=phase,
+                                    actor_id=actor_id,
+                                    topics=topics,
+                                    cycle=cycle,
+                                )
+                            except Exception as e:
+                                logger.error(f"Failed to save semantic topics: {e}")
+                    elif isinstance(result, Exception):
+                        logger.error(f"Topic extraction task failed: {result}")
+
+                # Step 3: Compare topics across actors
+                if len(topics_by_actor) >= 2:
+                    logger.info("Comparing topics across actors...")
+                    try:
+                        comparisons = await asyncio.wait_for(
+                            bg_semantic_service.compare_actors(
+                                question=self.session.question,
+                                topics_by_actor=topics_by_actor,
+                                actors=self.actors,
+                                adapter=adapter,
+                            ),
+                            timeout=60.0  # 60 second timeout
+                        )
+
+                        # Save to database
+                        if comparisons:
+                            await bg_semantic_service.save_semantic_comparisons(
                                 session_id=self.session.id,
                                 round_number=round_number,
                                 phase=phase,
-                                actor_id=actor_id,
-                                topics=topics,
+                                comparisons=comparisons,
                                 cycle=cycle,
                             )
-                        except Exception as e:
-                            logger.error(f"Failed to save semantic topics: {e}")
-                elif isinstance(result, Exception):
-                    logger.error(f"Topic extraction task failed: {result}")
 
-            # Step 3: Compare topics across actors
-            if len(topics_by_actor) >= 2:
-                logger.info("Comparing topics across actors...")
-                try:
-                    comparisons = await asyncio.wait_for(
-                        self.semantic_service.compare_actors(
-                            question=self.session.question,
-                            topics_by_actor=topics_by_actor,
-                            actors=self.actors,
-                            adapter=adapter,
-                        ),
-                        timeout=60.0  # 60 second timeout
-                    )
+                        self.latest_semantic_comparisons = comparisons
 
-                    # Save to database
-                    if comparisons:
-                        await self.semantic_service.save_semantic_comparisons(
-                            session_id=self.session.id,
-                            round_number=round_number,
-                            phase=phase,
-                            comparisons=comparisons,
-                            cycle=cycle,
-                        )
+                        # Emit semantic_comparison event with canonical phase_id
+                        phase_id = f"{round_number}:{phase}"
+                        if phase == "revision" and cycle:
+                            phase_id = f"{round_number}:{phase}:{cycle}"
 
-                    self.latest_semantic_comparisons = comparisons
+                        comparison_data = [
+                            {
+                                "topic_id": c.topic_id,
+                                "label": c.label,
+                                "salience": c.salience,
+                                "disagreement_score": c.disagreement_score,
+                                "status": c.status,
+                                "difference_types": c.difference_types,
+                                "agreement_summary": c.agreement_summary,
+                                "disagreement_summary": c.disagreement_summary,
+                                "actor_positions": [
+                                    {
+                                        "actor_id": p.actor_id,
+                                        "actor_name": p.actor_name,
+                                        "stance_label": p.stance_label,
+                                        "summary": p.summary,
+                                        "quotes": p.quotes,
+                                    }
+                                    for p in c.actor_positions
+                                ],
+                            }
+                            for c in comparisons
+                        ]
 
-                    # Emit semantic_comparison event with canonical phase_id
-                    phase_id = f"{round_number}:{phase}"
-                    if phase == "revision" and cycle:
-                        phase_id = f"{round_number}:{phase}:{cycle}"
+                        await self._emit({
+                            "event": "semantic_comparison",
+                            "data": {
+                                "phase_id": phase_id,
+                                "round_number": round_number,
+                                "phase": phase,
+                                "cycle": cycle,
+                                "question_intent": {
+                                    "question_type": self.question_intent.question_type,
+                                    "user_goal": self.question_intent.user_goal,
+                                    "time_horizons": self.question_intent.time_horizons,
+                                    "comparison_axes": self.question_intent.comparison_axes,
+                                },
+                                "comparisons": comparison_data,
+                            }
+                        })
 
-                    comparison_data = [
-                        {
-                            "topic_id": c.topic_id,
-                            "label": c.label,
-                            "salience": c.salience,
-                            "disagreement_score": c.disagreement_score,
-                            "status": c.status,
-                            "difference_types": c.difference_types,
-                            "agreement_summary": c.agreement_summary,
-                            "disagreement_summary": c.disagreement_summary,
-                            "actor_positions": [
-                                {
-                                    "actor_id": p.actor_id,
-                                    "actor_name": p.actor_name,
-                                    "stance_label": p.stance_label,
-                                    "summary": p.summary,
-                                    "quotes": p.quotes,
-                                }
-                                for p in c.actor_positions
-                            ],
-                        }
-                        for c in comparisons
-                    ]
+                        logger.info(f"Semantic analysis complete: {len(comparisons)} topics analyzed")
 
-                    await self._emit({
-                        "event": "semantic_comparison",
-                        "data": {
-                            "phase_id": phase_id,
-                            "round_number": round_number,
-                            "phase": phase,
-                            "cycle": cycle,
-                            "question_intent": {
-                                "question_type": self.question_intent.question_type,
-                                "user_goal": self.question_intent.user_goal,
-                                "time_horizons": self.question_intent.time_horizons,
-                                "comparison_axes": self.question_intent.comparison_axes,
-                            },
-                            "comparisons": comparison_data,
-                        }
-                    })
+                    except asyncio.TimeoutError:
+                        logger.warning("Topic comparison timed out")
+                    except Exception as e:
+                        logger.error(f"Topic comparison failed: {e}")
+                else:
+                    logger.info(f"Not enough actors with topics ({len(topics_by_actor)}), skipping comparison")
 
-                    logger.info(f"Semantic analysis complete: {len(comparisons)} topics analyzed")
-
-                except asyncio.TimeoutError:
-                    logger.warning("Topic comparison timed out")
-                except Exception as e:
-                    logger.error(f"Topic comparison failed: {e}")
-            else:
-                logger.info(f"Not enough actors with topics ({len(topics_by_actor)}), skipping comparison")
-
-        except Exception as e:
-            logger.error(f"Semantic analysis failed: {e}", exc_info=True)
-            # Don't fail the debate if semantic analysis fails
+            except Exception as e:
+                logger.error(f"Semantic analysis failed: {e}", exc_info=True)
+                # Don't fail the debate if semantic analysis fails
 
     async def _run_final_answer_phase(self, convergence_result: Optional[ConvergenceResult] = None):
         """Run final answer phase where judge outputs a user-facing final answer."""

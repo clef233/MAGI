@@ -47,6 +47,7 @@ interface DebateState {
   startDebate: (question: string, actorIds: string[], judgeActorId: string, config?: { max_rounds?: number }) => Promise<string>
   streamDebate: (sessionId: string) => void
   stopDebate: () => Promise<void>
+  disconnectStream: () => void
 
   setSession: (session: DebateSession) => void
   addToken: (actorId: string, content: string) => void
@@ -62,6 +63,10 @@ interface DebateState {
 
 let eventSource: EventSource | null = null
 let expectedClose = false  // Flag to track expected connection close
+let reconnectAttempt = 0
+let reconnectTimeoutId: ReturnType<typeof setTimeout> | null = null
+const MAX_RECONNECT_ATTEMPTS = 5
+const BASE_RECONNECT_DELAY = 1000 // 1 second
 
 // Token batching for performance optimization
 // Instead of updating Zustand state on every token, we buffer tokens and flush periodically
@@ -209,25 +214,57 @@ export const useDebateStore = create<DebateState>((set, get) => ({
 
     eventSource.onopen = () => {
       console.log('[SSE] Connection opened')
-      set({ status: 'streaming' })
+      reconnectAttempt = 0  // Reset reconnect counter on successful connection
+      set({ status: 'streaming', error: null })
     }
 
     eventSource.onerror = () => {
       console.error('[SSE] Native error')
-      // Check if this is an expected close (normal completion or manual stop)
       if (expectedClose) {
         console.log('[SSE] Expected close, ignoring error')
         return
       }
-      // Check if current state is already completed/stopped
       const currentState = get().status
       if (currentState === 'completed' || currentState === 'idle') {
         console.log('[SSE] Already completed/stopped, ignoring error')
         return
       }
-      set({ status: 'error', error: 'Connection lost' })
+
+      // Close current connection
       eventSource?.close()
       eventSource = null
+
+      // Attempt reconnection with exponential backoff
+      if (reconnectAttempt < MAX_RECONNECT_ATTEMPTS) {
+        const delay = BASE_RECONNECT_DELAY * Math.pow(2, reconnectAttempt)
+        reconnectAttempt++
+        console.log(`[SSE] Reconnecting in ${delay}ms (attempt ${reconnectAttempt}/${MAX_RECONNECT_ATTEMPTS})`)
+        set({ error: `连接中断，${Math.round(delay / 1000)}秒后重连 (${reconnectAttempt}/${MAX_RECONNECT_ATTEMPTS})` })
+
+        reconnectTimeoutId = setTimeout(() => {
+          reconnectTimeoutId = null
+          const sid = get().currentSessionId
+          if (sid && get().status !== 'completed' && get().status !== 'idle') {
+            console.log(`[SSE] Reconnecting to session ${sid}...`)
+            // Re-create EventSource without resetting state
+            // We call streamDebate but need to preserve existing phaseHistory
+            // So we just re-create the EventSource manually
+            const preservedState = {
+              phaseHistory: get().phaseHistory,
+              currentPhaseRecord: get().currentPhaseRecord,
+              semanticComparisons: get().semanticComparisons,
+              questionIntent: get().questionIntent,
+              progress: get().progress,
+            }
+            get().streamDebate(sid)
+            // Restore preserved state after streamDebate resets it
+            set(preservedState)
+          }
+        }, delay)
+      } else {
+        console.error(`[SSE] Max reconnect attempts reached`)
+        set({ status: 'error', error: '连接丢失，已达最大重连次数。请刷新页面。' })
+      }
     }
 
     // New phase_start event - create a new phase record (DO NOT clear history)
@@ -724,6 +761,11 @@ export const useDebateStore = create<DebateState>((set, get) => ({
 
   stopDebate: async () => {
     expectedClose = true  // Mark as expected close
+    if (reconnectTimeoutId) {
+      clearTimeout(reconnectTimeoutId)
+      reconnectTimeoutId = null
+    }
+    reconnectAttempt = 0
     clearTokenBufferState()  // Clear token buffer
     if (eventSource) {
       eventSource.close()
@@ -740,6 +782,50 @@ export const useDebateStore = create<DebateState>((set, get) => ({
     }
 
     set({ status: 'idle', currentSessionId: null })
+  },
+
+  disconnectStream: () => {
+    // Only disconnect SSE, don't call backend stop API
+    // Backend task continues running, user can check result from History
+    expectedClose = true
+    if (reconnectTimeoutId) {
+      clearTimeout(reconnectTimeoutId)
+      reconnectTimeoutId = null
+    }
+    reconnectAttempt = 0
+    clearTokenBufferState()
+    if (eventSource) {
+      eventSource.close()
+      eventSource = null
+    }
+    set({
+      status: 'idle',
+      currentSessionId: null,
+      currentSession: null,
+      streamingContent: new Map(),
+      activeActors: new Set(),
+      currentRound: 0,
+      currentPhase: '',
+      currentCycle: 0,
+      convergenceResult: null,
+      phaseHistory: [],
+      currentPhaseRecord: null,
+      selectedDiffPhaseId: null,
+      questionIntent: null,
+      semanticComparisons: new Map(),
+      selectedTopicId: null,
+      error: null,
+      progress: {
+        startedAt: null,
+        currentPhaseStartedAt: null,
+        completedSteps: 0,
+        estimatedTotalSteps: 9,
+        currentStepProgress: 0,
+        phaseTimings: new Map(),
+        totalActorsInPhase: 0,
+        completedActorsInPhase: 0,
+      },
+    })
   },
 
   setSession: (session) => set({ currentSession: session }),
@@ -774,6 +860,11 @@ export const useDebateStore = create<DebateState>((set, get) => ({
   selectTopic: (topicId) => set({ selectedTopicId: topicId }),
   reset: () => {
     expectedClose = true  // Mark as expected close
+    if (reconnectTimeoutId) {
+      clearTimeout(reconnectTimeoutId)
+      reconnectTimeoutId = null
+    }
+    reconnectAttempt = 0
     clearTokenBufferState()  // Clear token buffer and timeout
     if (eventSource) {
       eventSource.close()

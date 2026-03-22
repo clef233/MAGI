@@ -1,6 +1,6 @@
 'use client'
 
-import { memo, useMemo, useRef, useEffect } from 'react'
+import { memo, useMemo, useRef, useEffect, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Actor, LivePhaseRecord, LiveMessage, ConvergenceData, Consensus } from '@/types'
 import ConsensusView from './ConsensusView'
@@ -166,13 +166,43 @@ export default function ReviewChatView({
   consensus,
 }: ReviewChatViewProps) {
   const scrollRef = useRef<HTMLDivElement>(null)
+  const [userHasScrolledUp, setUserHasScrolledUp] = useState(false)
+  const lastScrollTop = useRef(0)
 
-  // Auto-scroll to bottom when new content arrives
+  // Track user scroll intent
   useEffect(() => {
-    if (scrollRef.current && status === 'streaming') {
+    const el = scrollRef.current
+    if (!el) return
+
+    const handleScroll = () => {
+      const { scrollTop, scrollHeight, clientHeight } = el
+      const distanceFromBottom = scrollHeight - scrollTop - clientHeight
+      // If user scrolled up more than 80px from bottom, respect their intent
+      if (distanceFromBottom > 80) {
+        setUserHasScrolledUp(true)
+      } else {
+        setUserHasScrolledUp(false)
+      }
+      lastScrollTop.current = scrollTop
+    }
+
+    el.addEventListener('scroll', handleScroll, { passive: true })
+    return () => el.removeEventListener('scroll', handleScroll)
+  }, [])
+
+  // Auto-scroll only when user is near bottom
+  useEffect(() => {
+    if (scrollRef.current && status === 'streaming' && !userHasScrolledUp) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight
     }
-  }, [phaseHistory, status])
+  }, [phaseHistory, status, userHasScrolledUp])
+
+  // Reset scroll lock when status changes to non-streaming
+  useEffect(() => {
+    if (status !== 'streaming') {
+      setUserHasScrolledUp(false)
+    }
+  }, [status])
 
   // Build ordered messages from phase history
   // Filter out summary phase - it should only show via ConsensusView, not in chat stream
@@ -242,6 +272,23 @@ export default function ReviewChatView({
       {phases.length === 0 && status === 'streaming' && (
         <div className="text-center text-text-tertiary py-8">
           <div className="animate-pulse">等待响应...</div>
+        </div>
+      )}
+
+      {/* Jump to bottom button - only shows when user has scrolled up during streaming */}
+      {status === 'streaming' && userHasScrolledUp && (
+        <div className="sticky bottom-4 flex justify-center pointer-events-none">
+          <button
+            onClick={() => {
+              setUserHasScrolledUp(false)
+              if (scrollRef.current) {
+                scrollRef.current.scrollTop = scrollRef.current.scrollHeight
+              }
+            }}
+            className="pointer-events-auto px-4 py-2 bg-accent-blue/90 text-white text-sm rounded-full shadow-lg hover:bg-accent-blue transition-colors"
+          >
+            ↓ 跳到最新
+          </button>
         </div>
       )}
 

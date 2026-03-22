@@ -61,6 +61,7 @@ export default function Arena() {
   // Actions - stable references
   const startDebate = useDebateStore((state) => state.startDebate)
   const stopDebate = useDebateStore((state) => state.stopDebate)
+  const disconnectStream = useDebateStore((state) => state.disconnectStream)
   const reset = useDebateStore((state) => state.reset)
 
   const inputRef = useRef<HTMLTextAreaElement>(null)
@@ -93,9 +94,12 @@ export default function Arena() {
 
   const handleBackToArena = () => {
     if (status === 'streaming') {
-      stopDebate()
+      // Only disconnect SSE, don't call backend stop API
+      // Backend task continues running, user can check result from History
+      disconnectStream()
+    } else {
+      reset()
     }
-    reset()
     setView('arena')
     loadRecentSessions()
   }
@@ -132,12 +136,28 @@ export default function Arena() {
         {/* Header */}
         <header className="border-b border-border px-6 py-4 shrink-0">
           <div className="flex items-center justify-between max-w-[1600px] mx-auto">
-            <button
-              onClick={handleBackToArena}
-              className="text-text-secondary hover:text-text-primary transition-colors"
-            >
-              ← Back
-            </button>
+            <div className="flex items-center gap-3">
+              <button
+                onClick={handleBackToArena}
+                className="text-text-secondary hover:text-text-primary transition-colors"
+              >
+                ← Back
+              </button>
+              {status === 'streaming' && (
+                <button
+                  onClick={async () => {
+                    if (confirm('确定要终止当前任务吗？任务将无法恢复。')) {
+                      await stopDebate()
+                      setView('arena')
+                      loadRecentSessions()
+                    }
+                  }}
+                  className="px-3 py-1 text-xs bg-accent-red/20 text-accent-red rounded-lg hover:bg-accent-red/30 transition-colors"
+                >
+                  终止任务
+                </button>
+              )}
+            </div>
             <h1 className="text-lg font-semibold tracking-wider text-accent-orange">MAGI</h1>
             <div className="w-16" />
           </div>

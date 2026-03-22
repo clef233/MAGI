@@ -24,7 +24,7 @@ interface DebateViewProps {
   consensus?: Consensus | null  // Add consensus prop
 }
 
-type SidebarTab = 'semantic' | 'diff'
+type SidebarTab = 'monitor' | 'semantic' | 'diff'
 
 export default function DebateView({
   actors,
@@ -42,7 +42,7 @@ export default function DebateView({
   consensus,
 }: DebateViewProps) {
   // Sidebar tab state
-  const [sidebarTab, setSidebarTab] = useState<SidebarTab>('semantic')
+  const [sidebarTab, setSidebarTab] = useState<SidebarTab>('monitor')
 
   // Selected actors for diff comparison
   const [selectedBaseId, setSelectedBaseId] = useState<string | null>(null)
@@ -91,19 +91,18 @@ export default function DebateView({
 
       {/* Right sidebar with tabs - scrolls independently */}
       <div className="w-80 lg:w-[420px] shrink-0 border-l border-border flex flex-col">
-        {/* Mini MAGI Monitor - always visible at top */}
-        <MiniMagiMonitor
-          status={status as 'idle' | 'connecting' | 'streaming' | 'completed' | 'error'}
-          currentPhase={currentPhase}
-          currentPhaseRecord={currentPhaseRecord || null}
-          phaseHistory={phaseHistory}
-          actors={actors}
-          judgeActor={judgeActor}
-          semanticComparisons={semanticComparisons}
-        />
-
         {/* Tab header */}
         <div className="flex border-b border-border bg-bg-secondary shrink-0">
+          <button
+            onClick={() => setSidebarTab('monitor')}
+            className={`flex-1 px-4 py-2 text-xs font-medium transition-colors ${
+              sidebarTab === 'monitor'
+                ? 'text-accent-orange border-b-2 border-accent-orange'
+                : 'text-text-tertiary hover:text-text-secondary'
+            }`}
+          >
+            MAGI
+          </button>
           <button
             onClick={() => setSidebarTab('semantic')}
             className={`flex-1 px-4 py-2 text-xs font-medium transition-colors ${
@@ -128,7 +127,17 @@ export default function DebateView({
 
         {/* Tab content */}
         <div className="flex-1 overflow-hidden min-h-0">
-          {sidebarTab === 'semantic' ? (
+          {sidebarTab === 'monitor' ? (
+            <MiniMagiMonitor
+              status={status as 'idle' | 'connecting' | 'streaming' | 'completed' | 'error'}
+              currentPhase={currentPhase}
+              currentPhaseRecord={currentPhaseRecord || null}
+              phaseHistory={phaseHistory}
+              actors={actors}
+              judgeActor={judgeActor}
+              semanticComparisons={semanticComparisons}
+            />
+          ) : sidebarTab === 'semantic' ? (
             <SemanticSidebar
               phaseHistory={phaseHistory}
               semanticComparisons={semanticComparisons}

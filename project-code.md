@@ -1,6 +1,6 @@
 # Project: MAGI
 
-Generated: 2026-03-22 12:29:25
+Generated: 2026-03-22 13:24:04
 Root: D:\Projects\MAGI
 Files: 63
 
@@ -3328,6 +3328,9 @@ class DebateEngine:
         """
         Run semantic analysis on the latest responses with parallel execution.
 
+        IMPORTANT: Uses an independent database session to avoid concurrent
+        access issues with the main debate flow's session.
+
         This method:
         1. Analyzes question intent (first time only)
         2. Extracts semantic topics from each actor's response (parallel)
@@ -3341,208 +3344,217 @@ class DebateEngine:
         """
         logger.info(f"Running semantic analysis for round {round_number}, phase {phase}, cycle {cycle}")
 
-        try:
-            # Get judge actor for semantic analysis
-            result = await self.db.execute(
-                select(Actor).where(Actor.id == self.session.judge_actor_id)
-            )
-            judge = result.scalar_one_or_none()
+        # Use independent db session to avoid SQLAlchemy concurrent access issues
+        from app.services.database import async_session_factory
+        async with async_session_factory() as bg_db:
+            # Create independent PromptService and SemanticService for this background task
+            bg_prompt_service = PromptService(bg_db)
+            await bg_prompt_service.load_templates()
+            await bg_prompt_service.load_presets()
+            bg_semantic_service = SemanticService(bg_db, bg_prompt_service)
 
-            if not judge:
-                logger.warning("Judge actor not found for semantic analysis, skipping")
-                return
+            try:
+                # Get judge actor for semantic analysis
+                result = await bg_db.execute(
+                    select(Actor).where(Actor.id == self.session.judge_actor_id)
+                )
+                judge = result.scalar_one_or_none()
 
-            adapter = self.get_adapter(judge)
+                if not judge:
+                    logger.warning("Judge actor not found for semantic analysis, skipping")
+                    return
 
-            # Step 1: Analyze question intent (only once) - with timeout
-            if not self.question_intent:
-                logger.info("Analyzing question intent...")
-                try:
-                    self.question_intent = await asyncio.wait_for(
-                        self.semantic_service.analyze_question_intent(
-                            question=self.session.question,
-                            adapter=adapter,
-                        ),
-                        timeout=60.0  # 60 second timeout
-                    )
-                    # Save to database
-                    await self.semantic_service.save_question_intent(
-                        session_id=self.session.id,
-                        result=self.question_intent,
-                    )
-                    logger.info(f"Question intent analyzed: {len(self.question_intent.comparison_axes)} axes")
-                except asyncio.TimeoutError:
-                    logger.warning("Question intent analysis timed out, using defaults")
-                    # Use default comparison axes
-                    self.question_intent = type('QuestionIntentResult', (), {
-                        'question_type': 'general',
-                        'user_goal': '',
-                        'time_horizons': [],
-                        'comparison_axes': [
-                            {"axis_id": "main_topic", "label": "核心观点"},
-                            {"axis_id": "approach", "label": "解决思路"},
-                        ]
-                    })()
-                except Exception as e:
-                    logger.error(f"Question intent analysis failed: {e}")
-                    # Use default comparison axes
-                    self.question_intent = type('QuestionIntentResult', (), {
-                        'question_type': 'general',
-                        'user_goal': '',
-                        'time_horizons': [],
-                        'comparison_axes': [
-                            {"axis_id": "main_topic", "label": "核心观点"},
-                            {"axis_id": "approach", "label": "解决思路"},
-                        ]
-                    })()
+                adapter = self.get_adapter(judge)
 
-            # Step 2: Extract semantic topics from each actor's latest response (parallel)
-            latest_answers = {}
-            for actor in self.actors:
-                responses = self.actor_responses.get(actor.id, [])
-                for r in reversed(responses):
-                    if r.get("role") in ["answer", "revision"]:
-                        latest_answers[actor.id] = r["content"]
-                        break
+                # Step 1: Analyze question intent (only once) - with timeout
+                if not self.question_intent:
+                    logger.info("Analyzing question intent...")
+                    try:
+                        self.question_intent = await asyncio.wait_for(
+                            bg_semantic_service.analyze_question_intent(
+                                question=self.session.question,
+                                adapter=adapter,
+                            ),
+                            timeout=60.0  # 60 second timeout
+                        )
+                        # Save to database
+                        await bg_semantic_service.save_question_intent(
+                            session_id=self.session.id,
+                            result=self.question_intent,
+                        )
+                        logger.info(f"Question intent analyzed: {len(self.question_intent.comparison_axes)} axes")
+                    except asyncio.TimeoutError:
+                        logger.warning("Question intent analysis timed out, using defaults")
+                        # Use default comparison axes
+                        self.question_intent = type('QuestionIntentResult', (), {
+                            'question_type': 'general',
+                            'user_goal': '',
+                            'time_horizons': [],
+                            'comparison_axes': [
+                                {"axis_id": "main_topic", "label": "核心观点"},
+                                {"axis_id": "approach", "label": "解决思路"},
+                            ]
+                        })()
+                    except Exception as e:
+                        logger.error(f"Question intent analysis failed: {e}")
+                        # Use default comparison axes
+                        self.question_intent = type('QuestionIntentResult', (), {
+                            'question_type': 'general',
+                            'user_goal': '',
+                            'time_horizons': [],
+                            'comparison_axes': [
+                                {"axis_id": "main_topic", "label": "核心观点"},
+                                {"axis_id": "approach", "label": "解决思路"},
+                            ]
+                        })()
 
-            if not latest_answers:
-                logger.warning("No answers found for semantic analysis")
-                return
+                # Step 2: Extract semantic topics from each actor's latest response (parallel)
+                latest_answers = {}
+                for actor in self.actors:
+                    responses = self.actor_responses.get(actor.id, [])
+                    for r in reversed(responses):
+                        if r.get("role") in ["answer", "revision"]:
+                            latest_answers[actor.id] = r["content"]
+                            break
 
-            # Parallel topic extraction using asyncio.gather with timeout
-            async def extract_topics_for_actor(actor: Actor):
-                content = latest_answers.get(actor.id, "")
-                if not content:
-                    return actor.id, []
+                if not latest_answers:
+                    logger.warning("No answers found for semantic analysis")
+                    return
 
-                logger.info(f"Extracting topics for actor {actor.name}...")
-                try:
-                    topics = await asyncio.wait_for(
-                        self.semantic_service.extract_semantic_topics(
-                            question=self.session.question,
-                            answer=content,
-                            comparison_axes=self.question_intent.comparison_axes,
-                            actor_id=actor.id,
-                            adapter=adapter,
-                        ),
-                        timeout=30.0  # 30 second timeout per actor
-                    )
-                    return actor.id, topics
-                except asyncio.TimeoutError:
-                    logger.warning(f"Topic extraction timed out for actor {actor.name}")
-                    return actor.id, []
-                except Exception as e:
-                    logger.error(f"Topic extraction failed for actor {actor.name}: {e}")
-                    return actor.id, []
+                # Parallel topic extraction using asyncio.gather with timeout
+                async def extract_topics_for_actor(actor: Actor):
+                    content = latest_answers.get(actor.id, "")
+                    if not content:
+                        return actor.id, []
 
-            extraction_tasks = [extract_topics_for_actor(actor) for actor in self.actors]
-            extraction_results = await asyncio.gather(*extraction_tasks, return_exceptions=True)
+                    logger.info(f"Extracting topics for actor {actor.name}...")
+                    try:
+                        topics = await asyncio.wait_for(
+                            bg_semantic_service.extract_semantic_topics(
+                                question=self.session.question,
+                                answer=content,
+                                comparison_axes=self.question_intent.comparison_axes,
+                                actor_id=actor.id,
+                                adapter=adapter,
+                            ),
+                            timeout=30.0  # 30 second timeout per actor
+                        )
+                        return actor.id, topics
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Topic extraction timed out for actor {actor.name}")
+                        return actor.id, []
+                    except Exception as e:
+                        logger.error(f"Topic extraction failed for actor {actor.name}: {e}")
+                        return actor.id, []
 
-            topics_by_actor = {}
-            for result in extraction_results:
-                if isinstance(result, tuple):
-                    actor_id, topics = result
-                    topics_by_actor[actor_id] = topics
-                    # Save to database
-                    if topics:
-                        try:
-                            await self.semantic_service.save_semantic_topics(
+                extraction_tasks = [extract_topics_for_actor(actor) for actor in self.actors]
+                extraction_results = await asyncio.gather(*extraction_tasks, return_exceptions=True)
+
+                topics_by_actor = {}
+                for result in extraction_results:
+                    if isinstance(result, tuple):
+                        actor_id, topics = result
+                        topics_by_actor[actor_id] = topics
+                        # Save to database
+                        if topics:
+                            try:
+                                await bg_semantic_service.save_semantic_topics(
+                                    session_id=self.session.id,
+                                    round_number=round_number,
+                                    phase=phase,
+                                    actor_id=actor_id,
+                                    topics=topics,
+                                    cycle=cycle,
+                                )
+                            except Exception as e:
+                                logger.error(f"Failed to save semantic topics: {e}")
+                    elif isinstance(result, Exception):
+                        logger.error(f"Topic extraction task failed: {result}")
+
+                # Step 3: Compare topics across actors
+                if len(topics_by_actor) >= 2:
+                    logger.info("Comparing topics across actors...")
+                    try:
+                        comparisons = await asyncio.wait_for(
+                            bg_semantic_service.compare_actors(
+                                question=self.session.question,
+                                topics_by_actor=topics_by_actor,
+                                actors=self.actors,
+                                adapter=adapter,
+                            ),
+                            timeout=60.0  # 60 second timeout
+                        )
+
+                        # Save to database
+                        if comparisons:
+                            await bg_semantic_service.save_semantic_comparisons(
                                 session_id=self.session.id,
                                 round_number=round_number,
                                 phase=phase,
-                                actor_id=actor_id,
-                                topics=topics,
+                                comparisons=comparisons,
                                 cycle=cycle,
                             )
-                        except Exception as e:
-                            logger.error(f"Failed to save semantic topics: {e}")
-                elif isinstance(result, Exception):
-                    logger.error(f"Topic extraction task failed: {result}")
 
-            # Step 3: Compare topics across actors
-            if len(topics_by_actor) >= 2:
-                logger.info("Comparing topics across actors...")
-                try:
-                    comparisons = await asyncio.wait_for(
-                        self.semantic_service.compare_actors(
-                            question=self.session.question,
-                            topics_by_actor=topics_by_actor,
-                            actors=self.actors,
-                            adapter=adapter,
-                        ),
-                        timeout=60.0  # 60 second timeout
-                    )
+                        self.latest_semantic_comparisons = comparisons
 
-                    # Save to database
-                    if comparisons:
-                        await self.semantic_service.save_semantic_comparisons(
-                            session_id=self.session.id,
-                            round_number=round_number,
-                            phase=phase,
-                            comparisons=comparisons,
-                            cycle=cycle,
-                        )
+                        # Emit semantic_comparison event with canonical phase_id
+                        phase_id = f"{round_number}:{phase}"
+                        if phase == "revision" and cycle:
+                            phase_id = f"{round_number}:{phase}:{cycle}"
 
-                    self.latest_semantic_comparisons = comparisons
+                        comparison_data = [
+                            {
+                                "topic_id": c.topic_id,
+                                "label": c.label,
+                                "salience": c.salience,
+                                "disagreement_score": c.disagreement_score,
+                                "status": c.status,
+                                "difference_types": c.difference_types,
+                                "agreement_summary": c.agreement_summary,
+                                "disagreement_summary": c.disagreement_summary,
+                                "actor_positions": [
+                                    {
+                                        "actor_id": p.actor_id,
+                                        "actor_name": p.actor_name,
+                                        "stance_label": p.stance_label,
+                                        "summary": p.summary,
+                                        "quotes": p.quotes,
+                                    }
+                                    for p in c.actor_positions
+                                ],
+                            }
+                            for c in comparisons
+                        ]
 
-                    # Emit semantic_comparison event with canonical phase_id
-                    phase_id = f"{round_number}:{phase}"
-                    if phase == "revision" and cycle:
-                        phase_id = f"{round_number}:{phase}:{cycle}"
+                        await self._emit({
+                            "event": "semantic_comparison",
+                            "data": {
+                                "phase_id": phase_id,
+                                "round_number": round_number,
+                                "phase": phase,
+                                "cycle": cycle,
+                                "question_intent": {
+                                    "question_type": self.question_intent.question_type,
+                                    "user_goal": self.question_intent.user_goal,
+                                    "time_horizons": self.question_intent.time_horizons,
+                                    "comparison_axes": self.question_intent.comparison_axes,
+                                },
+                                "comparisons": comparison_data,
+                            }
+                        })
 
-                    comparison_data = [
-                        {
-                            "topic_id": c.topic_id,
-                            "label": c.label,
-                            "salience": c.salience,
-                            "disagreement_score": c.disagreement_score,
-                            "status": c.status,
-                            "difference_types": c.difference_types,
-                            "agreement_summary": c.agreement_summary,
-                            "disagreement_summary": c.disagreement_summary,
-                            "actor_positions": [
-                                {
-                                    "actor_id": p.actor_id,
-                                    "actor_name": p.actor_name,
-                                    "stance_label": p.stance_label,
-                                    "summary": p.summary,
-                                    "quotes": p.quotes,
-                                }
-                                for p in c.actor_positions
-                            ],
-                        }
-                        for c in comparisons
-                    ]
+                        logger.info(f"Semantic analysis complete: {len(comparisons)} topics analyzed")
 
-                    await self._emit({
-                        "event": "semantic_comparison",
-                        "data": {
-                            "phase_id": phase_id,
-                            "round_number": round_number,
-                            "phase": phase,
-                            "cycle": cycle,
-                            "question_intent": {
-                                "question_type": self.question_intent.question_type,
-                                "user_goal": self.question_intent.user_goal,
-                                "time_horizons": self.question_intent.time_horizons,
-                                "comparison_axes": self.question_intent.comparison_axes,
-                            },
-                            "comparisons": comparison_data,
-                        }
-                    })
+                    except asyncio.TimeoutError:
+                        logger.warning("Topic comparison timed out")
+                    except Exception as e:
+                        logger.error(f"Topic comparison failed: {e}")
+                else:
+                    logger.info(f"Not enough actors with topics ({len(topics_by_actor)}), skipping comparison")
 
-                    logger.info(f"Semantic analysis complete: {len(comparisons)} topics analyzed")
-
-                except asyncio.TimeoutError:
-                    logger.warning("Topic comparison timed out")
-                except Exception as e:
-                    logger.error(f"Topic comparison failed: {e}")
-            else:
-                logger.info(f"Not enough actors with topics ({len(topics_by_actor)}), skipping comparison")
-
-        except Exception as e:
-            logger.error(f"Semantic analysis failed: {e}", exc_info=True)
-            # Don't fail the debate if semantic analysis fails
+            except Exception as e:
+                logger.error(f"Semantic analysis failed: {e}", exc_info=True)
+                # Don't fail the debate if semantic analysis fails
 
     async def _run_final_answer_phase(self, convergence_result: Optional[ConvergenceResult] = None):
         """Run final answer phase where judge outputs a user-facing final answer."""
@@ -6189,6 +6201,7 @@ export default function Arena() {
   // Actions - stable references
   const startDebate = useDebateStore((state) => state.startDebate)
   const stopDebate = useDebateStore((state) => state.stopDebate)
+  const disconnectStream = useDebateStore((state) => state.disconnectStream)
   const reset = useDebateStore((state) => state.reset)
 
   const inputRef = useRef<HTMLTextAreaElement>(null)
@@ -6221,9 +6234,12 @@ export default function Arena() {
 
   const handleBackToArena = () => {
     if (status === 'streaming') {
-      stopDebate()
+      // Only disconnect SSE, don't call backend stop API
+      // Backend task continues running, user can check result from History
+      disconnectStream()
+    } else {
+      reset()
     }
-    reset()
     setView('arena')
     loadRecentSessions()
   }
@@ -6260,12 +6276,28 @@ export default function Arena() {
         {/* Header */}
         <header className="border-b border-border px-6 py-4 shrink-0">
           <div className="flex items-center justify-between max-w-[1600px] mx-auto">
-            <button
-              onClick={handleBackToArena}
-              className="text-text-secondary hover:text-text-primary transition-colors"
-            >
-              ← Back
-            </button>
+            <div className="flex items-center gap-3">
+              <button
+                onClick={handleBackToArena}
+                className="text-text-secondary hover:text-text-primary transition-colors"
+              >
+                ← Back
+              </button>
+              {status === 'streaming' && (
+                <button
+                  onClick={async () => {
+                    if (confirm('确定要终止当前任务吗？任务将无法恢复。')) {
+                      await stopDebate()
+                      setView('arena')
+                      loadRecentSessions()
+                    }
+                  }}
+                  className="px-3 py-1 text-xs bg-accent-red/20 text-accent-red rounded-lg hover:bg-accent-red/30 transition-colors"
+                >
+                  终止任务
+                </button>
+              )}
+            </div>
             <h1 className="text-lg font-semibold tracking-wider text-accent-orange">MAGI</h1>
             <div className="w-16" />
           </div>
@@ -6581,11 +6613,13 @@ export default function ConsensusView({ consensus }: ConsensusViewProps) {
       </div>
 
       <div className="p-6 space-y-6">
-        {/* Summary */}
-        <div>
-          <h4 className="text-text-secondary text-sm mb-2">Summary</h4>
-          <MarkdownBlock content={consensus.summary} />
-        </div>
+        {/* Summary - only show if it's significantly different from final_answer content */}
+        {consensus.summary && consensus.summary.length < 500 && (
+          <div>
+            <h4 className="text-text-secondary text-sm mb-2">概要</h4>
+            <MarkdownBlock content={consensus.summary} />
+          </div>
+        )}
 
         {/* Agreements */}
         {consensus.agreements.length > 0 && (
@@ -6669,7 +6703,7 @@ interface DebateViewProps {
   consensus?: Consensus | null  // Add consensus prop
 }
 
-type SidebarTab = 'semantic' | 'diff'
+type SidebarTab = 'monitor' | 'semantic' | 'diff'
 
 export default function DebateView({
   actors,
@@ -6687,7 +6721,7 @@ export default function DebateView({
   consensus,
 }: DebateViewProps) {
   // Sidebar tab state
-  const [sidebarTab, setSidebarTab] = useState<SidebarTab>('semantic')
+  const [sidebarTab, setSidebarTab] = useState<SidebarTab>('monitor')
 
   // Selected actors for diff comparison
   const [selectedBaseId, setSelectedBaseId] = useState<string | null>(null)
@@ -6736,19 +6770,18 @@ export default function DebateView({
 
       {/* Right sidebar with tabs - scrolls independently */}
       <div className="w-80 lg:w-[420px] shrink-0 border-l border-border flex flex-col">
-        {/* Mini MAGI Monitor - always visible at top */}
-        <MiniMagiMonitor
-          status={status as 'idle' | 'connecting' | 'streaming' | 'completed' | 'error'}
-          currentPhase={currentPhase}
-          currentPhaseRecord={currentPhaseRecord || null}
-          phaseHistory={phaseHistory}
-          actors={actors}
-          judgeActor={judgeActor}
-          semanticComparisons={semanticComparisons}
-        />
-
         {/* Tab header */}
         <div className="flex border-b border-border bg-bg-secondary shrink-0">
+          <button
+            onClick={() => setSidebarTab('monitor')}
+            className={`flex-1 px-4 py-2 text-xs font-medium transition-colors ${
+              sidebarTab === 'monitor'
+                ? 'text-accent-orange border-b-2 border-accent-orange'
+                : 'text-text-tertiary hover:text-text-secondary'
+            }`}
+          >
+            MAGI
+          </button>
           <button
             onClick={() => setSidebarTab('semantic')}
             className={`flex-1 px-4 py-2 text-xs font-medium transition-colors ${
@@ -6773,7 +6806,17 @@ export default function DebateView({
 
         {/* Tab content */}
         <div className="flex-1 overflow-hidden min-h-0">
-          {sidebarTab === 'semantic' ? (
+          {sidebarTab === 'monitor' ? (
+            <MiniMagiMonitor
+              status={status as 'idle' | 'connecting' | 'streaming' | 'completed' | 'error'}
+              currentPhase={currentPhase}
+              currentPhaseRecord={currentPhaseRecord || null}
+              phaseHistory={phaseHistory}
+              actors={actors}
+              judgeActor={judgeActor}
+              semanticComparisons={semanticComparisons}
+            />
+          ) : sidebarTab === 'semantic' ? (
             <SemanticSidebar
               phaseHistory={phaseHistory}
               semanticComparisons={semanticComparisons}
@@ -6897,14 +6940,22 @@ export default function DiffSidebar({
   }, [phaseHistory, selectedDiffPhaseId, comparablePhases])
 
   // Get content for selected actors from the selected phase
+  // During streaming, return stable null to prevent downstream recomputation
   const baseContent = useMemo(() => {
     if (!selectedPhase || !selectedBaseId) return null
-    return selectedPhase.messages[selectedBaseId]?.content || null
+    // Skip content extraction during streaming - diff is hidden anyway
+    const msg = selectedPhase.messages[selectedBaseId]
+    if (!msg) return null
+    if (msg.status === 'streaming') return null
+    return msg.content || null
   }, [selectedPhase, selectedBaseId])
 
   const compareContent = useMemo(() => {
     if (!selectedPhase || !selectedCompareId) return null
-    return selectedPhase.messages[selectedCompareId]?.content || null
+    const msg = selectedPhase.messages[selectedCompareId]
+    if (!msg) return null
+    if (msg.status === 'streaming') return null
+    return msg.content || null
   }, [selectedPhase, selectedCompareId])
 
   // Check if streaming - if any actor in the selected phase is streaming
@@ -7309,23 +7360,23 @@ const phaseInfo: Record<string, { label: string; explanation: string }> = {
     explanation: '模型正在根据批评修正观点',
   },
   semantic_pending: {
-    label: '语义图谱构建中',
+    label: '語義図譜構築中',
     explanation: '系统正在提炼核心共识与分歧维度',
   },
   final_answer: {
-    label: '最终回答生成中',
+    label: '最終回答生成中',
     explanation: '总结模型正在整合多方观点',
   },
   summary: {
-    label: '共识裁决中',
+    label: '共識裁決中',
     explanation: '系统正在生成结构化共识报告',
   },
   completed: {
-    label: '决议完成',
+    label: '決議完了',
     explanation: '本次互评已完成',
   },
   error: {
-    label: '系统异常',
+    label: '系統異常',
     explanation: '本次流程发生错误',
   },
 }
@@ -7342,7 +7393,6 @@ interface MiniMagiMonitorProps {
   semanticComparisons?: Map<string, unknown[]>
 }
 
-// Derive node state from real data
 function getNodeState(
   actorId: string,
   phaseRecord: LivePhaseRecord | null,
@@ -7350,42 +7400,21 @@ function getNodeState(
   currentPhase: string,
   status: string
 ): NodeState {
-  // If error state
-  if (status === 'error') {
-    return 'error'
-  }
+  if (status === 'error') return 'error'
+  if (status === 'completed') return 'done'
+  if (status === 'connecting') return 'idle'
+  if (status !== 'streaming' || !phaseRecord) return 'idle'
 
-  // If completed
-  if (status === 'completed') {
-    return 'done'
-  }
-
-  // If connecting
-  if (status === 'connecting') {
-    return 'idle'
-  }
-
-  // If not streaming or no phase record
-  if (status !== 'streaming' || !phaseRecord) {
-    return 'idle'
-  }
-
-  // For judge in final_answer or summary phase
   if (isJudge && (currentPhase === 'final_answer' || currentPhase === 'summary')) {
     const judgeMessage = phaseRecord.messages[actorId]
     if (judgeMessage) {
       return judgeMessage.status === 'streaming' ? 'judge_active' : 'done'
     }
-    // Judge hasn't started yet but we're in its phase
     return 'judge_active'
   }
 
-  // For non-judge actors
   const message = phaseRecord.messages[actorId]
-  if (!message) {
-    return 'idle'
-  }
-
+  if (!message) return 'idle'
   return message.status === 'streaming' ? 'thinking' : 'done'
 }
 
@@ -7397,66 +7426,49 @@ export default function MiniMagiMonitor({
   actors,
   judgeActor,
 }: MiniMagiMonitorProps) {
-  // Get non-judge actors
   const debateActors = useMemo(() => {
     return actors.filter(a => !a.is_meta_judge)
   }, [actors])
 
-  // Determine current phase info
   const phaseData = useMemo(() => {
-    // Check if we should show semantic pending state
-    // This happens when:
-    // 1. Current phase is initial or revision
-    // 2. Phase has ended (no actors streaming)
-    // 3. No semantic data yet
-    // 4. Status is still streaming
-
     const isWaitingForSemantic =
       status === 'streaming' &&
       ['initial', 'revision'].includes(currentPhase) &&
       currentPhaseRecord &&
       Object.values(currentPhaseRecord.messages).every(m => m.status === 'done')
 
-    if (isWaitingForSemantic) {
-      return phaseInfo['semantic_pending']
-    }
-
-    if (status === 'connecting') {
-      return phaseInfo['connecting']
-    }
-
-    if (status === 'error') {
-      return phaseInfo['error']
-    }
-
-    if (status === 'completed') {
-      return phaseInfo['completed']
-    }
-
+    if (isWaitingForSemantic) return phaseInfo['semantic_pending']
+    if (status === 'connecting') return phaseInfo['connecting']
+    if (status === 'error') return phaseInfo['error']
+    if (status === 'completed') return phaseInfo['completed']
     return phaseInfo[currentPhase] || { label: currentPhase, explanation: '' }
   }, [status, currentPhase, currentPhaseRecord])
 
-  // Get actor names for display
+  // Support 2 or 3 actors
   const actorA = debateActors[0]
   const actorB = debateActors[1]
+  const actorC = debateActors[2] || null // nullable third actor
 
-  // Calculate node states
+  const judgeState = useMemo(() => {
+    if (!judgeActor) return 'idle' as NodeState
+    return getNodeState(judgeActor.id, currentPhaseRecord, true, currentPhase, status)
+  }, [judgeActor, currentPhaseRecord, currentPhase, status])
+
   const actorAState = useMemo(() => {
-    if (!actorA) return 'idle'
+    if (!actorA) return 'idle' as NodeState
     return getNodeState(actorA.id, currentPhaseRecord, false, currentPhase, status)
   }, [actorA, currentPhaseRecord, currentPhase, status])
 
   const actorBState = useMemo(() => {
-    if (!actorB) return 'idle'
+    if (!actorB) return 'idle' as NodeState
     return getNodeState(actorB.id, currentPhaseRecord, false, currentPhase, status)
   }, [actorB, currentPhaseRecord, currentPhase, status])
 
-  const judgeState = useMemo(() => {
-    if (!judgeActor) return 'idle'
-    return getNodeState(judgeActor.id, currentPhaseRecord, true, currentPhase, status)
-  }, [judgeActor, currentPhaseRecord, currentPhase, status])
+  const actorCState = useMemo(() => {
+    if (!actorC) return 'idle' as NodeState
+    return getNodeState(actorC.id, currentPhaseRecord, false, currentPhase, status)
+  }, [actorC, currentPhaseRecord, currentPhase, status])
 
-  // Count completed actors in current phase
   const completedCount = useMemo(() => {
     if (!currentPhaseRecord) return 0
     return Object.values(currentPhaseRecord.messages).filter(m => m.status === 'done').length
@@ -7467,196 +7479,258 @@ export default function MiniMagiMonitor({
     return Object.keys(currentPhaseRecord.messages).length
   }, [currentPhaseRecord])
 
+  const isProcessing = status === 'streaming' || status === 'connecting'
+
+  // Derive judge label, actor labels
+  const judgeLabel = judgeActor ? judgeActor.name.slice(0, 10).toUpperCase() : 'JUDGE'
+  const actorALabel = actorA ? actorA.name.slice(0, 10).toUpperCase() : 'ACTOR A'
+  const actorBLabel = actorB ? actorB.name.slice(0, 10).toUpperCase() : 'ACTOR B'
+  const actorCLabel = actorC ? actorC.name.slice(0, 10).toUpperCase() : ''
+
+  // For 2 actors: classic MAGI triangle layout (judge top, A bottom-left, B bottom-right)
+  // For 3 actors: diamond layout (judge top, A left, B right, C bottom)
+
   return (
-    <div className="w-full bg-bg-secondary border-b border-border shrink-0">
+    <div className="h-full flex flex-col bg-[#000000] overflow-hidden">
+      {/* EVA font - loaded globally via globals.css, but ensure inline fallback */}
+      <style jsx global>{`
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Serif+JP:wght@900&display=swap');
+      `}</style>
       <style jsx>{`
-        .monitor-svg {
+        .magi-monitor-svg {
           font-family: 'Noto Serif JP', serif;
+          filter: drop-shadow(0 0 2px rgba(242, 102, 0, 0.4));
         }
-        .monitor-svg text {
+        .magi-monitor-svg text {
           font-weight: 900;
           user-select: none;
         }
         .node-stroke {
           fill: transparent;
-          stroke: var(--c-orange, #f26600);
-          stroke-width: 3;
+          stroke: #f26600;
+          stroke-width: 4;
           stroke-linejoin: miter;
         }
-        @keyframes pulse-blue {
-          0%, 100% { fill: rgba(84, 165, 217, 0.3); }
-          50% { fill: rgba(84, 165, 217, 0.6); }
+        .node-fill-base {
+          fill: transparent;
         }
-        @keyframes pulse-purple {
-          0%, 100% { fill: rgba(147, 51, 234, 0.3); }
-          50% { fill: rgba(147, 51, 234, 0.6); }
+        .header-text {
+          fill: #f26600;
+          letter-spacing: 0.1em;
         }
-        .state-thinking .node-fill {
-          fill: rgba(84, 165, 217, 0.5);
-          animation: pulse-blue 1.5s ease-in-out infinite;
+        .magi-text {
+          fill: #f26600;
+          letter-spacing: 0.25em;
         }
-        .state-thinking .node-text {
-          fill: #0a1f2e;
+        .node-text-base {
+          fill: transparent;
+          letter-spacing: 0.05em;
         }
-        .state-done .node-fill {
-          fill: rgba(103, 255, 140, 0.5);
+        .green-line {
+          stroke: #2b7a5f;
+          stroke-width: 3;
         }
-        .state-done .node-text {
-          fill: #0a1f2e;
+
+        /* --- State animations matching START.HTML exactly --- */
+        @keyframes flash-fill-blue {
+          0%, 49.9% { fill: #54a5d9; }
+          50%, 100% { fill: transparent; }
         }
-        .state-error .node-fill {
-          fill: rgba(227, 0, 0, 0.5);
+        @keyframes flash-text-dark {
+          0%, 49.9% { fill: #0a1f2e; }
+          50%, 100% { fill: transparent; }
         }
-        .state-error .node-text {
-          fill: #0a1f2e;
+        @keyframes flash-fill-purple {
+          0%, 49.9% { fill: #9333ea; }
+          50%, 100% { fill: transparent; }
         }
-        .state-judge_active .node-fill {
-          fill: rgba(147, 51, 234, 0.5);
-          animation: pulse-purple 1.5s ease-in-out infinite;
-        }
-        .state-judge_active .node-text {
-          fill: #0a1f2e;
-        }
-        @keyframes flash-status {
+        @keyframes flash-shingi {
           0%, 49.9% { fill: #fec200; stroke: #fec200; }
           50%, 100% { fill: rgba(254, 194, 0, 0.3); stroke: rgba(254, 194, 0, 0.3); }
         }
-        .status-active rect {
-          animation: flash-status 1s steps(1, end) infinite;
-        }
-        .status-active text {
-          animation: flash-status 1s steps(1, end) infinite;
-          stroke: none;
-        }
+
+        .state-thinking .node-fill { animation: flash-fill-blue 0.4s steps(1, end) infinite; }
+        .state-thinking .node-text { animation: flash-text-dark 0.4s steps(1, end) infinite; }
+
+        .state-done .node-fill { fill: #67ff8c; }
+        .state-done .node-text { fill: #0a1f2e; }
+
+        .state-error .node-fill { fill: #e30000; }
+        .state-error .node-text { fill: #0a1f2e; }
+
+        .state-judge_active .node-fill { animation: flash-fill-purple 0.4s steps(1, end) infinite; }
+        .state-judge_active .node-text { animation: flash-text-dark 0.4s steps(1, end) infinite; }
+
+        .shingi-box { opacity: 0; }
+        .shingi-box.active { opacity: 1; }
+        .shingi-box.active rect { animation: flash-shingi 1s steps(1, end) infinite; }
+        .shingi-box.active text { animation: flash-shingi 1s steps(1, end) infinite; stroke: none; }
       `}</style>
 
-      {/* Header with phase label */}
-      <div className="px-3 py-2 border-b border-border flex items-center justify-between">
-        <span className="text-xs text-accent-orange font-medium tracking-wider">MAGI</span>
-        <span className="text-xs text-text-secondary">{phaseData.label}</span>
-      </div>
-
-      {/* SVG Monitor */}
-      <div className="px-2 py-2">
+      {/* SVG Monitor - faithful reproduction of START.HTML layout */}
+      <div className="flex-1 flex items-center justify-center p-2">
         <svg
-          className="monitor-svg w-full"
-          viewBox="0 0 300 140"
+          className="magi-monitor-svg w-full h-full"
+          viewBox="0 0 960 540"
           preserveAspectRatio="xMidYMid meet"
         >
-          {/* Connection lines */}
-          <g stroke="#f26600" strokeWidth="4" opacity="0.6">
-            <line x1="150" y1="85" x2="185" y2="110" />
-            <line x1="150" y1="85" x2="115" y2="110" />
+          <defs>
+            <pattern id="mini-scanline" patternUnits="userSpaceOnUse" width="4" height="4">
+              <line x1="0" y1="0" x2="4" y2="0" stroke="rgba(0,0,0,0.15)" strokeWidth="2" />
+            </pattern>
+          </defs>
+
+          {/* Double border frame (from START.HTML) */}
+          <rect x="20" y="20" width="920" height="500" stroke="#f26600" strokeWidth="1.5" fill="none" />
+          <rect x="35" y="35" width="890" height="470" stroke="#f26600" strokeWidth="4" fill="none" />
+
+          {/* Left header: 提訴 */}
+          <g transform="translate(90, 80)">
+            <line x1="0" y1="0" x2="200" y2="0" className="green-line" />
+            <line x1="0" y1="8" x2="200" y2="8" className="green-line" />
+            <text x="100" y="80" fontSize="70" textAnchor="middle" className="header-text">提訴</text>
+            <line x1="0" y1="100" x2="200" y2="100" className="green-line" />
+            <line x1="0" y1="108" x2="200" y2="108" className="green-line" />
           </g>
 
-          {/* Center MAGI label */}
-          <text x="150" y="65" textAnchor="middle" fill="#f26600" fontSize="14" letterSpacing="0.15em">
-            MAGI
-          </text>
-
-          {/* Judge node (top) */}
-          <g className={`state-${judgeState}`} transform="translate(100, 10)">
-            <polygon
-              className="node-fill"
-              points="50,0 100,0 100,35 85,50 65,50 50,35"
-              fill="transparent"
-            />
-            <polygon
-              className="node-stroke"
-              points="50,0 100,0 100,35 85,50 65,50 50,35"
-            />
-            <text
-              x="75"
-              y="30"
-              textAnchor="middle"
-              className="node-text"
-              fontSize="10"
-              fill="transparent"
-            >
-              {judgeActor ? judgeActor.name.slice(0, 6).toUpperCase() : 'JUDGE'}
-            </text>
+          {/* Right header: 決議 */}
+          <g transform="translate(670, 80)">
+            <line x1="0" y1="0" x2="200" y2="0" className="green-line" />
+            <line x1="0" y1="8" x2="200" y2="8" className="green-line" />
+            <text x="100" y="80" fontSize="70" textAnchor="middle" className="header-text">決議</text>
+            <line x1="0" y1="100" x2="200" y2="100" className="green-line" />
+            <line x1="0" y1="108" x2="200" y2="108" className="green-line" />
           </g>
 
-          {/* Actor A node (bottom left) */}
-          <g className={`state-${actorAState}`} transform="translate(20, 85)">
-            <polygon
-              className="node-fill"
-              points="0,0 80,0 80,30 70,45 10,45 0,30"
-              fill="transparent"
-            />
-            <polygon
-              className="node-stroke"
-              points="0,0 80,0 80,30 70,45 10,45 0,30"
-            />
-            <text
-              x="40"
-              y="28"
-              textAnchor="middle"
-              className="node-text"
-              fontSize="9"
-              fill="transparent"
-            >
-              {actorA ? actorA.name.slice(0, 8).toUpperCase() : 'ACTOR A'}
-            </text>
-          </g>
-
-          {/* Actor B node (bottom right) */}
-          <g className={`state-${actorBState}`} transform="translate(200, 85)">
-            <polygon
-              className="node-fill"
-              points="0,0 80,0 80,30 70,45 10,45 0,30"
-              fill="transparent"
-            />
-            <polygon
-              className="node-stroke"
-              points="0,0 80,0 80,30 70,45 10,45 0,30"
-            />
-            <text
-              x="40"
-              y="28"
-              textAnchor="middle"
-              className="node-text"
-              fontSize="9"
-              fill="transparent"
-            >
-              {actorB ? actorB.name.slice(0, 8).toUpperCase() : 'ACTOR B'}
-            </text>
-          </g>
-
-          {/* Status box */}
+          {/* 審議中 box (top right) */}
           <g
-            className={`status-active`}
-            transform="translate(190, 10)"
-            style={{ opacity: status === 'streaming' || status === 'connecting' ? 1 : 0.7 }}
+            className={`shingi-box${isProcessing ? ' active' : ''}`}
+            transform="translate(710, 210)"
           >
-            <rect
-              x="0"
-              y="0"
-              width="100"
-              height="28"
-              strokeWidth="2"
-              fill="none"
-              stroke="#fec200"
+            <rect x="0" y="0" width="120" height="40" strokeWidth="2" fill="none" />
+            <text x="60" y="29" fontSize="25" textAnchor="middle" letterSpacing="0.1em">審議中</text>
+          </g>
+
+          {/* Connection lines between MAGI center and bottom nodes (thick, like START.HTML) */}
+          <g stroke="#f26600" strokeWidth="15">
+            {/* Center to bottom-left */}
+            <line x1="388" y1="258" x2="363" y2="338" />
+            {/* Center to bottom-right */}
+            <line x1="573" y1="258" x2="598" y2="338" />
+            {/* Bottom horizontal */}
+            <line x1="425" y1="430" x2="535" y2="430" />
+          </g>
+
+          {/* MAGI text (center) */}
+          <text x="480" y="350" textAnchor="middle" className="magi-text" fontSize="24">MAGI</text>
+
+          {/* ===== JUDGE NODE (top center) ===== */}
+          {/* Hexagonal shape from START.HTML, scaled down */}
+          <g className={`state-${judgeState}`}>
+            <polygon
+              className="node-fill node-fill-base"
+              points="355,70 605,70 605,225 540,290 420,290 355,225"
+            />
+            <polygon
+              fill="url(#mini-scanline)"
+              points="355,70 605,70 605,225 540,290 420,290 355,225"
+            />
+            <polygon
+              className="node-stroke"
+              points="355,70 605,70 605,225 540,290 420,290 355,225"
             />
             <text
-              x="50"
-              y="18"
-              fontSize="11"
+              x="480"
+              y="195"
               textAnchor="middle"
-              fill="#fec200"
-              letterSpacing="0.05em"
+              className="node-text node-text-base"
+              fontSize="28"
             >
-              {status === 'completed' ? '完了' : status === 'error' ? '異常' : '処理中'}
+              {judgeLabel}
             </text>
           </g>
+
+          {/* ===== ACTOR A NODE (bottom left) ===== */}
+          <g className={`state-${actorAState}`}>
+            <polygon
+              className="node-fill node-fill-base"
+              points="125,275 300,275 425,400 425,470 125,470"
+            />
+            <polygon
+              fill="url(#mini-scanline)"
+              points="125,275 300,275 425,400 425,470 125,470"
+            />
+            <polygon
+              className="node-stroke"
+              points="125,275 300,275 425,400 425,470 125,470"
+            />
+            <text
+              x="250"
+              y="395"
+              textAnchor="middle"
+              className="node-text node-text-base"
+              fontSize="24"
+            >
+              {actorALabel}
+            </text>
+          </g>
+
+          {/* ===== ACTOR B NODE (bottom right) ===== */}
+          <g className={`state-${actorBState}`}>
+            <polygon
+              className="node-fill node-fill-base"
+              points="835,275 660,275 535,400 535,470 835,470"
+            />
+            <polygon
+              fill="url(#mini-scanline)"
+              points="835,275 660,275 535,400 535,470 835,470"
+            />
+            <polygon
+              className="node-stroke"
+              points="835,275 660,275 535,400 535,470 835,470"
+            />
+            <text
+              x="685"
+              y="395"
+              textAnchor="middle"
+              className="node-text node-text-base"
+              fontSize="24"
+            >
+              {actorBLabel}
+            </text>
+          </g>
+
+          {/* ===== ACTOR C NODE (optional, bottom center) ===== */}
+          {actorC && (
+            <g className={`state-${actorCState}`}>
+              <polygon
+                className="node-fill node-fill-base"
+                points="380,455 580,455 580,510 380,510"
+              />
+              <polygon
+                className="node-stroke"
+                points="380,455 580,455 580,510 380,510"
+              />
+              <text
+                x="480"
+                y="492"
+                textAnchor="middle"
+                className="node-text node-text-base"
+                fontSize="18"
+              >
+                {actorCLabel}
+              </text>
+            </g>
+          )}
         </svg>
       </div>
 
-      {/* Phase explanation */}
-      <div className="px-3 pb-2">
-        <p className="text-xs text-text-tertiary text-center">{phaseData.explanation}</p>
+      {/* Phase status bar */}
+      <div className="px-3 py-2 border-t border-[#f26600]/30 text-center">
+        <p className="text-xs text-[#f26600] font-medium tracking-wider">{phaseData.label}</p>
+        <p className="text-xs text-[#86868B] mt-0.5">{phaseData.explanation}</p>
         {status === 'streaming' && totalActors > 0 && (
-          <p className="text-xs text-text-tertiary text-center mt-1">
+          <p className="text-xs text-[#56565A] mt-0.5">
             {completedCount}/{totalActors} 模型完成
           </p>
         )}
@@ -7956,7 +8030,7 @@ export default function QuestionBox({
 ```tsx
 'use client'
 
-import { memo, useMemo, useRef, useEffect } from 'react'
+import { memo, useMemo, useRef, useEffect, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Actor, LivePhaseRecord, LiveMessage, ConvergenceData, Consensus } from '@/types'
 import ConsensusView from './ConsensusView'
@@ -8122,13 +8196,43 @@ export default function ReviewChatView({
   consensus,
 }: ReviewChatViewProps) {
   const scrollRef = useRef<HTMLDivElement>(null)
+  const [userHasScrolledUp, setUserHasScrolledUp] = useState(false)
+  const lastScrollTop = useRef(0)
 
-  // Auto-scroll to bottom when new content arrives
+  // Track user scroll intent
   useEffect(() => {
-    if (scrollRef.current && status === 'streaming') {
+    const el = scrollRef.current
+    if (!el) return
+
+    const handleScroll = () => {
+      const { scrollTop, scrollHeight, clientHeight } = el
+      const distanceFromBottom = scrollHeight - scrollTop - clientHeight
+      // If user scrolled up more than 80px from bottom, respect their intent
+      if (distanceFromBottom > 80) {
+        setUserHasScrolledUp(true)
+      } else {
+        setUserHasScrolledUp(false)
+      }
+      lastScrollTop.current = scrollTop
+    }
+
+    el.addEventListener('scroll', handleScroll, { passive: true })
+    return () => el.removeEventListener('scroll', handleScroll)
+  }, [])
+
+  // Auto-scroll only when user is near bottom
+  useEffect(() => {
+    if (scrollRef.current && status === 'streaming' && !userHasScrolledUp) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight
     }
-  }, [phaseHistory, status])
+  }, [phaseHistory, status, userHasScrolledUp])
+
+  // Reset scroll lock when status changes to non-streaming
+  useEffect(() => {
+    if (status !== 'streaming') {
+      setUserHasScrolledUp(false)
+    }
+  }, [status])
 
   // Build ordered messages from phase history
   // Filter out summary phase - it should only show via ConsensusView, not in chat stream
@@ -8198,6 +8302,23 @@ export default function ReviewChatView({
       {phases.length === 0 && status === 'streaming' && (
         <div className="text-center text-text-tertiary py-8">
           <div className="animate-pulse">等待响应...</div>
+        </div>
+      )}
+
+      {/* Jump to bottom button - only shows when user has scrolled up during streaming */}
+      {status === 'streaming' && userHasScrolledUp && (
+        <div className="sticky bottom-4 flex justify-center pointer-events-none">
+          <button
+            onClick={() => {
+              setUserHasScrolledUp(false)
+              if (scrollRef.current) {
+                scrollRef.current.scrollTop = scrollRef.current.scrollHeight
+              }
+            }}
+            className="pointer-events-auto px-4 py-2 bg-accent-blue/90 text-white text-sm rounded-full shadow-lg hover:bg-accent-blue transition-colors"
+          >
+            ↓ 跳到最新
+          </button>
         </div>
       )}
 
@@ -10157,6 +10278,7 @@ interface DebateState {
   startDebate: (question: string, actorIds: string[], judgeActorId: string, config?: { max_rounds?: number }) => Promise<string>
   streamDebate: (sessionId: string) => void
   stopDebate: () => Promise<void>
+  disconnectStream: () => void
 
   setSession: (session: DebateSession) => void
   addToken: (actorId: string, content: string) => void
@@ -10172,6 +10294,10 @@ interface DebateState {
 
 let eventSource: EventSource | null = null
 let expectedClose = false  // Flag to track expected connection close
+let reconnectAttempt = 0
+let reconnectTimeoutId: ReturnType<typeof setTimeout> | null = null
+const MAX_RECONNECT_ATTEMPTS = 5
+const BASE_RECONNECT_DELAY = 1000 // 1 second
 
 // Token batching for performance optimization
 // Instead of updating Zustand state on every token, we buffer tokens and flush periodically
@@ -10319,25 +10445,57 @@ export const useDebateStore = create<DebateState>((set, get) => ({
 
     eventSource.onopen = () => {
       console.log('[SSE] Connection opened')
-      set({ status: 'streaming' })
+      reconnectAttempt = 0  // Reset reconnect counter on successful connection
+      set({ status: 'streaming', error: null })
     }
 
     eventSource.onerror = () => {
       console.error('[SSE] Native error')
-      // Check if this is an expected close (normal completion or manual stop)
       if (expectedClose) {
         console.log('[SSE] Expected close, ignoring error')
         return
       }
-      // Check if current state is already completed/stopped
       const currentState = get().status
       if (currentState === 'completed' || currentState === 'idle') {
         console.log('[SSE] Already completed/stopped, ignoring error')
         return
       }
-      set({ status: 'error', error: 'Connection lost' })
+
+      // Close current connection
       eventSource?.close()
       eventSource = null
+
+      // Attempt reconnection with exponential backoff
+      if (reconnectAttempt < MAX_RECONNECT_ATTEMPTS) {
+        const delay = BASE_RECONNECT_DELAY * Math.pow(2, reconnectAttempt)
+        reconnectAttempt++
+        console.log(`[SSE] Reconnecting in ${delay}ms (attempt ${reconnectAttempt}/${MAX_RECONNECT_ATTEMPTS})`)
+        set({ error: `连接中断，${Math.round(delay / 1000)}秒后重连 (${reconnectAttempt}/${MAX_RECONNECT_ATTEMPTS})` })
+
+        reconnectTimeoutId = setTimeout(() => {
+          reconnectTimeoutId = null
+          const sid = get().currentSessionId
+          if (sid && get().status !== 'completed' && get().status !== 'idle') {
+            console.log(`[SSE] Reconnecting to session ${sid}...`)
+            // Re-create EventSource without resetting state
+            // We call streamDebate but need to preserve existing phaseHistory
+            // So we just re-create the EventSource manually
+            const preservedState = {
+              phaseHistory: get().phaseHistory,
+              currentPhaseRecord: get().currentPhaseRecord,
+              semanticComparisons: get().semanticComparisons,
+              questionIntent: get().questionIntent,
+              progress: get().progress,
+            }
+            get().streamDebate(sid)
+            // Restore preserved state after streamDebate resets it
+            set(preservedState)
+          }
+        }, delay)
+      } else {
+        console.error(`[SSE] Max reconnect attempts reached`)
+        set({ status: 'error', error: '连接丢失，已达最大重连次数。请刷新页面。' })
+      }
     }
 
     // New phase_start event - create a new phase record (DO NOT clear history)
@@ -10834,6 +10992,11 @@ export const useDebateStore = create<DebateState>((set, get) => ({
 
   stopDebate: async () => {
     expectedClose = true  // Mark as expected close
+    if (reconnectTimeoutId) {
+      clearTimeout(reconnectTimeoutId)
+      reconnectTimeoutId = null
+    }
+    reconnectAttempt = 0
     clearTokenBufferState()  // Clear token buffer
     if (eventSource) {
       eventSource.close()
@@ -10850,6 +11013,50 @@ export const useDebateStore = create<DebateState>((set, get) => ({
     }
 
     set({ status: 'idle', currentSessionId: null })
+  },
+
+  disconnectStream: () => {
+    // Only disconnect SSE, don't call backend stop API
+    // Backend task continues running, user can check result from History
+    expectedClose = true
+    if (reconnectTimeoutId) {
+      clearTimeout(reconnectTimeoutId)
+      reconnectTimeoutId = null
+    }
+    reconnectAttempt = 0
+    clearTokenBufferState()
+    if (eventSource) {
+      eventSource.close()
+      eventSource = null
+    }
+    set({
+      status: 'idle',
+      currentSessionId: null,
+      currentSession: null,
+      streamingContent: new Map(),
+      activeActors: new Set(),
+      currentRound: 0,
+      currentPhase: '',
+      currentCycle: 0,
+      convergenceResult: null,
+      phaseHistory: [],
+      currentPhaseRecord: null,
+      selectedDiffPhaseId: null,
+      questionIntent: null,
+      semanticComparisons: new Map(),
+      selectedTopicId: null,
+      error: null,
+      progress: {
+        startedAt: null,
+        currentPhaseStartedAt: null,
+        completedSteps: 0,
+        estimatedTotalSteps: 9,
+        currentStepProgress: 0,
+        phaseTimings: new Map(),
+        totalActorsInPhase: 0,
+        completedActorsInPhase: 0,
+      },
+    })
   },
 
   setSession: (session) => set({ currentSession: session }),
@@ -10884,6 +11091,11 @@ export const useDebateStore = create<DebateState>((set, get) => ({
   selectTopic: (topicId) => set({ selectedTopicId: topicId }),
   reset: () => {
     expectedClose = true  // Mark as expected close
+    if (reconnectTimeoutId) {
+      clearTimeout(reconnectTimeoutId)
+      reconnectTimeoutId = null
+    }
+    reconnectAttempt = 0
     clearTokenBufferState()  // Clear token buffer and timeout
     if (eventSource) {
       eventSource.close()

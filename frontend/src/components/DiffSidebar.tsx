@@ -86,14 +86,22 @@ export default function DiffSidebar({
   }, [phaseHistory, selectedDiffPhaseId, comparablePhases])
 
   // Get content for selected actors from the selected phase
+  // During streaming, return stable null to prevent downstream recomputation
   const baseContent = useMemo(() => {
     if (!selectedPhase || !selectedBaseId) return null
-    return selectedPhase.messages[selectedBaseId]?.content || null
+    // Skip content extraction during streaming - diff is hidden anyway
+    const msg = selectedPhase.messages[selectedBaseId]
+    if (!msg) return null
+    if (msg.status === 'streaming') return null
+    return msg.content || null
   }, [selectedPhase, selectedBaseId])
 
   const compareContent = useMemo(() => {
     if (!selectedPhase || !selectedCompareId) return null
-    return selectedPhase.messages[selectedCompareId]?.content || null
+    const msg = selectedPhase.messages[selectedCompareId]
+    if (!msg) return null
+    if (msg.status === 'streaming') return null
+    return msg.content || null
   }, [selectedPhase, selectedCompareId])
 
   // Check if streaming - if any actor in the selected phase is streaming
